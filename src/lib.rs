@@ -33,21 +33,19 @@ pub use c2rust::speex_echo_h::{
 };
 pub use c2rust::mdf::{
     speex_echo_cancel, speex_echo_cancellation, speex_echo_capture, speex_echo_ctl,
-    speex_echo_get_residual, speex_echo_playback, speex_echo_state_destroy,
-    speex_echo_state_init, speex_echo_state_init_mc, speex_echo_state_reset,
-    SpeexEchoState,
+    speex_echo_get_residual, speex_echo_playback, speex_echo_state_destroy, speex_echo_state_init,
+    speex_echo_state_init_mc, speex_echo_state_reset, SpeexEchoState,
 };
 pub use c2rust::resample::{
-    speex_resampler_destroy, speex_resampler_get_input_latency,
-    speex_resampler_get_output_latency, speex_resampler_get_quality,
-    speex_resampler_get_rate, speex_resampler_init, speex_resampler_init_frac,
-    speex_resampler_process_float, speex_resampler_process_int,
+    speex_resampler_destroy, speex_resampler_get_input_latency, speex_resampler_get_output_latency,
+    speex_resampler_get_quality, speex_resampler_get_rate, speex_resampler_init,
+    speex_resampler_init_frac, speex_resampler_process_float, speex_resampler_process_int,
     speex_resampler_process_interleaved_float, speex_resampler_process_interleaved_int,
     speex_resampler_reset_mem, speex_resampler_set_quality, speex_resampler_set_rate,
-    speex_resampler_set_rate_frac, speex_resampler_skip_zeros,
-    speex_resampler_strerror, RESAMPLER_ERR_ALLOC_FAILED, RESAMPLER_ERR_BAD_STATE,
+    speex_resampler_set_rate_frac, speex_resampler_skip_zeros, speex_resampler_strerror,
+    SpeexResamplerState, RESAMPLER_ERR_ALLOC_FAILED, RESAMPLER_ERR_BAD_STATE,
     RESAMPLER_ERR_INVALID_ARG, RESAMPLER_ERR_MAX_ERROR, RESAMPLER_ERR_OVERFLOW,
-    RESAMPLER_ERR_PTR_OVERLAP, RESAMPLER_ERR_SUCCESS, SpeexResamplerState,
+    RESAMPLER_ERR_PTR_OVERLAP, RESAMPLER_ERR_SUCCESS,
 };
 
 /// Safe wrapper around the translated Speex echo canceller.
@@ -120,12 +118,7 @@ impl EchoCanceller {
         assert_eq!(speaker.len(), self.frame_size * self.speaker_channels);
         assert_eq!(out.len(), mic.len());
         unsafe {
-            speex_echo_cancellation(
-                self.state,
-                mic.as_ptr(),
-                speaker.as_ptr(),
-                out.as_mut_ptr(),
-            );
+            speex_echo_cancellation(self.state, mic.as_ptr(), speaker.as_ptr(), out.as_mut_ptr());
         }
     }
 
@@ -161,6 +154,8 @@ impl Drop for EchoCanceller {
         }
     }
 }
+
+unsafe impl Send for Resampler {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResamplerError {
@@ -209,10 +204,8 @@ impl ResamplerError {
 
 impl fmt::Display for ResamplerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = unsafe {
-            CStr::from_ptr(speex_resampler_strerror(self.code()))
-                .to_string_lossy()
-        };
+        let message =
+            unsafe { CStr::from_ptr(speex_resampler_strerror(self.code())).to_string_lossy() };
         write!(f, "{message}")
     }
 }
@@ -274,13 +267,7 @@ impl Resampler {
         }
         Self::create_with(channels, |err| unsafe {
             speex_resampler_init_frac(
-                channels,
-                ratio_num,
-                ratio_den,
-                in_rate,
-                out_rate,
-                quality,
-                err,
+                channels, ratio_num, ratio_den, in_rate, out_rate, quality, err,
             )
         })
     }
@@ -353,8 +340,7 @@ impl Resampler {
 
     /// Update the input/output sample rates.
     pub fn set_rate(&mut self, in_rate: u32, out_rate: u32) -> Result<(), ResamplerError> {
-        let code =
-            unsafe { speex_resampler_set_rate(self.state.as_ptr(), in_rate, out_rate) };
+        let code = unsafe { speex_resampler_set_rate(self.state.as_ptr(), in_rate, out_rate) };
         ResamplerError::check(code)
     }
 
@@ -393,9 +379,7 @@ impl Resampler {
 
     /// Change the quality preset (0-10).
     pub fn set_quality(&mut self, quality: i32) -> Result<(), ResamplerError> {
-        ResamplerError::check(unsafe {
-            speex_resampler_set_quality(self.state.as_ptr(), quality)
-        })
+        ResamplerError::check(unsafe { speex_resampler_set_quality(self.state.as_ptr(), quality) })
     }
 
     /// Current quality preset.

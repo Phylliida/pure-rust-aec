@@ -14,13 +14,20 @@
 //! ```text
 //! cargo run --example cpal_aec --features cpal-example "USB Microphone" "Loopback"
 //! ```
+//!
+//! ```text
+//! cargo run --example cpal_aec --features cpal-example "USB Microphone" "Loopback" 48000
+//! ```
+//!
+//! The optional third argument selects the internal echo-canceller sample rate (Hz). When
+//! omitted, the demo defaults to 48 kHz and transparently resamples the devices if needed.
 
 use std::{
     collections::VecDeque,
     env,
     error::Error,
-    ffi::c_void,
     f32::consts::PI,
+    ffi::c_void,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -30,12 +37,20 @@ use cpal::{
     Device, SampleFormat, StreamConfig,
 };
 use speex_rust_aec::{
-    speex_echo_cancellation, speex_echo_ctl, EchoCanceller, SPEEX_ECHO_SET_SAMPLING_RATE,
+    speex_echo_cancellation, speex_echo_ctl, EchoCanceller, Resampler, SPEEX_ECHO_SET_SAMPLING_RATE,
 };
+
+const DEFAULT_AEC_RATE: u32 = 48_000;
+const RESAMPLER_QUALITY: i32 = 5;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     let host = cpal::default_host();
+
+    let target_sample_rate = args
+        .get(2)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_AEC_RATE);
 
     let input_device = if let Some(name) = args.get(0) {
         select_device(host.input_devices(), name, "Input")?
@@ -61,24 +76,76 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    // Use the input configuration for both streams. You may need to adjust
-    // this or pick a compatible configuration for your hardware.
-    let stream_config: StreamConfig = input_config.config();
-    let sample_rate = stream_config.sample_rate.0;
-    let channels = stream_config.channels as usize;
-    let frame_size = (sample_rate / 100) as usize; // 10 ms frames
+    let input_stream_config: StreamConfig = input_config.config();
+    let output_stream_config: StreamConfig = output_config.config();
+
+    if input_stream_config.channels != output_stream_config.channels {
+        eprintln!(
+            "Input/output channel mismatch: {} in vs {} out. Matching channels are required.",
+            input_stream_config.channels, output_stream_config.channels
+        );
+        return Ok(());
+    }
+
+    let input_rate = input_stream_config.sample_rate.0;
+    let output_rate = output_stream_config.sample_rate.0;
+    let channels = input_stream_config.channels as usize;
+
+    println!(
+        "Input rate: {input_rate} Hz, output rate: {output_rate} Hz, AEC rate: {target_sample_rate} Hz"
+    );
+
+    let mut mic_resampler = if input_rate != target_sample_rate {
+        println!("Resampling input stream to match AEC rate.");
+        Some(
+            Resampler::new(
+                channels as u32,
+                input_rate,
+                target_sample_rate,
+                RESAMPLER_QUALITY,
+            )
+            .map_err(|e| format!("Failed to create input resampler: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    if let Some(resampler) = mic_resampler.as_mut() {
+        if let Err(err) = resampler.skip_zeros() {
+            eprintln!("Unable to prime input resampler: {err}");
+        }
+    }
+
+    let mut far_resampler = if output_rate != target_sample_rate {
+        println!("Resampling output reference stream to match AEC rate.");
+        Some(
+            Resampler::new(
+                channels as u32,
+                output_rate,
+                target_sample_rate,
+                RESAMPLER_QUALITY,
+            )
+            .map_err(|e| format!("Failed to create output resampler: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    if let Some(resampler) = far_resampler.as_mut() {
+        if let Err(err) = resampler.skip_zeros() {
+            eprintln!("Unable to prime output resampler: {err}");
+        }
+    }
+
+    let frame_size = (target_sample_rate / 100).max(1) as usize; // ~10 ms frames
     let filter_length = frame_size * 20; // 200 ms echo tail
 
-    let mut canceller = EchoCanceller::new_multichannel(
-        frame_size,
-        filter_length,
-        channels,
-        channels,
-    )
-    .ok_or("Failed to allocate echo canceller state")?;
+    let mut canceller =
+        EchoCanceller::new_multichannel(frame_size, filter_length, channels, channels)
+            .ok_or("Failed to allocate echo canceller state")?;
 
     unsafe {
-        let mut rate = sample_rate as i32;
+        let mut rate = target_sample_rate as i32;
         speex_echo_ctl(
             canceller.as_ptr(),
             SPEEX_ECHO_SET_SAMPLING_RATE,
@@ -87,17 +154,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let shared = Arc::new(Mutex::new(SharedCanceller::new(
-        canceller, channels, frame_size,
+        canceller,
+        channels,
+        frame_size,
+        mic_resampler,
+        far_resampler,
     )));
 
     let output_shared = Arc::clone(&shared);
     let mut phase = 0f32;
+    let phase_increment = 440.0f32 * 2.0 * PI / output_rate as f32;
     let output_stream = output_device.build_output_stream(
-        &stream_config,
+        &output_stream_config,
         move |data: &mut [i16], _| {
             let mut state = output_shared.lock().unwrap();
             for frame in data.chunks_mut(state.channels) {
-                phase += 440.0f32 * 2.0 * PI / sample_rate as f32;
+                phase += phase_increment;
+                if phase > 2.0 * PI {
+                    phase -= 2.0 * PI;
+                }
                 let sample = (phase.sin() * 0.2 * i16::MAX as f32) as i16;
                 for sample_out in frame.iter_mut() {
                     *sample_out = sample;
@@ -111,7 +186,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let input_shared = Arc::clone(&shared);
     let input_stream = input_device.build_input_stream(
-        &stream_config,
+        &input_stream_config,
         move |data: &[i16], _| {
             let mut state = input_shared.lock().unwrap();
             state.process_capture(data);
@@ -135,6 +210,12 @@ struct SharedCanceller {
     aec: EchoCanceller,
     channels: usize,
     frame_samples: usize,
+    mic_resampler: Option<Resampler>,
+    far_resampler: Option<Resampler>,
+    mic_resampler_pending: Vec<i16>,
+    far_resampler_pending: Vec<i16>,
+    mic_resample_buf: Vec<i16>,
+    far_resample_buf: Vec<i16>,
     far_queue: VecDeque<i16>,
     mic_queue: VecDeque<i16>,
     mic_frame: Vec<i16>,
@@ -144,12 +225,24 @@ struct SharedCanceller {
 }
 
 impl SharedCanceller {
-    fn new(aec: EchoCanceller, channels: usize, frame_size: usize) -> Self {
+    fn new(
+        aec: EchoCanceller,
+        channels: usize,
+        frame_size: usize,
+        mic_resampler: Option<Resampler>,
+        far_resampler: Option<Resampler>,
+    ) -> Self {
         let frame_samples = frame_size * channels;
         Self {
             aec,
             channels,
             frame_samples,
+            mic_resampler,
+            far_resampler,
+            mic_resampler_pending: Vec::with_capacity(frame_samples),
+            far_resampler_pending: Vec::with_capacity(frame_samples),
+            mic_resample_buf: Vec::with_capacity(frame_samples),
+            far_resample_buf: Vec::with_capacity(frame_samples),
             far_queue: VecDeque::with_capacity(frame_samples * 8),
             mic_queue: VecDeque::with_capacity(frame_samples * 8),
             mic_frame: vec![0; frame_samples],
@@ -160,7 +253,17 @@ impl SharedCanceller {
     }
 
     fn push_far_end(&mut self, samples: &[i16]) {
-        self.far_queue.extend(samples.iter().copied());
+        if let Some(resampler) = self.far_resampler.as_mut() {
+            self.queue_resampled(
+                resampler,
+                &mut self.far_resampler_pending,
+                samples,
+                &mut self.far_resample_buf,
+                &mut self.far_queue,
+            );
+        } else {
+            self.far_queue.extend(samples.iter().copied());
+        }
         let max_len = self.frame_samples * 16;
         while self.far_queue.len() > max_len {
             self.far_queue.pop_front();
@@ -168,7 +271,17 @@ impl SharedCanceller {
     }
 
     fn process_capture(&mut self, samples: &[i16]) {
-        self.mic_queue.extend(samples.iter().copied());
+        if let Some(resampler) = self.mic_resampler.as_mut() {
+            self.queue_resampled(
+                resampler,
+                &mut self.mic_resampler_pending,
+                samples,
+                &mut self.mic_resample_buf,
+                &mut self.mic_queue,
+            );
+        } else {
+            self.mic_queue.extend(samples.iter().copied());
+        }
         while self.mic_queue.len() >= self.frame_samples {
             for sample in self.mic_frame.iter_mut() {
                 *sample = self.mic_queue.pop_front().unwrap();
@@ -197,13 +310,64 @@ impl SharedCanceller {
             }
         }
     }
+
+    fn queue_resampled(
+        &mut self,
+        resampler: &mut Resampler,
+        pending: &mut Vec<i16>,
+        new_samples: &[i16],
+        scratch: &mut Vec<i16>,
+        queue: &mut VecDeque<i16>,
+    ) {
+        if !new_samples.is_empty() {
+            pending.extend_from_slice(new_samples);
+        }
+        if pending.is_empty() {
+            return;
+        }
+
+        let (in_rate, out_rate) = resampler.get_rate();
+        let channels = resampler.channels();
+
+        loop {
+            if pending.is_empty() {
+                break;
+            }
+
+            let available = pending.len();
+            let mut expected =
+                ((available as u64 * out_rate as u64) / in_rate as u64) as usize + channels;
+            expected = expected.max(channels);
+            scratch.resize(expected, 0);
+
+            match resampler.process_interleaved_i16(pending.as_slice(), scratch.as_mut_slice()) {
+                Ok((consumed, produced)) => {
+                    if produced > 0 {
+                        queue.extend(scratch[..produced].iter().copied());
+                    }
+                    if consumed == 0 {
+                        break;
+                    }
+                    if consumed >= pending.len() {
+                        pending.clear();
+                    } else {
+                        pending.drain(..consumed);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Resampler error: {err}");
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn select_device<I>(
     devices: Result<I, cpal::DevicesError>,
     target: &str,
     kind: &str,
- ) -> Result<Device, Box<dyn Error>>
+) -> Result<Device, Box<dyn Error>>
 where
     I: Iterator<Item = Device>,
 {
@@ -230,10 +394,7 @@ where
         println!("{kind} device selected: {name}");
         Ok(device)
     } else if available.is_empty() {
-        Err(format!(
-            "{kind} device matching '{target}' not found (no devices available)"
-        )
-        .into())
+        Err(format!("{kind} device matching '{target}' not found (no devices available)").into())
     } else {
         Err(format!(
             "{kind} device matching '{target}' not found.\nAvailable:\n  {}",
