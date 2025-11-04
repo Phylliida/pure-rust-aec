@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let far_audio_path = args
         .get(3)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("examples/far_end.wav"));
+        .unwrap_or_else(|| PathBuf::from("examples/example_talking.wav"));
 
     let input_device = if let Some(name) = args.get(0) {
         select_device(host.input_devices(), name, "Input")?
@@ -827,9 +827,13 @@ where
     } else if available.is_empty() {
         Err(format!("{kind} device matching '{target}' not found (no devices available)").into())
     } else {
+        let quoted = available
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
         Err(format!(
-            "{kind} device matching '{target}' not found.\nAvailable:\n  {}",
-            available.join("\n  ")
+            "{kind} device matching '{target}' not found. Available: {quoted}"
         )
         .into())
     }
