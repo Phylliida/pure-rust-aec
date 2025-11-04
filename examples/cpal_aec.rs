@@ -298,25 +298,32 @@ impl SharedCanceller {
         if !new_samples.is_empty() {
             pending.extend_from_slice(new_samples);
         }
-        if pending.is_empty() {
-            return;
-        }
-
         let (in_rate, out_rate) = resampler.get_rate();
         let channels = resampler.channels();
 
         loop {
-            if pending.is_empty() {
+            if pending.len() < channels {
                 break;
             }
 
-            let available = pending.len();
-            let mut expected =
-                ((available as u64 * out_rate as u64) / in_rate as u64) as usize + channels;
-            expected = expected.max(channels);
-            scratch.resize(expected, 0);
+            let available_frames = pending.len() / channels;
+            if available_frames == 0 {
+                break;
+            }
+            let available_samples = available_frames * channels;
 
-            match resampler.process_interleaved_i16(pending.as_slice(), scratch.as_mut_slice()) {
+            let mut expected_frames = (available_frames as u64 * out_rate as u64
+                + in_rate as u64
+                - 1)
+                / in_rate as u64;
+            expected_frames = expected_frames.max(1);
+            let expected_samples = expected_frames as usize * channels;
+            scratch.resize(expected_samples, 0);
+
+            match resampler.process_interleaved_i16(
+                &pending[..available_samples],
+                scratch.as_mut_slice(),
+            ) {
                 Ok((consumed, produced)) => {
                     if produced > 0 {
                         queue.extend(scratch[..produced].iter().copied());
