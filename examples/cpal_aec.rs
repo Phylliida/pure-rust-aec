@@ -28,13 +28,14 @@ use std::{
     error::Error,
     f32::consts::PI,
     ffi::c_void,
+    mem,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, Sample, SampleFormat, Stream, StreamConfig,
+    Device, SampleFormat, Stream, StreamConfig,
 };
 use speex_rust_aec::{
     speex_echo_cancellation, speex_echo_ctl, EchoCanceller, Resampler, SPEEX_ECHO_SET_SAMPLING_RATE,
@@ -184,7 +185,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 struct SharedCanceller {
     aec: EchoCanceller,
-    channels: usize,
     frame_samples: usize,
     mic_resampler: Option<Resampler>,
     far_resampler: Option<Resampler>,
@@ -212,7 +212,6 @@ impl SharedCanceller {
         let frame_samples = frame_size * channels;
         Self {
             aec,
-            channels,
             frame_samples,
             mic_resampler,
             far_resampler,
@@ -339,13 +338,6 @@ impl SharedCanceller {
         }
     }
 
-    fn process_capture_generic<T: Sample>(&mut self, samples: &[T]) {
-        self.input_convert.resize(samples.len(), 0);
-        for (dst, src) in self.input_convert.iter_mut().zip(samples.iter()) {
-            *dst = src.to_i16();
-        }
-        self.process_capture(&self.input_convert);
-    }
 }
 
 fn build_output_stream(
@@ -357,49 +349,59 @@ fn build_output_stream(
     format: SampleFormat,
 ) -> Result<Stream, cpal::BuildStreamError> {
     match format {
-        SampleFormat::I16 => build_output_stream_for::<i16>(
-            device,
-            config,
-            shared,
-            phase_increment,
-            channels,
-        ),
-        SampleFormat::F32 => build_output_stream_for::<f32>(
-            device,
-            config,
-            shared,
-            phase_increment,
-            channels,
-        ),
-        SampleFormat::U16 => build_output_stream_for::<u16>(
-            device,
-            config,
-            shared,
-            phase_increment,
-            channels,
-        ),
-        format => {
-            eprintln!("Unsupported output sample format: {format:?}");
+        SampleFormat::I16 => build_output_stream_i16(device, config, shared, phase_increment, channels),
+        SampleFormat::F32 => build_output_stream_f32(device, config, shared, phase_increment, channels),
+        SampleFormat::U16 => build_output_stream_u16(device, config, shared, phase_increment, channels),
+        other => {
+            eprintln!("Unsupported output sample format: {other:?}");
             Err(cpal::BuildStreamError::StreamConfigNotSupported)
         }
     }
 }
 
-fn build_output_stream_for<T>(
+fn build_output_stream_i16(
     device: &Device,
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
     phase_increment: f32,
     channels: usize,
-) -> Result<Stream, cpal::BuildStreamError>
-where
-    T: Sample,
-{
+) -> Result<Stream, cpal::BuildStreamError> {
     let mut phase = 0f32;
     let mut far_frame = vec![0i16; channels];
     device.build_output_stream(
         config,
-        move |data: &mut [T], _| {
+        move |data: &mut [i16], _| {
+            let mut state = shared.lock().unwrap();
+            for frame in data.chunks_mut(channels) {
+                phase += phase_increment;
+                if phase > 2.0 * PI {
+                    phase -= 2.0 * PI;
+                }
+                let sample_i16 = (phase.sin() * 0.2 * i16::MAX as f32) as i16;
+                far_frame.fill(sample_i16);
+                for out_sample in frame.iter_mut() {
+                    *out_sample = sample_i16;
+                }
+                state.push_far_end(&far_frame);
+            }
+        },
+        move |err| eprintln!("Output stream error: {err}"),
+        None,
+    )
+}
+
+fn build_output_stream_f32(
+    device: &Device,
+    config: &StreamConfig,
+    shared: Arc<Mutex<SharedCanceller>>,
+    phase_increment: f32,
+    channels: usize,
+) -> Result<Stream, cpal::BuildStreamError> {
+    let mut phase = 0f32;
+    let mut far_frame = vec![0i16; channels];
+    device.build_output_stream(
+        config,
+        move |data: &mut [f32], _| {
             let mut state = shared.lock().unwrap();
             for frame in data.chunks_mut(channels) {
                 phase += phase_increment;
@@ -410,7 +412,41 @@ where
                 let sample_i16 = (sample_amp * i16::MAX as f32) as i16;
                 far_frame.fill(sample_i16);
                 for out_sample in frame.iter_mut() {
-                    *out_sample = Sample::from::<f32>(&sample_amp);
+                    *out_sample = sample_amp;
+                }
+                state.push_far_end(&far_frame);
+            }
+        },
+        move |err| eprintln!("Output stream error: {err}"),
+        None,
+    )
+}
+
+fn build_output_stream_u16(
+    device: &Device,
+    config: &StreamConfig,
+    shared: Arc<Mutex<SharedCanceller>>,
+    phase_increment: f32,
+    channels: usize,
+) -> Result<Stream, cpal::BuildStreamError> {
+    let mut phase = 0f32;
+    let mut far_frame = vec![0i16; channels];
+    device.build_output_stream(
+        config,
+        move |data: &mut [u16], _| {
+            let mut state = shared.lock().unwrap();
+            for frame in data.chunks_mut(channels) {
+                phase += phase_increment;
+                if phase > 2.0 * PI {
+                    phase -= 2.0 * PI;
+                }
+                let sample_amp = (phase.sin() * 0.2).clamp(-1.0, 1.0);
+                let sample_i16 = (sample_amp * i16::MAX as f32) as i16;
+                let sample_u16 = (((sample_amp + 1.0) * 0.5) * u16::MAX as f32)
+                    .clamp(0.0, u16::MAX as f32) as u16;
+                far_frame.fill(sample_i16);
+                for out_sample in frame.iter_mut() {
+                    *out_sample = sample_u16;
                 }
                 state.push_far_end(&far_frame);
             }
@@ -427,29 +463,74 @@ fn build_input_stream(
     format: SampleFormat,
 ) -> Result<Stream, cpal::BuildStreamError> {
     match format {
-        SampleFormat::I16 => build_input_stream_for::<i16>(device, config, shared),
-        SampleFormat::F32 => build_input_stream_for::<f32>(device, config, shared),
-        SampleFormat::U16 => build_input_stream_for::<u16>(device, config, shared),
-        format => {
-            eprintln!("Unsupported input sample format: {format:?}");
+        SampleFormat::I16 => build_input_stream_i16(device, config, shared),
+        SampleFormat::F32 => build_input_stream_f32(device, config, shared),
+        SampleFormat::U16 => build_input_stream_u16(device, config, shared),
+        other => {
+            eprintln!("Unsupported input sample format: {other:?}");
             Err(cpal::BuildStreamError::StreamConfigNotSupported)
         }
     }
 }
 
-fn build_input_stream_for<T>(
+fn build_input_stream_i16(
     device: &Device,
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
-) -> Result<Stream, cpal::BuildStreamError>
-where
-    T: Sample,
-{
+) -> Result<Stream, cpal::BuildStreamError> {
     device.build_input_stream(
         config,
-        move |data: &[T], _| {
+        move |data: &[i16], _| {
             let mut state = shared.lock().unwrap();
-            state.process_capture_generic(data);
+            state.process_capture(data);
+        },
+        move |err| eprintln!("Input stream error: {err}"),
+        None,
+    )
+}
+
+fn build_input_stream_f32(
+    device: &Device,
+    config: &StreamConfig,
+    shared: Arc<Mutex<SharedCanceller>>,
+) -> Result<Stream, cpal::BuildStreamError> {
+    device.build_input_stream(
+        config,
+        move |data: &[f32], _| {
+            let mut state = shared.lock().unwrap();
+            let mut buffer = mem::take(&mut state.input_convert);
+            buffer.resize(data.len(), 0);
+            for (dst, src) in buffer.iter_mut().zip(data.iter()) {
+                let clamped = (*src).clamp(-1.0, 1.0);
+                *dst = (clamped * i16::MAX as f32) as i16;
+            }
+            state.process_capture(&buffer);
+            state.input_convert = buffer;
+        },
+        move |err| eprintln!("Input stream error: {err}"),
+        None,
+    )
+}
+
+fn build_input_stream_u16(
+    device: &Device,
+    config: &StreamConfig,
+    shared: Arc<Mutex<SharedCanceller>>,
+) -> Result<Stream, cpal::BuildStreamError> {
+    device.build_input_stream(
+        config,
+        move |data: &[u16], _| {
+            let mut state = shared.lock().unwrap();
+            let mut buffer = mem::take(&mut state.input_convert);
+            buffer.resize(data.len(), 0);
+            for (dst, src) in buffer.iter_mut().zip(data.iter()) {
+                let normalized = (*src as f32) / u16::MAX as f32;
+                let centered = (normalized * 2.0) - 1.0;
+                let clamped = centered.clamp(-1.0, 1.0);
+                *dst = (clamped * i16::MAX as f32) as i16;
+            }
+            state.process_capture(&buffer);
+            state.input_convert = buffer;
         },
         move |err| eprintln!("Input stream error: {err}"),
         None,
