@@ -38,30 +38,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let host = cpal::default_host();
 
     let input_device = if let Some(name) = args.get(0) {
-        match host.input_devices() {
-            Ok(devices) => find_device(devices, name).ok_or_else(|| {
-                format!(
-                    "Input device matching '{name}' not found.\nAvailable:\n{}",
-                    device_listing(host.input_devices())
-                )
-            })?,
-            Err(err) => return Err(format!("Failed to enumerate input devices: {err}").into()),
-        }
+        select_device(host.input_devices(), name, "Input")?
     } else {
         host.default_input_device()
             .ok_or("No default input device available")?
     };
 
     let output_device = if let Some(name) = args.get(1) {
-        match host.output_devices() {
-            Ok(devices) => find_device(devices, name).ok_or_else(|| {
-                format!(
-                    "Output device matching '{name}' not found.\nAvailable:\n{}",
-                    device_listing(host.output_devices())
-                )
-            })?,
-            Err(err) => return Err(format!("Failed to enumerate output devices: {err}").into()),
-        }
+        select_device(host.output_devices(), name, "Output")?
     } else {
         host.default_output_device()
             .ok_or("No default output device available")?
@@ -122,6 +106,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         },
         move |err| eprintln!("Output stream error: {err}"),
+        None,
     )?;
 
     let input_shared = Arc::clone(&shared);
@@ -132,6 +117,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             state.process_capture(data);
         },
         move |err| eprintln!("Input stream error: {err}"),
+        None,
     )?;
 
     output_stream.play()?;
@@ -213,30 +199,46 @@ impl SharedCanceller {
     }
 }
 
-fn find_device(mut devices: cpal::Devices, target: &str) -> Option<Device> {
+fn select_device<I>(
+    devices: Result<I, cpal::DevicesError>,
+    target: &str,
+    kind: &str,
+ ) -> Result<Device, Box<dyn Error>>
+where
+    I: Iterator<Item = Device>,
+{
     let target_lower = target.to_lowercase();
-    devices.find(|device| {
-        device
-            .name()
-            .map(|name| name.to_lowercase().contains(&target_lower))
-            .unwrap_or(false)
-    })
-}
+    let mut available = Vec::new();
+    let mut selected: Option<(String, Device)> = None;
 
-fn device_listing(devices: Result<cpal::Devices, cpal::DevicesError>) -> String {
     match devices {
         Ok(list) => {
-            let names: Vec<String> = list.filter_map(|device| device.name().ok()).collect();
-            if names.is_empty() {
-                "  (none)".to_string()
-            } else {
-                names
-                    .into_iter()
-                    .map(|name| format!("  {name}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+            for device in list {
+                let name = device
+                    .name()
+                    .unwrap_or_else(|_| "<unknown device>".to_string());
+                if selected.is_none() && name.to_lowercase().contains(&target_lower) {
+                    selected = Some((name.clone(), device));
+                }
+                available.push(name);
             }
         }
-        Err(err) => format!("  <error listing devices: {err}>"),
+        Err(err) => return Err(format!("Failed to enumerate {kind} devices: {err}").into()),
+    }
+
+    if let Some((name, device)) = selected {
+        println!("{kind} device selected: {name}");
+        Ok(device)
+    } else if available.is_empty() {
+        Err(format!(
+            "{kind} device matching '{target}' not found (no devices available)"
+        )
+        .into())
+    } else {
+        Err(format!(
+            "{kind} device matching '{target}' not found.\nAvailable:\n  {}",
+            available.join("\n  ")
+        )
+        .into())
     }
 }
