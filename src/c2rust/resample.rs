@@ -1,3 +1,6 @@
+#![allow(unused_assignments)]
+#![allow(unused_variables)]
+
 extern "C" {
     fn calloc(__nmemb: size_t, __size: size_t) -> *mut std::ffi::c_void;
     fn realloc(__ptr: *mut std::ffi::c_void, __size: size_t) -> *mut std::ffi::c_void;
