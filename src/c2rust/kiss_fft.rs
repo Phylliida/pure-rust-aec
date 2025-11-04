@@ -1,3 +1,6 @@
+#![allow(unused_assignments)]
+#![allow(unused_variables)]
+
 #[repr(C)]
 pub struct _IO_wide_data {
     _unused: [u8; 0],

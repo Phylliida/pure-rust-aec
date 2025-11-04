@@ -1,3 +1,4 @@
+#![allow(unused_assignments)]
 
 extern "C" {
     fn cos(__x: std::ffi::c_double) -> std::ffi::c_double;
