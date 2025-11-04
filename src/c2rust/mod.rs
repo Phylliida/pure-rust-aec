@@ -23,6 +23,7 @@ pub mod fftwrap;
 pub mod kiss_fft;
 pub mod kiss_fftr;
 pub mod mdf;
+pub mod resample;
 pub mod smallft;
 
 pub use self::mdf::speex_echo_h;

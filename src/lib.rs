@@ -21,7 +21,9 @@
 
 pub mod c2rust;
 
-use std::ffi::c_int;
+use std::ffi::{c_int, CStr};
+use std::fmt;
+use std::ptr::NonNull;
 
 pub use c2rust::speex_echo_h::{
     SPEEX_ECHO_GET_FRAME_SIZE, SPEEX_ECHO_GET_IMPULSE_RESPONSE,
