@@ -35,7 +35,7 @@ use std::{
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, SampleFormat, Stream, StreamConfig,
+    Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfigRange,
 };
 use hound::{self, WavSpec};
 use speex_rust_aec::{
@@ -44,6 +44,62 @@ use speex_rust_aec::{
 
 const DEFAULT_AEC_RATE: u32 = 48_000;
 const RESAMPLER_QUALITY: i32 = 5;
+
+fn gather_supported_input_configs(
+    device: &Device,
+) -> Result<Vec<SupportedStreamConfigRange>, cpal::SupportedStreamConfigsError> {
+    device.supported_input_configs().map(|configs| configs.collect())
+}
+
+fn gather_supported_output_configs(
+    device: &Device,
+) -> Result<Vec<SupportedStreamConfigRange>, cpal::SupportedStreamConfigsError> {
+    device
+        .supported_output_configs()
+        .map(|configs| configs.collect())
+}
+
+fn log_supported_configs(
+    kind: &str,
+    device_name: &str,
+    configs: &[SupportedStreamConfigRange],
+) {
+    if configs.is_empty() {
+        println!(
+            "{kind} device '{device_name}' reported no supported stream configurations."
+        );
+        return;
+    }
+
+    println!("{kind} device '{device_name}' supported configs:");
+    for (idx, cfg) in configs.iter().enumerate() {
+        let min_rate = cfg.min_sample_rate().0;
+        let max_rate = cfg.max_sample_rate().0;
+        let rate_desc = if min_rate == max_rate {
+            format!("{min_rate} Hz")
+        } else {
+            format!("{min_rate}-{max_rate} Hz")
+        };
+        println!(
+            "  #{idx}: {} channel(s), format: {:?}, sample rates: {rate_desc}",
+            cfg.channels(),
+            cfg.sample_format(),
+        );
+    }
+}
+
+fn supports_rate(
+    configs: &[SupportedStreamConfigRange],
+    channels: u16,
+    rate: u32,
+    format: SampleFormat,
+) -> bool {
+    let sample_rate = SampleRate(rate);
+    configs
+        .iter()
+        .filter(|cfg| cfg.channels() == channels && cfg.sample_format() == format)
+        .any(|cfg| cfg.clone().try_with_sample_rate(sample_rate).is_some())
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -73,6 +129,35 @@ fn main() -> Result<(), Box<dyn Error>> {
             .ok_or("No default output device available")?
     };
 
+    let input_device_name = input_device
+        .name()
+        .unwrap_or_else(|_| "<unknown input device>".to_string());
+    let output_device_name = output_device
+        .name()
+        .unwrap_or_else(|_| "<unknown output device>".to_string());
+
+    let input_supported_configs = match gather_supported_input_configs(&input_device) {
+        Ok(configs) => configs,
+        Err(err) => {
+            eprintln!(
+                "Unable to enumerate input configs for '{input_device_name}': {err}"
+            );
+            Vec::new()
+        }
+    };
+    log_supported_configs("Input", &input_device_name, &input_supported_configs);
+
+    let output_supported_configs = match gather_supported_output_configs(&output_device) {
+        Ok(configs) => configs,
+        Err(err) => {
+            eprintln!(
+                "Unable to enumerate output configs for '{output_device_name}': {err}"
+            );
+            Vec::new()
+        }
+    };
+    log_supported_configs("Output", &output_device_name, &output_supported_configs);
+
     let input_config = input_device.default_input_config()?;
     let output_config = output_device.default_output_config()?;
 
@@ -90,6 +175,59 @@ fn main() -> Result<(), Box<dyn Error>> {
     let input_rate = input_stream_config.sample_rate.0;
     let output_rate = output_stream_config.sample_rate.0;
     let channels = input_stream_config.channels as usize;
+
+    if !input_supported_configs.is_empty() && !output_supported_configs.is_empty() {
+        let input_channels = input_stream_config.channels;
+        let output_channels = output_stream_config.channels;
+        let input_format = input_config.sample_format();
+        let output_format = output_config.sample_format();
+        if !supports_rate(
+            &input_supported_configs,
+            input_channels,
+            target_sample_rate,
+            input_format,
+        ) || !supports_rate(
+            &output_supported_configs,
+            output_channels,
+            target_sample_rate,
+            output_format,
+        ) {
+            let mut reasons = Vec::new();
+            if !supports_rate(
+                &input_supported_configs,
+                input_channels,
+                target_sample_rate,
+                input_format,
+            ) {
+                reasons.push(format!(
+                    "input device '{}' ({} channel[s], {:?})",
+                    input_device_name, input_channels, input_format
+                ));
+            }
+            if !supports_rate(
+                &output_supported_configs,
+                output_channels,
+                target_sample_rate,
+                output_format,
+            ) {
+                reasons.push(format!(
+                    "output device '{}' ({} channel[s], {:?})",
+                    output_device_name, output_channels, output_format
+                ));
+            }
+            let details = if reasons.is_empty() {
+                "unknown devices".to_string()
+            } else {
+                reasons.join(" and ")
+            };
+            return Err(format!(
+                "AEC sample rate {} Hz is not supported by {}. \
+                Please rerun with a supported rate.",
+                target_sample_rate, details
+            )
+            .into());
+        }
+    }
 
     println!(
         "Input rate: {input_rate} Hz, output rate: {output_rate} Hz, AEC rate: {target_sample_rate} Hz"
@@ -630,7 +768,7 @@ fn build_output_stream_i16(
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
     far_source: Arc<Mutex<FarAudioSource>>,
-    channels: usize,
+    _channels: usize,
 ) -> Result<Stream, cpal::BuildStreamError> {
     let mut far_buffer = Vec::<i16>::new();
     device.build_output_stream(
@@ -657,7 +795,7 @@ fn build_output_stream_f32(
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
     far_source: Arc<Mutex<FarAudioSource>>,
-    channels: usize,
+    _channels: usize,
 ) -> Result<Stream, cpal::BuildStreamError> {
     let mut far_buffer = Vec::<i16>::new();
     device.build_output_stream(
@@ -686,7 +824,7 @@ fn build_output_stream_u16(
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
     far_source: Arc<Mutex<FarAudioSource>>,
-    channels: usize,
+    _channels: usize,
 ) -> Result<Stream, cpal::BuildStreamError> {
     let mut far_buffer = Vec::<i16>::new();
     device.build_output_stream(
