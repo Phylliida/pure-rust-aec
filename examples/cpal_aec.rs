@@ -23,7 +23,7 @@
 //! omitted, the demo defaults to 48 kHz and transparently resamples the devices if needed.
 
 use std::{
-    collections::VecDeque,
+    collections::{hash_map::Entry, HashMap, VecDeque},
     env,
     error::Error,
     ffi::c_void,
@@ -35,7 +35,8 @@ use std::{
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, Sample, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfigRange,
+    Device, FromSample, InputCallbackInfo, Sample, SampleFormat, SampleRate, SizedSample, Stream,
+    StreamConfig, StreamInstant, SupportedStreamConfigRange,
 };
 use hound::{self, WavSpec};
 use speex_rust_aec::{
@@ -44,6 +45,107 @@ use speex_rust_aec::{
 
 const DEFAULT_AEC_RATE: u32 = 48_000;
 const RESAMPLER_QUALITY: i32 = 5;
+
+type AecCallback = Box<dyn FnMut(&[i16]) + Send + 'static>;
+
+struct ResampleContext {
+    resampler: Resampler,
+    channels: usize,
+}
+
+impl ResampleContext {
+    fn new(resampler: Resampler) -> Self {
+        let channels = resampler.channels() as usize;
+        Self {
+            resampler,
+            channels,
+        }
+    }
+
+    fn process(&mut self, new_samples: &[i16], out: &mut Vec<i16>) {
+        if new_samples.is_empty() {
+            return;
+        }
+        if self.channels == 0 {
+            eprintln!("ResampleContext invoked with zero channels; skipping.");
+            return;
+        }
+        if new_samples.len() % self.channels != 0 {
+            eprintln!(
+                "ResampleContext received samples not aligned to {} channel(s); dropping remainder.",
+                self.channels
+            );
+            return;
+        }
+
+        let (in_rate, out_rate) = self.resampler.get_rate();
+        let input_frames = new_samples.len() / self.channels;
+        if input_frames == 0 {
+            return;
+        }
+
+        let mut offset = 0usize;
+        while offset < new_samples.len() {
+            let remaining_samples = new_samples.len() - offset;
+            let remaining_frames = remaining_samples / self.channels;
+            if remaining_frames == 0 {
+                break;
+            }
+
+            let mut expected_frames =
+                (remaining_frames as u64 * out_rate as u64 + in_rate as u64 - 1) / in_rate as u64;
+            expected_frames = expected_frames.max(1) + 4; // add headroom
+            let mut chunk_samples = (expected_frames as usize).saturating_mul(self.channels);
+            if chunk_samples == 0 {
+                chunk_samples = self.channels.max(1);
+            }
+
+            let mut attempts = 0usize;
+            loop {
+                let start = out.len();
+                out.resize(start + chunk_samples, 0);
+                match self
+                    .resampler
+                    .process_interleaved_i16(&new_samples[offset..], &mut out[start..])
+                {
+                    Ok((consumed, produced)) => {
+                        out.truncate(start + produced);
+                        if consumed == 0 {
+                            if produced == chunk_samples && attempts < 8 {
+                                attempts += 1;
+                                chunk_samples += self.channels.max(1) * 32;
+                                continue;
+                            }
+                            if produced == 0 {
+                                out.truncate(start);
+                            }
+                            return;
+                        }
+                        offset += consumed;
+                        break;
+                    }
+                    Err(err) => {
+                        out.truncate(start);
+                        eprintln!("Resampler error: {err}");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn flush_into(&mut self, out: &mut Vec<i16>) {
+        let latency_samples = self.resampler.output_latency().saturating_mul(self.channels);
+        if latency_samples == 0 {
+            return;
+        }
+        if self.channels == 0 {
+            return;
+        }
+        let zeros = vec![0i16; latency_samples];
+        self.process(zeros.as_slice(), out);
+    }
+}
 
 fn gather_supported_input_configs(
     device: &Device,
@@ -164,55 +266,53 @@ fn main() -> Result<(), Box<dyn Error>> {
     let input_stream_config: StreamConfig = input_config.config();
     let output_stream_config: StreamConfig = output_config.config();
 
-    if input_stream_config.channels != output_stream_config.channels {
-        eprintln!(
-            "Input/output channel mismatch: {} in vs {} out. Matching channels are required.",
-            input_stream_config.channels, output_stream_config.channels
-        );
-        return Ok(());
-    }
-
     let input_rate = input_stream_config.sample_rate.0;
     let output_rate = output_stream_config.sample_rate.0;
-    let channels = input_stream_config.channels as usize;
+    let input_channels = input_stream_config.channels as usize;
+    let output_channels = output_stream_config.channels as usize;
+
+    if input_channels == 0 {
+        return Err("Input device reports zero channels; cannot run AEC.".into());
+    }
+    if output_channels == 0 {
+        return Err("Output device reports zero channels; cannot run AEC.".into());
+    }
 
     if !input_supported_configs.is_empty() && !output_supported_configs.is_empty() {
-        let input_channels = input_stream_config.channels;
-        let output_channels = output_stream_config.channels;
         let input_format = input_config.sample_format();
         let output_format = output_config.sample_format();
         if !supports_rate(
             &input_supported_configs,
-            input_channels,
+            input_stream_config.channels,
             target_sample_rate,
             input_format,
         ) || !supports_rate(
             &output_supported_configs,
-            output_channels,
+            output_stream_config.channels,
             target_sample_rate,
             output_format,
         ) {
             let mut reasons = Vec::new();
             if !supports_rate(
                 &input_supported_configs,
-                input_channels,
+                input_stream_config.channels,
                 target_sample_rate,
                 input_format,
             ) {
                 reasons.push(format!(
                     "input device '{}' ({} channel[s], {:?})",
-                    input_device_name, input_channels, input_format
+                    input_device_name, input_stream_config.channels, input_format
                 ));
             }
             if !supports_rate(
                 &output_supported_configs,
-                output_channels,
+                output_stream_config.channels,
                 target_sample_rate,
                 output_format,
             ) {
                 reasons.push(format!(
                     "output device '{}' ({} channel[s], {:?})",
-                    output_device_name, output_channels, output_format
+                    output_device_name, output_stream_config.channels, output_format
                 ));
             }
             let details = if reasons.is_empty() {
@@ -230,118 +330,72 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!(
-        "Input rate: {input_rate} Hz, output rate: {output_rate} Hz, AEC rate: {target_sample_rate} Hz"
+        "Input: {input_channels} ch @ {input_rate} Hz, Output: {output_channels} ch @ {output_rate} Hz, AEC rate: {target_sample_rate} Hz"
     );
 
-    let far_audio = load_far_audio(&far_audio_path, channels, output_rate)
+    let far_audio = load_far_audio(&far_audio_path, output_channels, output_rate)
         .map_err(|e| format!("Failed to load far-end audio '{}': {e}", far_audio_path.display()))?;
     println!("Far-end audio source: {}", far_audio_path.display());
-    let far_source = Arc::new(Mutex::new(far_audio));
 
-    let mut mic_resampler = if input_rate != target_sample_rate {
-        println!("Resampling input stream to match AEC rate.");
-        Some(
-            Resampler::new(
-                channels as u32,
-                input_rate,
-                target_sample_rate,
-                RESAMPLER_QUALITY,
-            )
-            .map_err(|e| format!("Failed to create input resampler: {e}"))?,
-        )
-    } else {
-        None
-    };
+    let default_frame_size = (target_sample_rate / 100).max(1) as usize;
+    let default_filter_length = default_frame_size * 20;
 
-    if let Some(resampler) = mic_resampler.as_mut() {
-        if let Err(err) = resampler.skip_zeros() {
-            eprintln!("Unable to prime input resampler: {err}");
-        }
-    }
-
-    let mut far_resampler = if output_rate != target_sample_rate {
-        println!("Resampling output reference stream to match AEC rate.");
-        Some(
-            Resampler::new(
-                channels as u32,
-                output_rate,
-                target_sample_rate,
-                RESAMPLER_QUALITY,
-            )
-            .map_err(|e| format!("Failed to create output resampler: {e}"))?,
-        )
-    } else {
-        None
-    };
-
-    if let Some(resampler) = far_resampler.as_mut() {
-        if let Err(err) = resampler.skip_zeros() {
-            eprintln!("Unable to prime output resampler: {err}");
-        }
-    }
-
-    let frame_size = (target_sample_rate / 100).max(1) as usize; // ~10 ms frames
-    let filter_length = frame_size * 20; // 200 ms echo tail
-
-    let canceller =
-        EchoCanceller::new_multichannel(frame_size, filter_length, channels, channels)
-            .ok_or("Failed to allocate echo canceller state")?;
-
-    unsafe {
-        let mut rate = target_sample_rate as i32;
-        speex_echo_ctl(
-            canceller.as_ptr(),
-            SPEEX_ECHO_SET_SAMPLING_RATE,
-            &mut rate as *mut _ as *mut c_void,
-        );
-    }
-
-    let shared = Arc::new(Mutex::new(SharedCanceller::new(
-        canceller,
-        channels,
-        frame_size,
-        mic_resampler,
-        far_resampler,
-    )));
-
-    let output_stream = build_output_stream(
-        &output_device,
-        &output_stream_config,
-        Arc::clone(&shared),
-        Arc::clone(&far_source),
-        channels,
-        output_config.sample_format(),
-    )?;
-
-    let input_stream = build_input_stream(
+    let shared_stream = SharedAecStream::new(
         &input_device,
+        &output_device,
         &input_stream_config,
-        Arc::clone(&shared),
         input_config.sample_format(),
+        &output_stream_config,
+        output_config.sample_format(),
+        target_sample_rate,
+        default_frame_size,
+        default_filter_length,
     )?;
+    shared_stream.add_audio(0, &far_audio, output_rate);
 
-    output_stream.play()?;
-    input_stream.play()?;
+    let shared_state = shared_stream.shared_state();
+
+    let mut frame_counter = 0usize;
+    shared_stream.register_callback(move |frame| {
+        frame_counter += 1;
+        if frame_counter % 50 == 0 {
+            let rms = (frame
+                .iter()
+                .map(|s| (*s as f64) * (*s as f64))
+                .sum::<f64>()
+                / frame.len() as f64)
+                .sqrt();
+            println!("Echo-cancelled frame RMS: {rms:.2}");
+        }
+    });
 
     println!("Running Speex AEC demo for five seconds...");
     std::thread::sleep(Duration::from_secs(5));
     println!("Done.");
 
-    drop(output_stream);
-   drop(input_stream);
+    drop(shared_stream);
 
     let recording_path = PathBuf::from("examples/aec_output.wav");
-    let recorded_samples = {
-        let mut guard = shared.lock().unwrap();
+    let (recorded_samples, capture_frames, last_capture_timestamp) = {
+        let mut guard = shared_state.lock().unwrap();
         guard.flush();
-        guard.take_recording()
+        let frames = guard.capture_frames_received;
+        let timestamp = guard.last_capture_timestamp;
+        (guard.take_recording(), frames, timestamp)
     };
+
+    match last_capture_timestamp {
+        Some(ts) => println!(
+            "Captured {capture_frames} AEC-rate frame(s); last capture timestamp: {ts:?}"
+        ),
+        None => println!("Captured {capture_frames} AEC-rate frame(s); no timestamp reported."),
+    }
 
     if recorded_samples.is_empty() {
         eprintln!("No echo-cancelled audio captured; skipping write to {}", recording_path.display());
     } else {
         let spec = WavSpec {
-            channels: channels as u16,
+            channels: input_channels as u16,
             sample_rate: target_sample_rate,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
@@ -363,89 +417,119 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 struct SharedCanceller {
     aec: EchoCanceller,
-    frame_samples: usize,
-    mic_resampler: Option<Resampler>,
-    far_resampler: Option<Resampler>,
-    mic_resampler_pending: Vec<i16>,
-    far_resampler_pending: Vec<i16>,
-    mic_resample_buf: Vec<i16>,
-    far_resample_buf: Vec<i16>,
-    input_convert: Vec<i16>,
+    input_channels: usize,
+    output_channels: usize,
+    input_frame_samples: usize,
+    output_frame_samples: usize,
     far_queue: VecDeque<i16>,
-    mic_queue: VecDeque<i16>,
-    mic_frame: Vec<i16>,
+    input_queue: VecDeque<i16>,
+    input_frame: Vec<i16>,
     far_frame: Vec<i16>,
     out_frame: Vec<i16>,
     processed_frames: usize,
     recorded: Vec<i16>,
+    callbacks: Vec<AecCallback>,
+    capture_frames_received: u64,
+    last_capture_timestamp: Option<StreamInstant>,
 }
 
 impl SharedCanceller {
     fn new(
         aec: EchoCanceller,
-        channels: usize,
+        input_channels: usize,
+        output_channels: usize,
         frame_size: usize,
-        mic_resampler: Option<Resampler>,
-        far_resampler: Option<Resampler>,
     ) -> Self {
-        let frame_samples = frame_size * channels;
+        let input_frame_samples = frame_size * input_channels;
+        let output_frame_samples = frame_size * output_channels;
         Self {
             aec,
-            frame_samples,
-            mic_resampler,
-            far_resampler,
-            mic_resampler_pending: Vec::with_capacity(frame_samples),
-            far_resampler_pending: Vec::with_capacity(frame_samples),
-            mic_resample_buf: Vec::with_capacity(frame_samples),
-            far_resample_buf: Vec::with_capacity(frame_samples),
-            input_convert: Vec::with_capacity(frame_samples),
-            far_queue: VecDeque::with_capacity(frame_samples * 8),
-            mic_queue: VecDeque::with_capacity(frame_samples * 8),
-            mic_frame: vec![0; frame_samples],
-            far_frame: vec![0; frame_samples],
-            out_frame: vec![0; frame_samples],
+            input_channels,
+            output_channels,
+            input_frame_samples,
+            output_frame_samples,
+            far_queue: VecDeque::with_capacity(output_frame_samples * 8),
+            input_queue: VecDeque::with_capacity(input_frame_samples * 8),
+            input_frame: vec![0; input_frame_samples],
+            far_frame: vec![0; output_frame_samples.max(1)],
+            out_frame: vec![0; input_frame_samples],
             processed_frames: 0,
-            recorded: Vec::with_capacity(frame_samples * 8),
+            recorded: Vec::with_capacity(input_frame_samples * 8),
+            callbacks: Vec::new(),
+            capture_frames_received: 0,
+            last_capture_timestamp: None,
         }
     }
 
-    fn push_far_end(&mut self, samples: &[i16]) {
-        if let Some(resampler) = self.far_resampler.as_mut() {
-            Self::queue_resampled(
-                resampler,
-                &mut self.far_resampler_pending,
-                samples,
-                &mut self.far_resample_buf,
-                &mut self.far_queue,
-            );
-        } else {
-            self.far_queue.extend(samples.iter().copied());
+    fn push_far_end_resampled(&mut self, samples: &[i16]) {
+        if samples.is_empty() {
+            return;
         }
-        let max_len = self.frame_samples * 16;
+        if self.output_channels == 0 {
+            return;
+        }
+        let remainder = samples.len() % self.output_channels;
+        if remainder != 0 {
+            eprintln!(
+                "Far-end reference samples ({}) not divisible by output channel count {}; dropping remainder.",
+                samples.len(),
+                self.output_channels
+            );
+        }
+        let usable = samples.len() - remainder;
+        if usable == 0 {
+            return;
+        }
+        self.far_queue
+            .extend(samples[..usable].iter().copied());
+        let max_len = self.output_frame_samples * 16;
         while self.far_queue.len() > max_len {
             self.far_queue.pop_front();
         }
     }
 
-    fn process_capture(&mut self, samples: &[i16]) {
-        if let Some(resampler) = self.mic_resampler.as_mut() {
-            Self::queue_resampled(
-                resampler,
-                &mut self.mic_resampler_pending,
-                samples,
-                &mut self.mic_resample_buf,
-                &mut self.mic_queue,
-            );
-        } else {
-            self.mic_queue.extend(samples.iter().copied());
+    fn process_capture_resampled(
+        &mut self,
+        samples: &[i16],
+        capture_timestamp: Option<StreamInstant>,
+    ) {
+        if let Some(timestamp) = capture_timestamp {
+            self.last_capture_timestamp = Some(timestamp);
         }
+        if samples.is_empty() {
+            return;
+        }
+        if self.input_channels == 0 {
+            return;
+        }
+        let remainder = samples.len() % self.input_channels;
+        if remainder != 0 {
+            eprintln!(
+                "Capture samples ({}) not divisible by input channel count {}; dropping remainder.",
+                samples.len(),
+                self.input_channels
+            );
+        }
+        let usable = samples.len() - remainder;
+        if usable == 0 {
+            return;
+        }
+        self.input_queue
+            .extend(samples[..usable].iter().copied());
+        let frames = usable / self.input_channels;
+        self.capture_frames_received = self
+            .capture_frames_received
+            .saturating_add(frames as u64);
         self.process_ready_frames();
     }
 
     fn process_ready_frames(&mut self) {
-        while self.mic_queue.len() >= self.frame_samples {
-            for sample in self.mic_frame.iter_mut() {
-                *sample = self.mic_queue.pop_front().unwrap();
+        if self.input_frame_samples == 0 {
+            return;
+        }
+        while self.input_queue.len() >= self.input_frame_samples {
+            for sample in self.input_frame.iter_mut() {
+                *sample = self.input_queue.pop_front().unwrap();
             }
             for sample in self.far_frame.iter_mut() {
                 *sample = self.far_queue.pop_front().unwrap_or(0);
@@ -453,253 +537,81 @@ impl SharedCanceller {
             unsafe {
                 speex_echo_cancellation(
                     self.aec.as_ptr(),
-                    self.mic_frame.as_ptr(),
-                    self.far_frame.as_ptr(),
+                    self.input_frame.as_ptr(),
+                    if self.output_channels == 0 {
+                        std::ptr::null()
+                    } else {
+                        self.far_frame.as_ptr()
+                    },
                     self.out_frame.as_mut_ptr(),
                 );
             }
             self.processed_frames += 1;
             self.recorded
                 .extend(self.out_frame.iter().copied());
-            if self.processed_frames % 50 == 0 {
-                let rms = (self
-                    .out_frame
-                    .iter()
-                    .map(|s| (*s as f64) * (*s as f64))
-                    .sum::<f64>()
-                    / self.out_frame.len() as f64)
-                    .sqrt();
-                println!("Echo-cancelled frame RMS: {rms:.2}");
+            for callback in self.callbacks.iter_mut() {
+                callback(self.out_frame.as_slice());
             }
         }
     }
 
     fn flush(&mut self) {
-        Self::flush_resampler(
-            self.mic_resampler.as_mut(),
-            &mut self.mic_resampler_pending,
-            &mut self.mic_resample_buf,
-            &mut self.mic_queue,
-        );
-        Self::flush_resampler(
-            self.far_resampler.as_mut(),
-            &mut self.far_resampler_pending,
-            &mut self.far_resample_buf,
-            &mut self.far_queue,
-        );
-
         self.process_ready_frames();
 
-        if !self.mic_queue.is_empty() {
-            let needed = self.frame_samples - self.mic_queue.len();
-            self.mic_queue
+        if !self.input_queue.is_empty() && self.input_frame_samples != 0 {
+            let needed = self.input_frame_samples - self.input_queue.len();
+            self.input_queue
                 .extend(std::iter::repeat(0i16).take(needed));
             self.process_ready_frames();
         }
     }
 
-    fn queue_resampled(
-        resampler: &mut Resampler,
-        pending: &mut Vec<i16>,
-        new_samples: &[i16],
-        scratch: &mut Vec<i16>,
-        queue: &mut VecDeque<i16>,
-    ) {
-        if !new_samples.is_empty() {
-            pending.extend_from_slice(new_samples);
-        }
-        let (in_rate, out_rate) = resampler.get_rate();
-        let channels = resampler.channels();
-
-        loop {
-            if pending.len() < channels {
-                break;
-            }
-
-            let available_frames = pending.len() / channels;
-            if available_frames == 0 {
-                break;
-            }
-            let available_samples = available_frames * channels;
-
-            let mut expected_frames = (available_frames as u64 * out_rate as u64
-                + in_rate as u64
-                - 1)
-                / in_rate as u64;
-            expected_frames = expected_frames.max(1);
-            let expected_samples = expected_frames as usize * channels;
-            scratch.resize(expected_samples, 0);
-
-            match resampler.process_interleaved_i16(
-                &pending[..available_samples],
-                scratch.as_mut_slice(),
-            ) {
-                Ok((consumed, produced)) => {
-                    if produced > 0 {
-                        queue.extend(scratch[..produced].iter().copied());
-                    }
-                    if consumed == 0 {
-                        break;
-                    }
-                    if consumed >= pending.len() {
-                        pending.clear();
-                    } else {
-                        pending.drain(..consumed);
-                    }
-                }
-                Err(err) => {
-                    eprintln!("Resampler error: {err}");
-                    break;
-                }
-            }
-        }
-    }
-
-    fn flush_resampler(
-        mut resampler: Option<&mut Resampler>,
-        pending: &mut Vec<i16>,
-        scratch: &mut Vec<i16>,
-        queue: &mut VecDeque<i16>,
-    ) {
-        let Some(resampler) = resampler else {
-            return;
-        };
-        let channels = resampler.channels();
-
-        let remainder = pending.len() % channels;
-        if remainder != 0 {
-            let pad = channels - remainder;
-            pending.extend(std::iter::repeat(0i16).take(pad));
-        }
-
-        if !pending.is_empty() {
-            Self::queue_resampled(resampler, pending, &[], scratch, queue);
-        }
-
-        let latency = resampler.output_latency().saturating_mul(channels);
-        if latency > 0 {
-            let zeros = vec![0i16; latency];
-            Self::queue_resampled(resampler, pending, zeros.as_slice(), scratch, queue);
-        }
-
-        pending.clear();
-        scratch.clear();
-    }
-
     fn take_recording(&mut self) -> Vec<i16> {
         mem::take(&mut self.recorded)
     }
+
+    fn add_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(&[i16]) + Send + 'static,
+    {
+        self.callbacks.push(Box::new(callback));
+    }
 }
 
-struct FarAudioSource {
-    samples: Vec<i16>,
-    channels: usize,
-    position: usize,
-    resampler: Option<Resampler>,
-    pending: Vec<i16>,
-    scratch: Vec<i16>,
+struct PlaybackBuffer {
     queue: VecDeque<i16>,
+    channels: usize,
 }
 
-impl FarAudioSource {
-    fn new(
-        samples: Vec<i16>,
-        source_rate: u32,
-        output_rate: u32,
-        channels: usize,
-    ) -> Result<Self, String> {
-        if channels == 0 {
-            return Err("Output channel count must be greater than zero".into());
-        }
-        if samples.is_empty() {
-            return Err("Audio file contained no samples".into());
-        }
-
-        let resampler = if source_rate != output_rate {
-            let mut r = Resampler::new(
-                channels as u32,
-                source_rate,
-                output_rate,
-                RESAMPLER_QUALITY,
-            )
-            .map_err(|e| format!("Failed to create playback resampler: {e}"))?;
-            if let Err(err) = r.skip_zeros() {
-                eprintln!("Unable to prime playback resampler: {err}");
-            }
-            Some(r)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            samples,
-            channels,
-            position: 0,
-            resampler,
-            pending: Vec::with_capacity(channels * 1024),
-            scratch: Vec::with_capacity(channels * 1024),
+impl PlaybackBuffer {
+    fn new(channels: usize) -> Self {
+        Self {
             queue: VecDeque::with_capacity(channels * 1024),
-        })
-    }
-
-    fn next_samples(&mut self, out: &mut [i16]) {
-        if out.is_empty() {
-            return;
-        }
-        if let Some(_) = self.resampler {
-            self.fill_resampled(out.len());
-            for sample in out.iter_mut() {
-                if let Some(value) = self.queue.pop_front() {
-                    *sample = value;
-                } else {
-                    *sample = 0;
-                }
-            }
-        } else {
-            let len = self.samples.len();
-            let mut pos = self.position;
-            for sample in out.iter_mut() {
-                *sample = self.samples[pos];
-                pos += 1;
-                if pos >= len {
-                    pos = 0;
-                }
-            }
-            self.position = pos;
+            channels,
         }
     }
 
-    fn fill_resampled(&mut self, required_samples: usize) {
-        let Some(resampler) = self.resampler.as_mut() else {
-            return;
-        };
-        if self.samples.is_empty() {
+    fn push_samples(&mut self, samples: &[i16]) {
+        if samples.is_empty() {
             return;
         }
-        let len = self.samples.len();
-        while self.queue.len() < required_samples {
-            let before = self.queue.len();
-            let chunk_frames = ((required_samples.saturating_sub(before)) / self.channels)
-                .max(1);
-            let chunk_samples = chunk_frames * self.channels;
-            self.pending.reserve(chunk_samples);
-            for _ in 0..chunk_samples {
-                self.pending.push(self.samples[self.position]);
-                self.position += 1;
-                if self.position >= len {
-                    self.position = 0;
-                }
-            }
-            SharedCanceller::queue_resampled(
-                resampler,
-                &mut self.pending,
-                &[],
-                &mut self.scratch,
-                &mut self.queue,
+        if self.channels == 0 {
+            eprintln!("PlaybackBuffer received samples but channel count is zero; discarding.");
+            return;
+        }
+        if samples.len() % self.channels != 0 {
+            eprintln!(
+                "PlaybackBuffer received samples not aligned to {} channel(s); truncating remainder.",
+                self.channels
             );
-            if self.queue.len() == before {
-                break;
-            }
+        }
+        let usable = samples.len() - (samples.len() % self.channels);
+        self.queue.extend(samples[..usable].iter().copied());
+    }
+
+    fn pop_into(&mut self, out: &mut [i16]) {
+        for sample in out.iter_mut() {
+            *sample = self.queue.pop_front().unwrap_or(0);
         }
     }
 }
@@ -708,7 +620,7 @@ fn load_far_audio(
     path: &Path,
     output_channels: usize,
     output_rate: u32,
-) -> Result<FarAudioSource, Box<dyn Error>> {
+) -> Result<Vec<f32>, Box<dyn Error>> {
     if output_channels == 0 {
         return Err("Output channel count must be greater than zero".into());
     }
@@ -774,8 +686,33 @@ fn load_far_audio(
         return Err("WAV file contained no complete frames".into());
     }
 
-    FarAudioSource::new(samples, spec.sample_rate, output_rate, output_channels)
-        .map_err(|e| e.into())
+    let mut processed = if spec.sample_rate != output_rate {
+        let resampler = Resampler::new(
+            output_channels as u32,
+            spec.sample_rate,
+            output_rate,
+            RESAMPLER_QUALITY,
+        )
+        .map_err(|e| format!("Failed to create playback resampler: {e}"))?;
+        let mut ctx = ResampleContext::new(resampler);
+        let mut converted = Vec::with_capacity(samples.len());
+        ctx.process(&samples, &mut converted);
+        ctx.flush_into(&mut converted);
+        converted
+    } else {
+        samples
+    };
+
+    if processed.is_empty() {
+        return Err("Resampler produced no audio samples".into());
+    }
+
+    let mut as_f32 = Vec::with_capacity(processed.len());
+    for sample in processed.drain(..) {
+        as_f32.push(sample as f32 / i16::MAX as f32);
+    }
+
+    Ok(as_f32)
 }
 
 fn push_mapped_frame(
@@ -803,19 +740,31 @@ fn build_output_stream(
     device: &Device,
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
-    far_source: Arc<Mutex<FarAudioSource>>,
-    channels: usize,
+    playback: Arc<Mutex<PlaybackBuffer>>,
+    resampler: Option<Arc<Mutex<ResampleContext>>>,
     format: SampleFormat,
 ) -> Result<Stream, cpal::BuildStreamError> {
     match format {
         SampleFormat::I16 => build_output_stream_typed::<i16>(
-            device, config, shared, far_source, channels,
+            device,
+            config,
+            shared,
+            Arc::clone(&playback),
+            resampler.clone(),
         ),
         SampleFormat::F32 => build_output_stream_typed::<f32>(
-            device, config, shared, far_source, channels,
+            device,
+            config,
+            shared,
+            Arc::clone(&playback),
+            resampler.clone(),
         ),
         SampleFormat::U16 => build_output_stream_typed::<u16>(
-            device, config, shared, far_source, channels,
+            device,
+            config,
+            shared,
+            playback,
+            resampler,
         ),
         other => {
             eprintln!("Unsupported output sample format: {other:?}");
@@ -828,13 +777,14 @@ fn build_output_stream_typed<T>(
     device: &Device,
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
-    far_source: Arc<Mutex<FarAudioSource>>,
-    _channels: usize,
+    playback: Arc<Mutex<PlaybackBuffer>>,
+    resampler: Option<Arc<Mutex<ResampleContext>>>,
 ) -> Result<Stream, cpal::BuildStreamError>
 where
-    T: Sample,
+    T: Sample + SizedSample + FromSample<i16>,
 {
     let mut far_buffer = Vec::<i16>::new();
+    let mut resampled = Vec::<i16>::new();
     device.build_output_stream(
         config,
         move |data: &mut [T], _| {
@@ -842,14 +792,28 @@ where
                 far_buffer.resize(data.len(), 0);
             }
             {
-                let mut source = far_source.lock().unwrap();
-                source.next_samples(&mut far_buffer);
+                let mut buffer = playback.lock().unwrap();
+                buffer.pop_into(&mut far_buffer);
             }
             for (dst, src) in data.iter_mut().zip(far_buffer.iter()) {
-                *dst = <T as Sample>::from_sample(*src);
+                *dst = T::from_sample(*src);
             }
-            let mut state = shared.lock().unwrap();
-            state.push_far_end(&far_buffer);
+
+            let produced = if let Some(resampler_handle) = &resampler {
+                resampled.clear();
+                if let Ok(mut ctx) = resampler_handle.lock() {
+                    ctx.process(&far_buffer, &mut resampled);
+                }
+                resampled.as_slice()
+            } else {
+                far_buffer.as_slice()
+            };
+
+            if !produced.is_empty() {
+                if let Ok(mut state) = shared.lock() {
+                    state.push_far_end_resampled(produced);
+                }
+            }
         },
         move |err| eprintln!("Output stream error: {err}"),
         None,
@@ -860,12 +824,28 @@ fn build_input_stream(
     device: &Device,
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
+    resampler: Option<Arc<Mutex<ResampleContext>>>,
     format: SampleFormat,
 ) -> Result<Stream, cpal::BuildStreamError> {
     match format {
-        SampleFormat::I16 => build_input_stream_typed::<i16>(device, config, shared),
-        SampleFormat::F32 => build_input_stream_typed::<f32>(device, config, shared),
-        SampleFormat::U16 => build_input_stream_typed::<u16>(device, config, shared),
+        SampleFormat::I16 => build_input_stream_typed::<i16>(
+            device,
+            config,
+            shared,
+            resampler.clone(),
+        ),
+        SampleFormat::F32 => build_input_stream_typed::<f32>(
+            device,
+            config,
+            shared,
+            resampler.clone(),
+        ),
+        SampleFormat::U16 => build_input_stream_typed::<u16>(
+            device,
+            config,
+            shared,
+            resampler,
+        ),
         other => {
             eprintln!("Unsupported input sample format: {other:?}");
             Err(cpal::BuildStreamError::StreamConfigNotSupported)
@@ -877,25 +857,421 @@ fn build_input_stream_typed<T>(
     device: &Device,
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
+    resampler: Option<Arc<Mutex<ResampleContext>>>,
 ) -> Result<Stream, cpal::BuildStreamError>
 where
-    T: Sample,
+    T: Sample + SizedSample,
+    i16: FromSample<T>,
 {
+    let mut convert_buffer = Vec::<i16>::new();
+    let mut resampled = Vec::<i16>::new();
     device.build_input_stream(
         config,
-        move |data: &[T], _| {
-            let mut state = shared.lock().unwrap();
-            let mut buffer = mem::take(&mut state.input_convert);
-            buffer.resize(data.len(), 0);
-            for (dst, src) in buffer.iter_mut().zip(data.iter()) {
-                *dst = (*src).to_sample::<i16>();
+        move |data: &[T], info: &InputCallbackInfo| {
+            if convert_buffer.len() != data.len() {
+                convert_buffer.resize(data.len(), 0);
             }
-            state.process_capture(&buffer);
-            state.input_convert = buffer;
+            for (dst, src) in convert_buffer.iter_mut().zip(data.iter()) {
+                *dst = i16::from_sample(*src);
+            }
+
+            let capture_timestamp = info.timestamp().capture;
+
+            let produced = if let Some(resampler_handle) = &resampler {
+                resampled.clear();
+                if let Ok(mut ctx) = resampler_handle.lock() {
+                    ctx.process(&convert_buffer, &mut resampled);
+                }
+                resampled.as_slice()
+            } else {
+                convert_buffer.as_slice()
+            };
+
+            let mut state = shared.lock().unwrap();
+            state.process_capture_resampled(produced, Some(capture_timestamp));
         },
         move |err| eprintln!("Input stream error: {err}"),
         None,
     )
+}
+
+struct StreamAligner {
+    start_time: Option<std::time::Instant>,
+    input_sample_rate: i128,
+    output_sample_rate: i128,
+    dynamic_output_sample_rate: i128,
+    input_audio_buffer_producer: HeapProd<u64>,
+    input_audio_buffer_consumer: HeapCons<u64>,
+    chunk_sizes: LocalRb<u64>, // only accessed by the audio push thread
+    system_time_in_frames_when_chunk_ended: LocalRb<i128>, // only accessed by the audio input thread
+    target_emitted_frames: AtomicU64
+    total_emitted_frames: AtomicU64
+}
+
+
+impl StreamAligner {
+    // Takes input audio and resamples it to the target rate
+    // May slightly stretch or squeeze the audio (via resampling)
+    // to ensure the outputs stay aligned with system clock
+    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: u32, audio_buffer_seconds: u32) {
+        let {mut input_audio_buffer_producer, mut input_audio_buffer_consumer} = HeapRb::<f32>::new(buffer_seconds*input_sample_rate).split();
+        Ok(Self {
+            input_sample_rate: i128::from(input_sample_rate),
+            output_sample_rate: i128::from(output_sample_rate),
+            dynamic_output_sample_rate: i128::from(output_sample_rate),
+            input_audio_buffer_producer: input_audio_buffer_producer,
+            input_audio_buffer_consumer: input_audio_buffer_consumer,
+            chunk_sizes: LocalRb::<u64>::new(history_len),
+            system_time_in_frames_when_chunk_ended: LocalRb::<i128>::new(history_len),
+            target_emitted_frames: AtomicU64::new(0),
+            total_emitted_frames: AtomicU64::new(0)
+        })
+    }
+
+    fn micros_to_frames(microseconds: i128, sample_rate: i128) -> i128 {
+        // There are sample_rate samples per second
+        // there are sample_rate / 1_000_000 samples per microsecond
+        // now that we have samples_per_microsecond, we simply multiply by microseconds to get total samples
+        // rearranging:
+        return (microseconds * sample_rate / 1 000 000)
+    }
+
+    fn frames_to_micros(frames: i128, sample_rate: i128) -> i128 {
+        // frames = (microseconds * sample_rate / 1 000 000)
+        // frames * 1_000_000 = microseconds * sample_rate
+         return frames * 1_000_000 / sample_rate // = microseconds
+    }
+
+    fn estimate_when_most_recent_ended() -> i128 {
+        // Take minimum over estimates for all previous recieved
+        // Some may be delayed due to cpu being busy, but none can ever arrive too early
+        // so this should be a decent estimate
+        // it does not account for hardware latency, but we cannot account for that without manual calibration
+        // (btw, CPAL timestamps do not work because they may be different for different devices)
+        // (wheras this synchronizes us to global system time)
+        let best_estimate_of_when_most_recent_ended = self.system_time_in_frames_when_chunk_ended.first();
+        for chunk_size, frames_when_chunk_ended in self.chunk_sizes.iter().zip(self.system_time_in_frames_when_chunk_ended.iter(), self.chunk_cpal_capture_times.iter()) {
+            best_estimate_of_when_most_recent_ended = min(frames_when_chunk_ended, best_estimate_of_when_most_recent_ended+chunk_size)
+        }
+        return best_estimate_of_when_most_recent_ended
+    }
+
+    fn process_chunk(chunk: &[f32]) {
+        let recieved_timestamp = Instant::now(); // store this first so we are as precise as possible
+        if let None = self.start_time {
+            // choose a start time so that frames_when_chunk_ended starts out equal to chunk len
+            self.start_time = recieved_timestamp - Duration::from_micros(frames_to_micros(chunk.len()));
+        }
+        let frames_when_chunk_ended = self.micros_to_frames(recieved_timestamp.duration_since(self.start_time).as_micros(), self.input_sample_rate);
+
+        let appended_count = self.input_audio_buffer_producer.push_slice(chunk);
+        if appended_count < chunk.len() { // todo: auto resize
+            eprintln!("Error: cannot keep up with audio, buffer is full, try increasing audio_buffer_seconds")
+        }
+        // delibrately overwrite once we pass history len, we keep a rolling buffer of last 100 or so
+        self.chunk_sizes.push_overwrite(chunk.len());
+        self.system_time_in_frames_when_chunk_ended.push_overwrite(frames_when_chunk_ended);
+
+        // use our estimate to suggest how many frames we should have emitted
+        // this is used to dynamically adjust sample rate until we actually emit that many frames
+        // that ensures that we stay synchronized to the system clock and do not drift
+        self.target_emitted_frames.fetch_add(self.estimate_when_most_recent_ended() * self.output_sample_rate / self.input_sample_rate, Ordering::Relaxed);
+    }
+
+    fn output_chunks() {
+        let target_emitted_frames = self.target_emitted_frames.load(Ordering::Relaxed);
+        let num_available_frames = self.input_audio_buffer.occupied_len();
+        let estimated_emitted_frames = num_available_frames * self.dynamic_output_sample_rate / self.input_sample_rate
+        let updated_total_frames_emitted = self.total_emitted_frames + estimated_emitted_frames
+        if updated_total_frames_emitted < 
+
+    }
+}
+
+
+struct SharedAecStream {
+    shared: Arc<Mutex<SharedCanceller>>,
+    playback: Arc<Mutex<PlaybackBuffer>>,
+    playback_resamplers: Mutex<HashMap<u32, ResampleContext>>,
+    _output_stream: Stream,
+    _input_stream: Stream,
+    output_channels: usize,
+    start_time: std::time::Instant,
+    target_sample_rate: u32,
+    input_resampler: Option<Arc<Mutex<ResampleContext>>>,
+    output_resampler: Option<Arc<Mutex<ResampleContext>>>,
+}
+
+impl SharedAecStream {
+    fn new(
+        input_device: &Device,
+        output_device: &Device,
+        input_config: &StreamConfig,
+        input_format: SampleFormat,
+    output_config: &StreamConfig,
+    output_format: SampleFormat,
+    target_sample_rate: u32,
+    frame_size: usize,
+    filter_length: usize,
+) -> Result<Self, Box<dyn Error>> {
+        let input_channels = input_config.channels as usize;
+        let output_channels = output_config.channels as usize;
+        let input_rate = input_config.sample_rate.0;
+        let output_rate = output_config.sample_rate.0;
+        self.start_time = Instant::now();
+
+
+        let mut input_resampler = if input_rate != target_sample_rate {
+            println!("Resampling input stream to match AEC rate.");
+            Some(
+                Resampler::new(
+                    input_channels as u32,
+                    input_rate,
+                    target_sample_rate,
+                    RESAMPLER_QUALITY,
+                )
+                .map_err(|e| format!("Failed to create input resampler: {e}"))?,
+            )
+        } else {
+            None
+        };
+
+        let mut output_resampler = if output_rate != target_sample_rate {
+            println!("Resampling output reference stream to match AEC rate.");
+            Some(
+                Resampler::new(
+                    output_channels as u32,
+                    output_rate,
+                    target_sample_rate,
+                    RESAMPLER_QUALITY,
+                )
+                .map_err(|e| format!("Failed to create output resampler: {e}"))?,
+            )
+        } else {
+            None
+        };
+
+        let canceller =
+            EchoCanceller::new_multichannel(frame_size, filter_length, input_channels, output_channels)
+                .ok_or("Failed to allocate echo canceller state")?;
+
+        unsafe {
+            let mut rate = target_sample_rate as i32;
+            speex_echo_ctl(
+                canceller.as_ptr(),
+                SPEEX_ECHO_SET_SAMPLING_RATE,
+                &mut rate as *mut _ as *mut c_void,
+            );
+        }
+
+        let input_resampler_ctx = input_resampler
+            .map(|resampler| Arc::new(Mutex::new(ResampleContext::new(resampler))));
+        let output_resampler_ctx = output_resampler
+            .map(|resampler| Arc::new(Mutex::new(ResampleContext::new(resampler))));
+
+        let shared = Arc::new(Mutex::new(SharedCanceller::new(
+            canceller,
+            input_channels,
+            output_channels,
+            frame_size,
+        )));
+        let playback = Arc::new(Mutex::new(PlaybackBuffer::new(output_channels)));
+
+        let output_stream = build_output_stream(
+            output_device,
+            output_config,
+            Arc::clone(&shared),
+            Arc::clone(&playback),
+            output_resampler_ctx.clone(),
+            output_format,
+        )?;
+
+        let input_stream = build_input_stream(
+            input_device,
+            input_config,
+            Arc::clone(&shared),
+            input_resampler_ctx.clone(),
+            input_format,
+        )?;
+
+        output_stream
+            .play()
+            .map_err(|e| format!("Failed to start output stream: {e}"))?;
+        input_stream
+            .play()
+            .map_err(|e| format!("Failed to start input stream: {e}"))?;
+
+        Ok(Self {
+            shared,
+            playback,
+            playback_resamplers: Mutex::new(HashMap::new()),
+            _output_stream: output_stream,
+            _input_stream: input_stream,
+            output_channels,
+            target_sample_rate,
+            input_resampler: input_resampler_ctx,
+            output_resampler: output_resampler_ctx,
+        })
+    }
+
+    fn add_audio(&self, channel: usize, samples: &[f32], sample_rate: u32) {
+        if samples.is_empty() {
+            return;
+        }
+        if self.output_channels == 0 {
+            eprintln!("add_audio called but no output channels are configured.");
+            return;
+        }
+        if channel >= self.output_channels {
+            eprintln!(
+                "add_audio requested channel {} but only {} output channel(s) configured.",
+                channel, self.output_channels
+            );
+            return;
+        }
+
+        let channel_count = self.output_channels;
+        let use_interleaved = channel_count > 1
+            && samples.len() >= channel_count
+            && samples.len() % channel_count == 0;
+        let frames = if use_interleaved {
+            samples.len() / channel_count
+        } else {
+            samples.len()
+        };
+        if frames == 0 {
+            return;
+        }
+
+        let mut interleaved = vec![0i16; frames.saturating_mul(channel_count)];
+
+        if use_interleaved {
+            for frame_idx in 0..frames {
+                let idx = frame_idx * channel_count + channel;
+                let value = samples[idx];
+                let finite = if value.is_finite() { value } else { 0.0 };
+                let clamped = finite.clamp(-1.0, 1.0);
+                interleaved[frame_idx * channel_count + channel] =
+                    (clamped * i16::MAX as f32) as i16;
+            }
+        } else {
+            for (frame_idx, &value) in samples.iter().enumerate() {
+                let finite = if value.is_finite() { value } else { 0.0 };
+                let clamped = finite.clamp(-1.0, 1.0);
+                interleaved[frame_idx * channel_count + channel] =
+                    (clamped * i16::MAX as f32) as i16;
+            }
+        }
+
+        if sample_rate == self.target_sample_rate {
+            if let Ok(mut playback) = self.playback.lock() {
+                playback.push_samples(&interleaved);
+            }
+            return;
+        }
+
+        let resampled = {
+            let mut resamplers = match self.playback_resamplers.lock() {
+                Ok(guard) => guard,
+                Err(err) => {
+                    eprintln!("Failed to lock playback resamplers: {err}");
+                    return;
+                }
+            };
+
+            let ctx = match resamplers.entry(sample_rate) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let resampler = match Resampler::new(
+                        channel_count as u32,
+                        sample_rate,
+                        self.target_sample_rate,
+                        RESAMPLER_QUALITY,
+                    ) {
+                        Ok(resampler) => resampler,
+                        Err(err) => {
+                            eprintln!(
+                                "Unable to resample playback from {sample_rate} Hz to {} Hz: {err}",
+                                self.target_sample_rate
+                            );
+                            return;
+                        }
+                    };
+                    entry.insert(ResampleContext::new(resampler))
+                }
+            };
+
+            let mut produced = Vec::<i16>::new();
+            ctx.process(&interleaved, &mut produced);
+            produced
+        };
+
+        if resampled.is_empty() {
+            return;
+        }
+
+        if let Ok(mut playback) = self.playback.lock() {
+            playback.push_samples(&resampled);
+        }
+    }
+
+    fn register_callback<F>(&self, callback: F)
+    where
+        F: FnMut(&[i16]) + Send + 'static,
+    {
+        let mut guard = self.shared.lock().unwrap();
+        guard.add_callback(callback);
+    }
+
+    fn shared_state(&self) -> Arc<Mutex<SharedCanceller>> {
+        Arc::clone(&self.shared)
+    }
+
+    fn flush_resamplers(&self) {
+        let mut produced = Vec::<i16>::new();
+
+        if let Some(resampler_handle) = &self.output_resampler {
+            produced.clear();
+            if let Ok(mut ctx) = resampler_handle.lock() {
+                ctx.flush_into(&mut produced);
+            }
+            if !produced.is_empty() {
+                if let Ok(mut state) = self.shared.lock() {
+                    state.push_far_end_resampled(&produced);
+                }
+            }
+        }
+
+        if let Some(resampler_handle) = &self.input_resampler {
+            produced.clear();
+            if let Ok(mut ctx) = resampler_handle.lock() {
+                ctx.flush_into(&mut produced);
+            }
+            if !produced.is_empty() {
+                if let Ok(mut state) = self.shared.lock() {
+                    state.process_capture_resampled(&produced, None);
+                }
+            }
+        }
+
+        let mut playback_leftover = Vec::<i16>::new();
+        if let Ok(mut resamplers) = self.playback_resamplers.lock() {
+            for ctx in resamplers.values_mut() {
+                ctx.flush_into(&mut playback_leftover);
+            }
+        }
+        if !playback_leftover.is_empty() {
+            if let Ok(mut state) = self.shared.lock() {
+                state.push_far_end_resampled(&playback_leftover);
+            }
+        }
+    }
+}
+
+impl Drop for SharedAecStream {
+    fn drop(&mut self) {
+        self.flush_resamplers();
+    }
 }
 
 fn select_device<I>(

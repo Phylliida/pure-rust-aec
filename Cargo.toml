@@ -11,6 +11,7 @@ cpal-example = ["cpal"]
 
 cpal = { version = "0.15", optional = true }
 hound = "3.5"
+ringbuf = "0.4.8"
 
 [[example]]
 name = "cpal_aec"
