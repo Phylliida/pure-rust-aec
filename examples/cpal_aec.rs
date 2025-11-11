@@ -895,6 +895,10 @@ where
     )
 }
 
+struct BufferedCircularProducer {
+
+}
+
 struct AudioBufferMetadata {
     num_frames: u64,
     target_emitted_frames: i128
@@ -1028,22 +1032,21 @@ impl StreamAligner {
         return ((output_Frames as u64) * (in_rate as u64) / (out_rate as u64)) as u32
     }
 
-    fn resample_exact(
+    fn resample(
+        &mut self,
         input: &mut HeapCons<f32>,
-        mut remaining: usize,
+        mut remaining: u32,
         output: &mut HeapProd<f32>,
         in_rate: u32,
         out_rate: u32,
         resampler: &mut Resampler,
     ) -> Result<(), ResamplerError> {
+        resampler.set_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
+
         // there might be some leftover from last call, so use global state
         // (worst case this is like 0.6 ms or so, so it's okay to have them slightly delayed like this)
         self.total_input_samples_remaining += remaining;
 
-        // resize if too small
-        if self.working_input_audio_buffer.capacity() < self.total_input_samples_remaining {
-            self.working_input_audio_buffer.resize(self.total_input_samples_remaining, 0.0);
-        }
         let (input_items_up_to_end, input_items_starting_from_front) = input.as_slices();
 
         // we can just use the latter half of ring buffer, use that and avoid any copies
@@ -1056,6 +1059,11 @@ impl StreamAligner {
         }
         // we need continguous memory, use our working buffer            
         else {
+            // resize if too small
+            if self.working_input_audio_buffer.capacity() < self.total_input_samples_remaining {
+                self.working_input_audio_buffer.resize(self.total_input_samples_remaining, 0.0);
+            }
+
             self.working_input_audio_buffer.clear(); // doesn't actually deallocate memory, just sets size to zero
             let mut needed = self.total_input_samples_remaining;
             // this goes through the top part and bottom part of ringbuffer, in order until we've eaten enough
@@ -1072,6 +1080,7 @@ impl StreamAligner {
             self.working_input_audio_buffer
         }
 
+        // get available space in output circular buffer
         let (output_items_up_to_end, output_items_starting_from_front) = output.vacant_slices_mut();
 
         let target_output_samples_count = input_to_output_frames(self.total_input_samples_remaining, in_rate, out_rate) + 10; // add a few extra for rounding
@@ -1110,8 +1119,8 @@ impl StreamAligner {
             self.output.push_slice(output_buf[..produced])
         };
 
+        // move ahead input to let it know that we consumed that many
         self.total_input_samples_remaining -= consumed;
-        
         input.skip(consumed);
     }
 
@@ -1128,8 +1137,6 @@ impl StreamAligner {
         else if updated_total_frames_emitted > target_emitted_frames {
             increase_dynamic_sample_rate();
         }
-        // Code goes here. It should pop off num_available_frames from self.input_audio_buffer_consumer
-        resampler.set_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
         
         match self
             .resampler
