@@ -1154,7 +1154,7 @@ impl StreamAligner {
         let most_recent_ended_estimate = self.estimate_when_most_recent_ended();
         let metadata = AudioBufferMetadata {
             num_frames: chunk.len() as u64,
-            target_emitted_frames: input_to_output_frames(most_recent_ended_estimate, self.output_sample_rate, self.input_sample_rate)
+            target_emitted_frames: input_to_output_frames(most_recent_ended_estimate, self.input_sample_rate, self.output_sample_rate)
         };
         if let Err(metadata) = self.input_audio_buffer_metadata_producer.try_push(metadata) {
             eprintln!("Error: metadata ring buffer full; dropping {:?}, this is very bad what happened", metadata);
@@ -1177,11 +1177,11 @@ impl StreamAligner {
         let updated_total_frames_emitted = self.total_emitted_frames + estimated_emitted_frames;
         // not enough frames, we need to increase dynamic sample rate (to get more samples)
         if updated_total_frames_emitted < target_emitted_frames {
-            self.decrease_dynamic_sample_rate();
+            self.increase_dynamic_sample_rate();
         }
         // too many frames, we need to decrease dynamic sample rate (to get less samples)
         else if updated_total_frames_emitted > target_emitted_frames {
-            self.increase_dynamic_sample_rate();
+            self.decrease_dynamic_sample_rate();
         }
 
         //// do resampling ////
