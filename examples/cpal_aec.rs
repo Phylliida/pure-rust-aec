@@ -932,6 +932,9 @@ impl<T: Copy> BufferedCircularProducer<T> {
         if need_to_write_outputs {
             // wrote to scratch, need to add it to producer
             let _appended = self.producer.push_slice(&self.scratch[..num_written]);
+            if (_appended < num_written) {
+                eprintln("Warning: Producer cannot keep up, increase buffer size or decrease latency")
+            }
         } else {
             // wrote directly to producer, simply advance write index
             unsafe { self.producer.advance_write_index(num_written) };
@@ -1154,7 +1157,7 @@ impl StreamAligner {
             // that ensures that we stay synchronized to the system clock and do not drift
             let most_recent_ended_estimate = self.estimate_when_most_recent_ended();
             let metadata = AudioBufferMetadata {
-                num_frames: chunk.len() as u64,
+                num_frames: appended_count as u64,
                 target_emitted_frames: input_to_output_frames(most_recent_ended_estimate, self.input_sample_rate, self.output_sample_rate)
             };
             if let Err(metadata) = self.input_audio_buffer_metadata_producer.try_push(metadata) {
