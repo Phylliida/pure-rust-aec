@@ -1,5 +1,6 @@
 #![allow(unused_assignments)]
 #![allow(unused_variables)]
+#![allow(unused_unsafe)]
 
 
 #[repr(C)]

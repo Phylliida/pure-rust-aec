@@ -41,7 +41,6 @@ use cpal::{
 use hound::{self, WavSpec};
 use ringbuf::{
     traits::{Consumer, Observer, Producer, RingBuffer, Split},
-    utils::slice_assume_init_mut,
     HeapCons, HeapProd, HeapRb, LocalRb,
 };
 use ringbuf::storage::Heap;
@@ -51,8 +50,6 @@ use speex_rust_aec::{
 
 use std::time::Instant;
 
-use std::cmp::max;
-use std::cmp::min;
 
 
 const DEFAULT_AEC_RATE: u32 = 48_000;
@@ -63,6 +60,11 @@ type AecCallback = Box<dyn FnMut(&[i16]) + Send + 'static>;
 struct ResampleContext {
     resampler: Resampler,
     channels: usize,
+}
+
+#[inline]
+unsafe fn assume_init_slice_mut<T>(slice: &mut [MaybeUninit<T>]) -> &mut [T] {
+    &mut *(slice as *mut [MaybeUninit<T>] as *mut [T])
 }
 
 impl ResampleContext {
@@ -942,10 +944,10 @@ impl<T: Copy + Default> BufferedCircularProducer<T> {
         let (first, second) = self.producer.vacant_slices_mut();
         // we can simply 
         if first.len() >= size {
-            let buf = unsafe { slice_assume_init_mut(first) };
+            let buf = unsafe { assume_init_slice_mut(first) };
             (true, &mut buf[..size])
         } else if first.is_empty() && second.len() >= size {
-            let buf = unsafe { slice_assume_init_mut(second) };
+            let buf = unsafe { assume_init_slice_mut(second) };
             (true, &mut buf[..size])
         }
         else {
@@ -1048,12 +1050,12 @@ struct StreamAligner {
 
 fn input_to_output_frames(input_frames: i128, in_rate: u32, out_rate: u32) -> i128 {
     // u128 to avoid overflow
-    return (((input_frames as i128) * (out_rate as i128)) / (in_rate as i128)) as i128
+    (((input_frames as i128) * (out_rate as i128)) / (in_rate as i128)) as i128
 }
 
 fn output_to_input_frames(output_frames: i128, in_rate: u32, out_rate: u32) -> i128 {
     // u128 to avoid overflow
-    return (((output_frames as i128) * (in_rate as i128)) / (out_rate as i128)) as i128
+    (((output_frames as i128) * (in_rate as i128)) / (out_rate as i128)) as i128
 }
 
 fn micros_to_frames(microseconds: i128, sample_rate: i128) -> i128 {
@@ -1061,13 +1063,13 @@ fn micros_to_frames(microseconds: i128, sample_rate: i128) -> i128 {
     // there are sample_rate / 1_000_000 samples per microsecond
     // now that we have samples_per_microsecond, we simply multiply by microseconds to get total samples
     // rearranging:
-    return (microseconds * sample_rate / 1000000)
+    microseconds * sample_rate / 1000000
 }
 
 fn frames_to_micros(frames: i128, sample_rate: i128) -> i128 {
     // frames = (microseconds * sample_rate / 1 000 000)
     // frames * 1_000_000 = microseconds * sample_rate
-        return frames * 1000000 / sample_rate // = microseconds
+    frames * 1000000 / sample_rate // = microseconds
 }
 
 
@@ -1076,8 +1078,8 @@ impl StreamAligner {
     // May slightly stretch or squeeze the audio (via resampling)
     // to ensure the outputs stay aligned with system clock
     fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, audio_buffer_seconds: u32, resampler_quality: i32, output_audio_buffer_producer: HeapProd<f32>) -> Result<Self, Box<dyn Error>>  {
-        let (mut input_audio_buffer_producer, mut input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
-        let (mut input_audio_buffer_metadata_producer, mut input_audio_buffer_metadata_consumer) = HeapRb::<AudioBufferMetadata>::new(1000).split(); // should be plenty for any practical use
+        let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
+        let (input_audio_buffer_metadata_producer, input_audio_buffer_metadata_consumer) = HeapRb::<AudioBufferMetadata>::new(1000).split(); // should be plenty for any practical use
         Ok(Self {
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
@@ -1104,7 +1106,7 @@ impl StreamAligner {
         })
     }
 
-    fn estimate_when_most_recent_ended(self) -> i128 {
+    fn estimate_when_most_recent_ended(&self) -> i128 {
         // Take minimum over estimates for all previous recieved
         // Some may be delayed due to cpu being busy, but none can ever arrive too early
         // so this should be a decent estimate
@@ -1118,7 +1120,7 @@ impl StreamAligner {
             0 as i128
         };
         for (chunk_size, frames_when_chunk_ended) in self.chunk_sizes.iter().zip(self.system_time_in_frames_when_chunk_ended.iter()) {
-            best_estimate_of_when_most_recent_ended = min(*frames_when_chunk_ended, best_estimate_of_when_most_recent_ended+(*chunk_size as i128));
+            best_estimate_of_when_most_recent_ended = (*frames_when_chunk_ended).min(best_estimate_of_when_most_recent_ended+(*chunk_size as i128));
         }
         best_estimate_of_when_most_recent_ended
     }
@@ -1190,7 +1192,7 @@ impl StreamAligner {
 
         let input_buf = self.input_audio_buffer_consumer.get_chunk_to_read(self.total_input_samples_remaining as usize);
         let target_output_samples_count = input_to_output_frames(self.total_input_samples_remaining, self.input_sample_rate, self.dynamic_output_sample_rate) + 10; // add a few extra for rounding
-        let (need_to_write_outputs, mut output_buf) = self.output_audio_buffer_producer.get_chunk_to_write(target_output_samples_count as usize);
+        let (need_to_write_outputs, output_buf) = self.output_audio_buffer_producer.get_chunk_to_write(target_output_samples_count as usize);
         let (consumed, produced) = self.resampler.process_interleaved_f32(input_buf, output_buf)?;
         // it may return less consumed and produced than the sizes of stuff we gave it
         // so use actual processed sizes here instead of our lengths from above

@@ -1,5 +1,8 @@
 #![allow(unused_assignments)]
 #![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(static_mut_refs)]
+#![allow(unused_unsafe)]
 
 extern "C" {
     fn calloc(__nmemb: size_t, __size: size_t) -> *mut std::ffi::c_void;

@@ -1,5 +1,6 @@
 #![allow(unused_assignments)]
 #![allow(unused_variables)]
+#![allow(unused_unsafe)]
 
 pub mod types_h {
     pub type __int16_t = i16;
