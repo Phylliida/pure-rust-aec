@@ -35,8 +35,8 @@ use std::{
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, FromSample, InputCallbackInfo, Sample, SampleFormat, SampleRate, SizedSample, Stream,
-    StreamConfig, StreamInstant, SupportedStreamConfigRange,
+    Device, FromSample, Host, InputCallbackInfo, Sample, SampleFormat, SampleRate, SizedSample,
+    Stream, StreamConfig, StreamInstant, SupportedStreamConfigRange,
 };
 use hound::{self, WavSpec};
 use ringbuf::{
@@ -50,10 +50,14 @@ use speex_rust_aec::{
 
 use std::time::Instant;
 
+use evmap::handles::{ReadHandle, WriteHandle};
 
 
 const DEFAULT_AEC_RATE: u32 = 48_000;
 const RESAMPLER_QUALITY: i32 = 5;
+const STREAM_ALIGNER_HISTORY_LEN: usize = 128;
+const STREAM_ALIGNER_INPUT_BUFFER_SECONDS: u32 = 2;
+const STREAM_ALIGNER_OUTPUT_BUFFER_SECONDS: u32 = 2;
 
 type AecCallback = Box<dyn FnMut(&[i16]) + Send + 'static>;
 
@@ -355,13 +359,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     let default_filter_length = default_frame_size * 20;
 
     /*
+    let input_descriptors = [InputDeviceDescriptor {
+        device_name: input_device_name.clone(),
+        config: input_stream_config.clone(),
+        sample_format: input_config.sample_format(),
+    }];
+    let output_descriptors = [OutputDeviceDescriptor {
+        device_name: output_device_name.clone(),
+        config: output_stream_config.clone(),
+        sample_format: output_config.sample_format(),
+    }];
+
     let shared_stream = SharedAecStream::new(
-        &input_device,
-        &output_device,
-        &input_stream_config,
-        input_config.sample_format(),
-        &output_stream_config,
-        output_config.sample_format(),
+        &host,
+        &input_descriptors,
+        &output_descriptors,
         target_sample_rate,
         default_frame_size,
         default_filter_length,
@@ -1034,7 +1046,7 @@ struct AudioBufferMetadata {
     target_emitted_frames: i128
 }
 
-struct StreamAligner {
+struct InputStreamAligner {
     start_time: Option<std::time::Instant>,
     input_sample_rate: u32,
     output_sample_rate: u32,
@@ -1076,7 +1088,7 @@ fn frames_to_micros(frames: i128, sample_rate: i128) -> i128 {
 }
 
 
-impl StreamAligner {
+impl InputStreamAligner {
     // Takes input audio and resamples it to the target rate
     // May slightly stretch or squeeze the audio (via resampling)
     // to ensure the outputs stay aligned with system clock
@@ -1222,291 +1234,435 @@ impl StreamAligner {
     }
 }
 
-/*
+type StreamId = u64;
+type Prod = ringbuf::HeapProd<f32>;
+
+enum HeapConsSendMsg {
+    Add(StreamId, Prod),
+    Remove(StreamId),
+}
+
+struct OuputStreamAligner {
+
+}
+
+// allows for playing audio on top of each other (mixing) or just appending to buffer
+impl OutputStreamAligner {
+    fn new(input_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, output_audio_buffer_producer: HeapProd<f32>) -> Result<Self, Box<dyn Error>>  {
+
+        // used to send across threads
+        let (heap_cons_sender, heap_cons_reciever) = mpsc::channel::<HeapConsSendMsg>();
+        let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
+        
+        Ok(Self {
+            start_time: Instant::now(),
+            input_sample_rate: input_sample_rate,
+            output_sample_rate: output_sample_rate,
+            heap_cons_sender: heap_cons_sender,
+            heap_cons_reciever: heap_cons_reciever,
+            input_audio_buffer_producer: BufferedCircularProducer::new(input_audio_buffer_producer),
+            input_audio_buffer_consumer: BufferedCircularConsumer::new(input_audio_buffer_consumer),
+            output_audio_buffer_producer: BufferedCircularProducer::new(output_audio_buffer_producer),
+            location_in_input_audio_buffer: 0,
+            stream_consumers: HashMap::new(),
+            cur_stream_index: Arc::new(AtomicU64::new(0)),
+            resampler: Resampler::new(
+                1, // channels, we have one of these StreamAligner each channel
+                input_sample_rate,
+                output_sample_rate,
+                resampler_quality
+            )?
+        })
+    }
+
+    fn begin_audio_stream(&self, audio_buffer_seconds: usize) -> (u32, HeapProd<f32>) {
+        // this assigns unique ids in a thread-safe way
+        let stream_index = cur_stream_index.fetch_add(1, Ordering::Relaxed);
+        let consumer, producer = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
+        // send the consumer to the consume thread
+        self.heap_prod_sender.send(HeapConsSendMsg::Add(stream_index, consumer)).unwrap();
+        return producer;
+    }
+
+    fn enqueue_audio(audio_data: &[f32], audio_producer: HeapProd<f32>) {
+        audio_producer.push_slice_overwrite(audio_data);
+    }
+
+    fn end_audio_stream(&self, stream_index: u32) {
+        self.heap_prod_sender.send(HeapConsSendMsg::Remove(stream_index));
+    }
+
+    fn get_audio_chunk(input_chunk_size: usize) -> &[f32] {
+        while let Ok(msg) = self.heap_prod_reciever.recv() {
+            match msg {
+                HeapProdSendMsg::Add(id, cons) => {
+                    self.stream_consumers.insert(id, BufferedCircularConsumer::new(cons));
+                }
+                HeapProdSendMsg::Remove(id) => {
+                    self.stream_consumers.remove(&id);
+                }
+            }
+        }
+
+        let (need_to_write_input_values, input_buf_write) = self.input_audio_buffer_producer.get_chunk_to_write(input_chunk_size);
+        let actual_input_chunk_size = input_buf_write.len();
+        let furthest_written = 0;
+        // todo: write zeros to input_buf_write
+        input_buf_write[:] = 0; // something like this, todo fix
+        for (stream_id, cons) in self.stream_consumers.iter_mut() {
+            let buf_from_stream = cons.get_chunk_to_read(actual_input_chunk_size);
+            // todo: add buf_from_stream values to input_buf_write
+            // (note, buf_from_stream may be smaller than input_buf, in that case the audio has ended, it's fine we only write a subset)
+
+            // something like this, todo fix
+            // we specifically want to do add with no clipping so it's a linear operation for eac
+            // we can clip later
+            input_buf_write[:buf_from_stream.len()] += buf_from_stream;
+            
+            cons.finish_read(buf_from_stream.len());
+        }
+        let input_buf_read = self.input_audio_buffer_consumer.get_chunk_to_read(input_chunk_size);
+        let target_output_samples_count = input_to_output_frames(input_buf_read.len(), self.input_sample_rate, self.output_sample_rate); // add a few extra for rounding
+        let (need_to_write_output_values, output_buf_write) = self.output_audio_buffer_producer.get_chunk_to_write(target_output_samples_count);
+        let (consumed, produced) = self.resampler.process_interleaved_f32(input_buf_read, output_buf_write)?;
+        // it may return less consumed and produced than the sizes of stuff we gave it
+        // so use actual processed sizes here instead of our lengths from above
+        // (worst case this is like 0.6 ms or so, so it's okay to have them slightly delayed like this)
+        self.input_audio_buffer_consumer.finish_read(consumed);
+        self.output_audio_buffer_producer.finish_write(need_to_write_outputs, produced);
+    }
+}
+
+
+
+struct InputChannelState {
+    device_index: usize,
+    channel_index: usize,
+    sample_rate: u32,
+    aligner: Arc<Mutex<StreamAligner>>,
+    output_consumer: BufferedCircularConsumer<f32>,
+}
+
+struct DeviceDescriptor {
+    device_name: String,
+    channels: usize,
+    sample_rate: usize,
+    sample_format: SampleFormat,
+}
+
+struct OutputDeviceDescriptor {
+    device_name: String,
+    config: StreamConfig,
+    sample_format: SampleFormat,
+}
+
+struct InputDeviceStream {
+    name: String,
+    channels: usize,
+    sample_rate: u32,
+    sample_format: SampleFormat,
+    channel_aligners: Vec<Arc<Mutex<StreamAligner>>>,
+    _stream: Stream,
+}
+
 struct SharedAecStream {
-    shared: Arc<Mutex<SharedCanceller>>,
-    playback: Arc<Mutex<PlaybackBuffer>>,
-    playback_resamplers: Mutex<HashMap<u32, ResampleContext>>,
-    _output_stream: Stream,
-    _input_stream: Stream,
-    output_channels: usize,
-    start_time: std::time::Instant,
     target_sample_rate: u32,
-    input_resampler: Option<Arc<Mutex<ResampleContext>>>,
-    output_resampler: Option<Arc<Mutex<ResampleContext>>>,
+    input_channels: Vec<InputChannelState>,
+    input_streams: Vec<InputDeviceStream>,
+    output_device_names: Vec<String>,
 }
 
 impl SharedAecStream {
     fn new(
-        input_device: &Device,
-        output_device: &Device,
-        input_config: &StreamConfig,
-        input_format: SampleFormat,
-    output_config: &StreamConfig,
-    output_format: SampleFormat,
-    target_sample_rate: u32,
-    frame_size: usize,
-    filter_length: usize,
-) -> Result<Self, Box<dyn Error>> {
-        let input_channels = input_config.channels as usize;
-        let output_channels = output_config.channels as usize;
-        let input_rate = input_config.sample_rate.0;
-        let output_rate = output_config.sample_rate.0;
+        host: &Host,
+        input_devices: &[InputDeviceDescriptor],
+        output_devices: &[OutputDeviceDescriptor],
+        target_sample_rate: u32,
+        frame_size: usize,
+        filter_length: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        if input_devices.is_empty() {
+            return Err("At least one input device is required to build SharedAecStream.".into());
+        }
+        if target_sample_rate == 0 {
+            return Err("Target sample rate must be greater than zero.".into());
+        }
 
+        // These parameters will be reintroduced when the canceller plumbing is wired up.
+        let _ = (frame_size, filter_length);
 
-        let mut input_resampler = if input_rate != target_sample_rate {
-            println!("Resampling input stream to match AEC rate.");
-            Some(
-                Resampler::new(
-                    input_channels as u32,
+        let mut input_streams = Vec::with_capacity(input_devices.len());
+        let mut input_channels = Vec::new();
+
+        for (device_index, descriptor) in input_devices.iter().enumerate() {
+            let requested_name = descriptor.device_name.as_str();
+            let device = select_device(
+                host.input_devices(),
+                requested_name,
+                "Input",
+            )?;
+            let device_name = device
+                .name()
+                .unwrap_or_else(|_| requested_name.to_string());
+
+            validate_device_stream_config(
+                &device,
+                &device_name,
+                descriptor.config.channels,
+                descriptor.config.sample_rate.0,
+                descriptor.sample_format,
+                "input",
+            )?;
+
+            let stream_config = &descriptor.config;
+            let sample_format = descriptor.sample_format;
+            let input_rate = stream_config.sample_rate.0;
+            let channels = stream_config.channels as usize;
+
+            if channels == 0 {
+                return Err(format!(
+                    "Input device '{device_name}' reports zero channels; cannot create StreamAligner."
+                )
+                .into());
+            }
+
+            let mut aligners = Vec::with_capacity(channels);
+            for channel_index in 0..channels {
+                let mut output_capacity = (STREAM_ALIGNER_OUTPUT_BUFFER_SECONDS as usize)
+                    .saturating_mul(target_sample_rate as usize);
+                if output_capacity == 0 {
+                    output_capacity = target_sample_rate as usize;
+                }
+                if output_capacity == 0 {
+                    output_capacity = 1;
+                }
+
+                let (output_producer, output_consumer) =
+                    HeapRb::<f32>::new(output_capacity).split();
+                let aligner = StreamAligner::new(
                     input_rate,
                     target_sample_rate,
+                    STREAM_ALIGNER_HISTORY_LEN,
+                    STREAM_ALIGNER_INPUT_BUFFER_SECONDS,
                     RESAMPLER_QUALITY,
+                    output_producer,
                 )
-                .map_err(|e| format!("Failed to create input resampler: {e}"))?,
-            )
-        } else {
-            None
-        };
+                .map_err(|err| {
+                    format!(
+                        "Failed to create stream aligner for device '{device_name}' channel {channel_index}: {err}"
+                    )
+                })?;
+                let aligner = Arc::new(Mutex::new(aligner));
+                input_channels.push(InputChannelState {
+                    device_index,
+                    channel_index,
+                    sample_rate: input_rate,
+                    aligner: Arc::clone(&aligner),
+                    output_consumer: BufferedCircularConsumer::new(output_consumer),
+                });
+                aligners.push(aligner);
+            }
 
-        let mut output_resampler = if output_rate != target_sample_rate {
-            println!("Resampling output reference stream to match AEC rate.");
-            Some(
-                Resampler::new(
-                    output_channels as u32,
-                    output_rate,
-                    target_sample_rate,
-                    RESAMPLER_QUALITY,
-                )
-                .map_err(|e| format!("Failed to create output resampler: {e}"))?,
-            )
-        } else {
-            None
-        };
+            let aligners_for_stream = aligners.iter().map(Arc::clone).collect::<Vec<_>>();
+            let stream = build_input_alignment_stream(
+                &device,
+                &device_name,
+                stream_config,
+                sample_format,
+                aligners_for_stream,
+            )?;
 
-        let canceller =
-            EchoCanceller::new_multichannel(frame_size, filter_length, input_channels, output_channels)
-                .ok_or("Failed to allocate echo canceller state")?;
+            stream
+                .play()
+                .map_err(|err| format!("Failed to start input stream for '{device_name}': {err}"))?;
 
-        unsafe {
-            let mut rate = target_sample_rate as i32;
-            speex_echo_ctl(
-                canceller.as_ptr(),
-                SPEEX_ECHO_SET_SAMPLING_RATE,
-                &mut rate as *mut _ as *mut c_void,
-            );
+            input_streams.push(InputDeviceStream {
+                name: device_name,
+                channels,
+                sample_rate: input_rate,
+                sample_format,
+                channel_aligners: aligners,
+                _stream: stream,
+            });
         }
 
-        let input_resampler_ctx = input_resampler
-            .map(|resampler| Arc::new(Mutex::new(ResampleContext::new(resampler))));
-        let output_resampler_ctx = output_resampler
-            .map(|resampler| Arc::new(Mutex::new(ResampleContext::new(resampler))));
-
-        let shared = Arc::new(Mutex::new(SharedCanceller::new(
-            canceller,
-            input_channels,
-            output_channels,
-            frame_size,
-        )));
-        let playback = Arc::new(Mutex::new(PlaybackBuffer::new(output_channels)));
-
-        let output_stream = build_output_stream(
-            output_device,
-            output_config,
-            Arc::clone(&shared),
-            Arc::clone(&playback),
-            output_resampler_ctx.clone(),
-            output_format,
-        )?;
-
-        let input_stream = build_input_stream(
-            input_device,
-            input_config,
-            Arc::clone(&shared),
-            input_resampler_ctx.clone(),
-            input_format,
-        )?;
-
-        output_stream
-            .play()
-            .map_err(|e| format!("Failed to start output stream: {e}"))?;
-        input_stream
-            .play()
-            .map_err(|e| format!("Failed to start input stream: {e}"))?;
+        let mut output_device_names = Vec::with_capacity(output_devices.len());
+        for descriptor in output_devices.iter() {
+            let requested_name = descriptor.device_name.as_str();
+            let device = select_device(
+                host.output_devices(),
+                requested_name,
+                "Output",
+            )?;
+            let device_name = device
+                .name()
+                .unwrap_or_else(|_| requested_name.to_string());
+            validate_device_stream_config(
+                &device,
+                &device_name,
+                descriptor.config.channels,
+                descriptor.config.sample_rate.0,
+                descriptor.sample_format,
+                "output",
+            )?;
+            output_device_names.push(device_name);
+        }
 
         Ok(Self {
-            shared,
-            playback,
-            playback_resamplers: Mutex::new(HashMap::new()),
-            _output_stream: output_stream,
-            _input_stream: input_stream,
-            output_channels,
             target_sample_rate,
-            input_resampler: input_resampler_ctx,
-            output_resampler: output_resampler_ctx,
+            input_channels,
+            input_streams,
+            output_device_names,
         })
     }
+}
 
-    fn add_audio(&self, channel: usize, samples: &[f32], sample_rate: u32) {
-        if samples.is_empty() {
-            return;
-        }
-        if self.output_channels == 0 {
-            eprintln!("add_audio called but no output channels are configured.");
-            return;
-        }
-        if channel >= self.output_channels {
+fn build_input_alignment_stream(
+    device: &Device,
+    device_name: &str,
+    config: &StreamConfig,
+    format: SampleFormat,
+    channel_aligners: Vec<Arc<Mutex<StreamAligner>>>,
+) -> Result<Stream, cpal::BuildStreamError> {
+    let label = device_name.to_string();
+    match format {
+        SampleFormat::I16 => build_input_alignment_stream_typed::<i16>(
+            device,
+            label.clone(),
+            config,
+            channel_aligners.clone(),
+        ),
+        SampleFormat::F32 => build_input_alignment_stream_typed::<f32>(
+            device,
+            label.clone(),
+            config,
+            channel_aligners.clone(),
+        ),
+        SampleFormat::U16 => build_input_alignment_stream_typed::<u16>(
+            device,
+            label,
+            config,
+            channel_aligners,
+        ),
+        other => {
             eprintln!(
-                "add_audio requested channel {} but only {} output channel(s) configured.",
-                channel, self.output_channels
+                "Input device '{device_name}' uses unsupported sample format {other:?}; cannot build StreamAligner."
             );
-            return;
-        }
-
-        let channel_count = self.output_channels;
-        let use_interleaved = channel_count > 1
-            && samples.len() >= channel_count
-            && samples.len() % channel_count == 0;
-        let frames = if use_interleaved {
-            samples.len() / channel_count
-        } else {
-            samples.len()
-        };
-        if frames == 0 {
-            return;
-        }
-
-        let mut interleaved = vec![0i16; frames.saturating_mul(channel_count)];
-
-        if use_interleaved {
-            for frame_idx in 0..frames {
-                let idx = frame_idx * channel_count + channel;
-                let value = samples[idx];
-                let finite = if value.is_finite() { value } else { 0.0 };
-                let clamped = finite.clamp(-1.0, 1.0);
-                interleaved[frame_idx * channel_count + channel] =
-                    (clamped * i16::MAX as f32) as i16;
-            }
-        } else {
-            for (frame_idx, &value) in samples.iter().enumerate() {
-                let finite = if value.is_finite() { value } else { 0.0 };
-                let clamped = finite.clamp(-1.0, 1.0);
-                interleaved[frame_idx * channel_count + channel] =
-                    (clamped * i16::MAX as f32) as i16;
-            }
-        }
-
-        if sample_rate == self.target_sample_rate {
-            if let Ok(mut playback) = self.playback.lock() {
-                playback.push_samples(&interleaved);
-            }
-            return;
-        }
-
-        let resampled = {
-            let mut resamplers = match self.playback_resamplers.lock() {
-                Ok(guard) => guard,
-                Err(err) => {
-                    eprintln!("Failed to lock playback resamplers: {err}");
-                    return;
-                }
-            };
-
-            let ctx = match resamplers.entry(sample_rate) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let resampler = match Resampler::new(
-                        channel_count as u32,
-                        sample_rate,
-                        self.target_sample_rate,
-                        RESAMPLER_QUALITY,
-                    ) {
-                        Ok(resampler) => resampler,
-                        Err(err) => {
-                            eprintln!(
-                                "Unable to resample playback from {sample_rate} Hz to {} Hz: {err}",
-                                self.target_sample_rate
-                            );
-                            return;
-                        }
-                    };
-                    entry.insert(ResampleContext::new(resampler))
-                }
-            };
-
-            let mut produced = Vec::<i16>::new();
-            ctx.process(&interleaved, &mut produced);
-            produced
-        };
-
-        if resampled.is_empty() {
-            return;
-        }
-
-        if let Ok(mut playback) = self.playback.lock() {
-            playback.push_samples(&resampled);
-        }
-    }
-
-    fn register_callback<F>(&self, callback: F)
-    where
-        F: FnMut(&[i16]) + Send + 'static,
-    {
-        let mut guard = self.shared.lock().unwrap();
-        guard.add_callback(callback);
-    }
-
-    fn shared_state(&self) -> Arc<Mutex<SharedCanceller>> {
-        Arc::clone(&self.shared)
-    }
-
-    fn flush_resamplers(&self) {
-        let mut produced = Vec::<i16>::new();
-
-        if let Some(resampler_handle) = &self.output_resampler {
-            produced.clear();
-            if let Ok(mut ctx) = resampler_handle.lock() {
-                ctx.flush_into(&mut produced);
-            }
-            if !produced.is_empty() {
-                if let Ok(mut state) = self.shared.lock() {
-                    state.push_far_end_resampled(&produced);
-                }
-            }
-        }
-
-        if let Some(resampler_handle) = &self.input_resampler {
-            produced.clear();
-            if let Ok(mut ctx) = resampler_handle.lock() {
-                ctx.flush_into(&mut produced);
-            }
-            if !produced.is_empty() {
-                if let Ok(mut state) = self.shared.lock() {
-                    state.process_capture_resampled(&produced, None);
-                }
-            }
-        }
-
-        let mut playback_leftover = Vec::<i16>::new();
-        if let Ok(mut resamplers) = self.playback_resamplers.lock() {
-            for ctx in resamplers.values_mut() {
-                ctx.flush_into(&mut playback_leftover);
-            }
-        }
-        if !playback_leftover.is_empty() {
-            if let Ok(mut state) = self.shared.lock() {
-                state.push_far_end_resampled(&playback_leftover);
-            }
+            Err(cpal::BuildStreamError::StreamConfigNotSupported)
         }
     }
 }
 
-impl Drop for SharedAecStream {
-    fn drop(&mut self) {
-        self.flush_resamplers();
+fn build_input_alignment_stream_typed<T>(
+    device: &Device,
+    device_label: String,
+    config: &StreamConfig,
+    channel_aligners: Vec<Arc<Mutex<StreamAligner>>>,
+) -> Result<Stream, cpal::BuildStreamError>
+where
+    T: Sample + SizedSample,
+    f32: FromSample<T>,
+{
+    let channels = config.channels as usize;
+    if channels == 0 {
+        eprintln!(
+            "Input device '{device_label}' reported zero channels; skipping stream creation."
+        );
+        return Err(cpal::BuildStreamError::StreamConfigNotSupported);
+    }
+
+    if channel_aligners.len() != channels {
+        eprintln!(
+            "Warning: device '{device_label}' channel count ({channels}) differs from aligner count ({}); audio may be dropped.",
+            channel_aligners.len()
+        );
+    }
+
+    let buffer_count = channels.max(1);
+    let per_channel_capacity = (config.sample_rate.0 as usize)
+        .saturating_div(20) // ~50 ms of audio per channel
+        .max(1024);
+    let mut channel_buffers = (0..buffer_count)
+        .map(|_| Vec::<f32>::with_capacity(per_channel_capacity))
+        .collect::<Vec<_>>();
+
+    device.build_input_stream(
+        config,
+        move |data: &[T], _info: &InputCallbackInfo| {
+            if data.is_empty() {
+                return;
+            }
+            for buffer in channel_buffers.iter_mut() {
+                buffer.clear();
+            }
+            for frame in data.chunks(channels) {
+                for (channel_idx, sample) in frame.iter().enumerate() {
+                    if let Some(buffer) = channel_buffers.get_mut(channel_idx) {
+                        buffer.push(f32::from_sample(*sample));
+                    }
+                }
+            }
+            let limit = channel_buffers.len().min(channels);
+            for channel_idx in 0..limit {
+                let buffer = &mut channel_buffers[channel_idx];
+                if buffer.is_empty() {
+                    continue;
+                }
+                match channel_aligners.get(channel_idx) {
+                    Some(handle) => match handle.lock() {
+                        Ok(mut aligner) => aligner.process_chunk(buffer.as_slice()),
+                        Err(err) => eprintln!(
+                            "Input stream '{device_label}' channel {channel_idx}: failed to lock StreamAligner: {err}"
+                        ),
+                    },
+                    None => eprintln!(
+                        "Input stream '{device_label}' channel {channel_idx}: missing StreamAligner; dropping audio."
+                    ),
+                }
+                buffer.clear();
+            }
+        },
+        move |err| eprintln!("Input stream '{device_label}' error: {err}"),
+        None,
+    )
+}
+
+fn validate_device_stream_config(
+    device: &Device,
+    device_name: &str,
+    channels: u16,
+    sample_rate: u32,
+    format: SampleFormat,
+    direction: &'static str,
+) -> Result<(), Box<dyn Error>> {
+    let configs = match direction {
+        "input" => gather_supported_input_configs(device)
+            .map_err(|err| format!("Unable to enumerate input configs for '{device_name}': {err}"))?,
+        "output" => gather_supported_output_configs(device)
+            .map_err(|err| format!("Unable to enumerate output configs for '{device_name}': {err}"))?,
+        other => {
+            return Err(format!("Unknown device direction '{other}' when validating {device_name}.").into());
+        }
+    };
+
+    if configs.is_empty() {
+        return Err(format!(
+            "{} device '{}' reported no supported stream configurations to validate.",
+            direction, device_name
+        )
+        .into());
+    }
+
+    if supports_rate(&configs, channels, sample_rate, format) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} device '{}' does not support {} channel(s), {:?} at {} Hz.",
+            direction, device_name, channels, format, sample_rate
+        )
+        .into())
     }
 }
-*/
 
 fn select_device<I>(
     devices: Result<I, cpal::DevicesError>,
