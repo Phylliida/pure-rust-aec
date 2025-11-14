@@ -55,8 +55,6 @@ use speex_rust_aec::{
 
 use std::time::Instant;
 
-use evmap::handles::{ReadHandle, WriteHandle};
-
 
 const DEFAULT_AEC_RATE: u32 = 48_000;
 const RESAMPLER_QUALITY: i32 = 5;
@@ -962,7 +960,7 @@ impl<T: Copy> BufferedCircularProducer<T> {
         if need_to_write_outputs {
             // wrote to scratch, need to add it to producer
             let _appended = self.producer.push_slice(&self.scratch[..num_written]);
-            if (_appended < num_written) {
+            if _appended < num_written {
                 eprintln!("Warning: Producer cannot keep up, increase buffer size or decrease latency")
             }
         } else {
@@ -1013,6 +1011,13 @@ impl<T: Copy> BufferedCircularConsumer<T> {
     fn finish_read(&mut self, num_read: usize) -> usize {
         self.consumer.skip(num_read)
     }
+
+    fn available(&self) -> usize {
+        let (head, tail) = self.consumer.as_slices();
+        let head_len = head.len();
+        let tail_len = tail.len();
+        head_len + tail_len
+    }
 }
 
 impl<T: Copy> BufferedCircularConsumer<T> {
@@ -1025,6 +1030,7 @@ impl<T: Copy> BufferedCircularConsumer<T> {
         let head_len = head.len();
         let tail_len = tail.len();
         let available = head_len + tail_len;
+
         if available == 0 {
             eprintln!("Consumer is saturated, this is bad, please increase buffer sizes");
             return &[];
@@ -1257,6 +1263,7 @@ type StreamId = u64;
 enum HeapConsSendMsg {
     Add(StreamId, ringbuf::HeapCons<f32>),
     Remove(StreamId),
+    InterruptAll(),
 }
 
 struct OutputStreamAligner {
@@ -1266,6 +1273,7 @@ struct OutputStreamAligner {
     heap_cons_reciever: mpsc::Receiver<HeapConsSendMsg>,
     input_audio_buffer_producer: BufferedCircularProducer<f32>,
     input_audio_buffer_consumer: BufferedCircularConsumer<f32>,
+    total_input_samples_remaining: i128,
     output_audio_buffer_producer: BufferedCircularProducer<f32>,
     stream_consumers: HashMap<StreamId, BufferedCircularConsumer<f32>>,
     cur_stream_id: Arc<AtomicU64>,
@@ -1279,7 +1287,6 @@ impl OutputStreamAligner {
         // used to send across threads
         let (heap_cons_sender, heap_cons_reciever) = mpsc::channel::<HeapConsSendMsg>();
         let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
-        
         Ok(Self {
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
@@ -1287,6 +1294,7 @@ impl OutputStreamAligner {
             heap_cons_reciever: heap_cons_reciever,
             input_audio_buffer_producer: BufferedCircularProducer::new(input_audio_buffer_producer),
             input_audio_buffer_consumer: BufferedCircularConsumer::new(input_audio_buffer_consumer),
+            total_input_samples_remaining: 0,
             output_audio_buffer_producer: BufferedCircularProducer::new(output_audio_buffer_producer),
             stream_consumers: HashMap::new(),
             cur_stream_id: Arc::new(AtomicU64::new(0)),
@@ -1309,15 +1317,30 @@ impl OutputStreamAligner {
     }
 
     fn enqueue_audio(audio_data: &[f32], mut audio_producer: HeapProd<f32>) {
-        audio_producer.push_slice_overwrite(audio_data);
+        let num_pushed = audio_producer.push_slice(audio_data);
+        if num_pushed < audio_data.len() {
+            eprintln!("Error: output audio buffer got behind, try increasing buffer size");
+        }
     }
 
     fn end_audio_stream(&self, stream_index: StreamId) {
         self.heap_cons_sender.send(HeapConsSendMsg::Remove(stream_index));
     }
 
-    fn get_audio_chunk(&mut self, input_chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
-        // fetch new messages non-blocking
+    fn interrupt_all_streams(&self) { 
+        self.heap_cons_sender.send(HeapConsSendMsg::InterruptAll());
+    }
+    
+    // frame size should be small, on the order of 1-2ms or less.
+    fn fetch_audio_chunk(&mut self, output_audio_buffer_consumer: HeapCons<f32>, input_frame_size: usize, output_chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
+        while output_audio_buffer_consumer.occupied_len() < output_chunk_size {
+            self.fetch_audio_chunk_helper(input_frame_size)?;
+        }
+        Ok(())
+    }
+
+    fn fetch_audio_chunk_helper(&mut self, input_chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
+        // fetch new audio consumers, non-blocking
         loop {
             match self.heap_cons_reciever.try_recv() {
                 Ok(msg) => match msg {
@@ -1325,7 +1348,12 @@ impl OutputStreamAligner {
                         self.stream_consumers.insert(id, BufferedCircularConsumer::new(cons));
                     }
                     HeapConsSendMsg::Remove(id) => {
+                        // remove if present
                         self.stream_consumers.remove(&id);
+                    }
+                    HeapConsSendMsg::InterruptAll() => {
+                        // remove all streams, interrupt requires new streams to be created
+                        self.stream_consumers.clear();
                     }
                 },
                 Err(TryRecvError::Empty) => break,          // nothing waiting; continue processing
@@ -1336,7 +1364,7 @@ impl OutputStreamAligner {
         let (need_to_write_input_values, input_buf_write) = self.input_audio_buffer_producer.get_chunk_to_write(input_chunk_size);
         let actual_input_chunk_size = input_buf_write.len();
         input_buf_write.fill(0.0);
-        for (stream_id, cons) in self.stream_consumers.iter_mut() {
+        for (_stream_id, cons) in self.stream_consumers.iter_mut() {
             let buf_from_stream = cons.get_chunk_to_read(actual_input_chunk_size);
             let samples_to_mix = buf_from_stream.len().min(actual_input_chunk_size);
             if samples_to_mix == 0 {
@@ -1354,8 +1382,10 @@ impl OutputStreamAligner {
             cons.finish_read(samples_to_mix);
         }
         self.input_audio_buffer_producer.finish_write(need_to_write_input_values, actual_input_chunk_size);
-        let input_buf_read = self.input_audio_buffer_consumer.get_chunk_to_read(input_chunk_size);
-        let target_output_samples_count = (input_to_output_frames(input_buf_read.len() as i128, self.input_sample_rate, self.output_sample_rate) + 10) as usize; // add a few extra for rounding
+        // we need to do this accumulation because resample won't do all of them, it rounds to its internal frame size
+        self.total_input_samples_remaining += actual_input_chunk_size as i128;
+        let input_buf_read = self.input_audio_buffer_consumer.get_chunk_to_read(self.total_input_samples_remaining as usize);
+        let target_output_samples_count = (input_to_output_frames(self.total_input_samples_remaining, self.input_sample_rate, self.output_sample_rate) + 10) as usize; // add a few extra for rounding
         let (need_to_write_output_values, output_buf_write) = self.output_audio_buffer_producer.get_chunk_to_write(target_output_samples_count);
         let (consumed, produced) = self.resampler.process_interleaved_f32(input_buf_read, output_buf_write)?;
         // it may return less consumed and produced than the sizes of stuff we gave it
@@ -1363,7 +1393,7 @@ impl OutputStreamAligner {
         // (worst case this is like 0.6 ms or so, so it's okay to have them slightly delayed like this)
         self.input_audio_buffer_consumer.finish_read(consumed);
         self.output_audio_buffer_producer.finish_write(need_to_write_output_values, produced);
-
+        self.total_input_samples_remaining -= consumed as i128;
         Ok(())
     }
 }
