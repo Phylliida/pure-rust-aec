@@ -1514,13 +1514,13 @@ fn get_input_stream_aligners(device_config: InputDeviceConfig, aec_config: AecCo
 
     let device = select_device(
         device_config.host.input_devices(),
-        device_config.name,
+        device_config.device_name,
         "Input",
     )?;
 
     let supported_config = find_matching_device_config(
         &device,
-        device_config.name,
+        device_config.device_name,
         device_config.channels,
         device_config.sample_rate,
         device_config.sample_format,
@@ -1553,13 +1553,13 @@ fn get_output_stream_aligners(device_config: OutputDeviceConfig, aec_config: Aec
 
     let device = select_device(
         device_config.host.output_devices(),
-        device_config.name,
+        device_config.device_name,
         "Output",
     )?;
 
     let supported_config = find_matching_device_config(
         &device,
-        device_config.name,
+        device_config.device_name,
         device_config.channels,
         device_config.sample_rate,
         device_config.sample_format,
@@ -1656,46 +1656,56 @@ impl AecStream {
         }
     }
 
-    fn add_input_device(&mut self, config: InputDeviceConfig) {
+    fn add_input_device(&mut self, config: InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
         let (stream, aligners) = get_input_stream_aligners(config, self.aec_config);
-        if let Some(stream) = self.input_streams.get(config.name) {
+        if let Some(stream) = self.input_streams.get(&config.device_name) {
             stream.pause()?;
         }
-        self.input_streams.set(config.name, stream);
-        self.input_aligners.set(config.name, aligners);
+        self.input_streams.insert(config.device_name.clone(), stream);
+        self.input_aligners.insert(config.device_name.clone(), aligners);
 
         self.update_aec();
+        Ok(())
     }
 
-    fn add_output_device(config: OutputDeviceConfig) {
+    fn add_output_device(config: OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
         let (stream, aligners) = get_output_stream_aligners(config, self.aec_config);
-        if let Some(stream) = self.output_streams.get(config.name) {
+        if let Some(stream) = self.output_streams.get(&config.device_name) {
             stream.pause()?;
         }
-        self.output_streams.set(config.name, stream);
-        self.output_aligners.set(config.name, aligners);
+        self.output_streams.insert(config.device_name.clone(), stream);
+        self.output_aligners.insert(config.device_name.clone(), aligners);
 
         self.update_aec();
+        Ok(())
     }
 
-    fn remove_input_device(&mut self, config: InputDeviceConfig) {
-        self.input_streams.remove(config.name);
-        self.input_aligners.remove(config.name);
+    fn remove_input_device(&mut self, config: InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(stream) = self.input_streams.get(&config.device_name) {
+            stream.pause()?;
+        }
+        self.input_streams.remove(&config.device_name);
+        self.input_aligners.remove(&config.device_name);
 
         self.update_aec();
+        Ok(())
     }
 
-    fn remove_output_device(&mut self, config: OutputDeviceConfig) {
-        self.input_streams.remove(config.name);
-        self.input_aligners.remove(config.name);
+    fn remove_output_device(&mut self, config: OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(stream) = self.output_streams.get(&config.device_name) {
+            stream.pause()?;
+        }
+        self.input_streams.remove(&config.device_name);
+        self.input_aligners.remove(&config.device_name);
 
         self.update_aec();
+        Ok(())
     }
 
     fn update() {
         // todo: grab the buffers from stream aligners, feed them to aec, the send them back as outputs
         for input_key in self.sorted_input_aligners {
-            
+
         }
     }
 }
@@ -1746,7 +1756,7 @@ fn find_matching_device_config(
     format: SampleFormat,
     direction: &'static str,
 ) -> Result<SupportedStreamConfig, Box<dyn Error>> {
-    let configs = match direction {
+    let configs : Vec<_> = match direction {
         "Input" => device.supported_input_configs().map(|configs| configs.collect())
             .map_err(|err| format!("Unable to enumerate input configs for '{device_name}': {err}"))?,
         "Output" => device.supported_output_configs().map(|configs| configs.collect())
@@ -1855,7 +1865,7 @@ where
         .collect::<Vec<_>>();
     
     device.build_input_stream(
-        supported_config,
+        &supported_config.config(),
         move |data: &[T], _info: &InputCallbackInfo| {
             if data.is_empty() {
                 return;
@@ -1923,30 +1933,23 @@ fn build_output_alignment_stream(
 
 fn build_output_alignment_stream_typed<T>(
     device: &Device,
-    config: InputDeviceConfig,
+    config: OutputDeviceConfig,
     supported_config: SupportedStreamConfig,
     device_audio_channel_consumers: Vec<BufferedCircularConsumer>
 ) -> Result<Stream, cpal::BuildStreamError>
 where
     T: Sample + SizedSample,
-    f32: FromSample<T>,
+    T: FromSample<f32>,
 {
-    let per_channel_capacity = config.sample_rate
-        .saturating_div(20) // ~50 ms of audio per channel
-        .max(1024);
-    let mut channel_buffers = (0..config.channels)
-        .map(|_| Vec::<f32>::with_capacity(per_channel_capacity))
-        .collect::<Vec<_>>();
-    
     device.build_output_stream(
-        supported_config,
+        &supported_config.config(),
         move |data: &mut [T], _| {
             let frames = data.len() / config.channels;
             if frames == 0 {
                 return;
             }
-            // in case consumers don't have enough yet
-            data.fill(T::from_sample(0.0));
+            // in case one of the device_audio_channel_consumers doesn't have enough yet
+            data.fill(T::from_sample(0.0f32));
             
             // interleave the data which is what cpal expects
             for (channel_idx, consumer) in device_audio_channel_consumers.iter_mut().enumerate() {
