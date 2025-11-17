@@ -1585,7 +1585,6 @@ fn get_output_stream_aligners(device_config: OutputDeviceConfig, aec_config: Aec
         device: device,
         config: device_config,
         supported_config: supported_config,
-        aligners: aligners,
         device_audio_channel_consumers: device_audio_channel_consumers
     )
 
@@ -1696,6 +1695,7 @@ impl AecStream {
     fn update() {
         // todo: grab the buffers from stream aligners, feed them to aec, the send them back as outputs
         for input_key in self.sorted_input_aligners {
+            
         }
     }
 }
@@ -1806,7 +1806,7 @@ fn build_input_alignment_stream(
     device: &Device,
     config: InputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    channel_aligners: Vec<StreamAligner>,
+    channel_aligners: Vec<InputStreamAligner>,
 ) -> Result<Stream, cpal::BuildStreamError> {
     let label = device_name.to_string();
     match config.sample_format {
@@ -1841,7 +1841,7 @@ fn build_input_alignment_stream_typed<T>(
     device: &Device,
     config: InputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    channel_aligners: Vec<StreamAligner>,
+    channel_aligners: Vec<InputStreamAligner>,
 ) -> Result<Stream, cpal::BuildStreamError>
 where
     T: Sample + SizedSample,
@@ -1864,6 +1864,8 @@ where
                 buffer.clear();
             }
             // undo the interleaving and convert to f32
+            // todo: do this looping per channel in outermost instead of get_mut each time
+            // (if it becomes a performance issue)
             for frame in data.chunks(config.channels) {
                 for (channel_idx, sample) in frame.iter().enumerate() {
                     if let Some(buffer) = channel_buffers.get_mut(channel_idx) {
@@ -1888,7 +1890,6 @@ fn build_output_alignment_stream(
     device: &Device,
     config: OutputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    channel_aligners: Vec<StreamAligner>,
     device_audio_channel_consumers: Vec<BufferedCircularConsumer>
 ) -> Result<Stream, cpal::BuildStreamError> {
     let label = device_name.to_string();
@@ -1897,21 +1898,18 @@ fn build_output_alignment_stream(
             device,
             config,
             supported_config,
-            channel_aligners,
             device_audio_channel_consumers,
         ),
         SampleFormat::F32 => build_output_alignment_stream_typed::<f32>(
             device,
             config,
             supported_config,
-            channel_aligners,
             device_audio_channel_consumers,
         ),
         SampleFormat::U16 => build_output_alignment_stream_typed::<u16>(
             device,
             config,
             supported_config,
-            channel_aligners,
             device_audio_channel_consumers,
         ),
         other => {
@@ -1927,7 +1925,6 @@ fn build_output_alignment_stream_typed<T>(
     device: &Device,
     config: InputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    channel_aligners: Vec<StreamAligner>,
     device_audio_channel_consumers: Vec<BufferedCircularConsumer>
 ) -> Result<Stream, cpal::BuildStreamError>
 where
@@ -1944,9 +1941,28 @@ where
     device.build_output_stream(
         supported_config,
         move |data: &mut [T], _| {
-            // here look here codex
-            // this should eat data from each of the device_audio_channel_consumers and convert it into right stuff needed for data
+            let frames = data.len() / config.channels;
+            if frames == 0 {
+                return;
+            }
+            // in case consumers don't have enough yet
+            data.fill(T::from_sample(0.0));
             
+            // interleave the data which is what cpal expects
+            for (channel_idx, consumer) in device_audio_channel_consumers.iter_mut().enumerate() {
+                let chunk = consumer.get_chunk_to_read(frames);
+                if chunk.is_empty() {
+                    continue;
+                }
+
+                let samples_to_write = chunk.len().min(frames);
+                for (frame_idx, &sample) in chunk.iter().take(samples_to_write).enumerate() {
+                    let dst = frame_idx * config.channels + channel_idx;
+                    data[dst] = T::from_sample(sample);
+                }
+
+                consumer.finish_read(samples_to_write);
+            }
         },
         move |err| eprintln!("Output stream '{device_label}' error: {err}"),
         None,
