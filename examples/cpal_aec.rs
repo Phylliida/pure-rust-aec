@@ -935,6 +935,30 @@ where
 
 
 
+fn input_to_output_frames(input_frames: i128, in_rate: u32, out_rate: u32) -> i128 {
+    // u128 to avoid overflow
+    (((input_frames as i128) * (out_rate as i128)) / (in_rate as i128)) as i128
+}
+
+fn output_to_input_frames(output_frames: i128, in_rate: u32, out_rate: u32) -> i128 {
+    // u128 to avoid overflow
+    (((output_frames as i128) * (in_rate as i128)) / (out_rate as i128)) as i128
+}
+
+fn micros_to_frames(microseconds: i128, sample_rate: i128) -> i128 {
+    // There are sample_rate samples per second
+    // there are sample_rate / 1_000_000 samples per microsecond
+    // now that we have samples_per_microsecond, we simply multiply by microseconds to get total samples
+    // rearranging:
+    microseconds * sample_rate / 1000000
+}
+
+fn frames_to_micros(frames: i128, sample_rate: i128) -> i128 {
+    // frames = (microseconds * sample_rate / 1 000 000)
+    // frames * 1_000_000 = microseconds * sample_rate
+    frames * 1000000 / sample_rate // = microseconds
+}
+
 
 
 
@@ -1067,24 +1091,23 @@ impl<T: Copy> BufferedCircularConsumer<T> {
 // a wrapper around BufferedCircularConsumer that resamples the stream before outputting
 // you must call .resample(...)? before calling get_chunk_to_read() or there will be nothing available
 // a safe choice is .resample(consumer.available_to_resample())
-struct ResampledBufferedCircularConsumer<T: Copy> {
-    consumer: BufferedCircularConsumer<T>,
-    resampled_producer: BufferedCircularProducer<T>,
-    resampled_consumer: BufferedCircularConsumer<T>,
+struct ResampledBufferedCircularConsumer {
+    consumer: BufferedCircularConsumer<f32>,
+    resampled_producer: BufferedCircularProducer<f32>,
+    resampled_consumer: BufferedCircularConsumer<f32>,
     input_sample_rate: u32,
     output_sample_rate: u32,
     total_input_samples_remaining: i128,
-    scratch: Vec<T>,
     resampler: Resampler
 }
 
-impl<T: Copy> ResampledBufferedCircularConsumer<T> {
-    fn new(input_sample_rate: u32, output_sample_rate : u32, resampler_quality: i32, audio_buffer_seconds: u32, consumer: BufferedCircularConsumer<T>) -> Result<Self, Box<dyn std::error::Error>> {
+impl ResampledBufferedCircularConsumer {
+    fn new(input_sample_rate: u32, output_sample_rate : u32, resampler_quality: i32, audio_buffer_seconds: u32, consumer: BufferedCircularConsumer<f32>) -> Result<Self, Box<dyn std::error::Error>> {
         let (resampled_producer, resampled_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
         Ok(Self {
             consumer: consumer,
-            resampled_producer: resampled_producer,
-            resampled_consumer: resampled_consumer,
+            resampled_producer: BufferedCircularProducer::<f32>::new(resampled_producer),
+            resampled_consumer: BufferedCircularConsumer::<f32>::new(resampled_consumer),
             total_input_samples_remaining: 0,
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
@@ -1100,7 +1123,7 @@ impl<T: Copy> ResampledBufferedCircularConsumer<T> {
     fn set_sample_rate(&mut self, input_sample_rate: u32, output_sample_rate: u32) -> Result<(), Box<dyn std::error::Error>> {
         self.resampler.set_rate(input_sample_rate, output_sample_rate)?;
         self.input_sample_rate = input_sample_rate;
-        self.output_sample_rate = ouptut_sample_rate;
+        self.output_sample_rate = output_sample_rate;
         Ok(())
     }
 
@@ -1117,15 +1140,15 @@ impl<T: Copy> ResampledBufferedCircularConsumer<T> {
     }
 }
 
-impl<T: Copy> ResampledBufferedCircularConsumer<T> {
+impl ResampledBufferedCircularConsumer {
     // resample all data available
     fn resample_all(&mut self) -> Result<(usize, usize), Box<dyn std::error::Error>>  {
-        self.resample(self.available_to_resample())?
+        self.resample(self.available_to_resample() as u32)
     }
 
     fn resample(&mut self, num_available_frames: u32) -> Result<(usize, usize), Box<dyn std::error::Error>> {
         if num_available_frames == 0 {
-            return Ok(());
+            return Ok((0,0));
         }
         // there might be some leftover from last call, so use state
         self.total_input_samples_remaining += num_available_frames as i128;
@@ -1144,36 +1167,10 @@ impl<T: Copy> ResampledBufferedCircularConsumer<T> {
         Ok((consumed, produced))
     }
 
-    fn get_chunk_to_read(&mut self, size: usize) -> &[T] {
-        self.resampled_consumer.get_chunk_to_read(produced.min(size))
+    fn get_chunk_to_read(&mut self, size: usize) -> &[f32] {
+        self.resampled_consumer.get_chunk_to_read(size)
     }
-
-
-
-
-fn input_to_output_frames(input_frames: i128, in_rate: u32, out_rate: u32) -> i128 {
-    // u128 to avoid overflow
-    (((input_frames as i128) * (out_rate as i128)) / (in_rate as i128)) as i128
 }
-
-fn output_to_input_frames(output_frames: i128, in_rate: u32, out_rate: u32) -> i128 {
-    // u128 to avoid overflow
-    (((output_frames as i128) * (in_rate as i128)) / (out_rate as i128)) as i128
-}
-
-fn micros_to_frames(microseconds: i128, sample_rate: i128) -> i128 {
-    // There are sample_rate samples per second
-    // there are sample_rate / 1_000_000 samples per microsecond
-    // now that we have samples_per_microsecond, we simply multiply by microseconds to get total samples
-    // rearranging:
-    microseconds * sample_rate / 1000000
-}
-
-fn frames_to_micros(frames: i128, sample_rate: i128) -> i128 {
-    // frames = (microseconds * sample_rate / 1 000 000)
-    // frames * 1_000_000 = microseconds * sample_rate
-    frames * 1000000 / sample_rate // = microseconds
-}}
 
 #[derive(Debug)]
 struct AudioBufferMetadata {
@@ -1181,48 +1178,26 @@ struct AudioBufferMetadata {
     target_emitted_frames: i128
 }
 
-struct InputStreamAligner {
+
+struct InputStreamAlignerProducer {
     start_time: Option<std::time::Instant>,
     input_sample_rate: u32,
     output_sample_rate: u32,
-    dynamic_output_sample_rate: u32,
     input_audio_buffer_producer: HeapProd<f32>,
-    input_audio_buffer_consumer: BufferedResampledCircularConsumer<f32>,
     input_audio_buffer_metadata_producer: HeapProd<AudioBufferMetadata>,
-    input_audio_buffer_metadata_consumer: HeapCons<AudioBufferMetadata>,
-    total_emitted_frames: i128,
-    total_input_samples_remaining: i128,
-    chunk_sizes: LocalRb<Heap<usize>>, // only accessed by the audio push thread
-    system_time_in_frames_when_chunk_ended: LocalRb<Heap<i128>>, // only accessed by the audio input thread
-    resampler: Resampler
+    chunk_sizes: LocalRb<Heap<usize>>,
+    system_time_in_frames_when_chunk_ended: LocalRb<Heap<i128>>
 }
 
-impl InputStreamAligner {
-    // Takes input audio and resamples it to the target rate
-    // May slightly stretch or squeeze the audio (via resampling)
-    // to ensure the outputs stay aligned with system clock
-    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, audio_buffer_seconds: u32, resampler_quality: i32) -> Result<Self, Box<dyn Error>>  {
-        let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
-        let (input_audio_buffer_metadata_producer, input_audio_buffer_metadata_consumer) = HeapRb::<AudioBufferMetadata>::new(1000).split(); // should be plenty for any practical use
+impl InputStreamAlignerProducer {
+    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, input_audio_buffer_producer: HeapProd<f32>, input_audio_buffer_metadata_producer: HeapProd<AudioBufferMetadata>) -> Result<Self, Box<dyn Error>>  {
         Ok(Self {
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
-            dynamic_output_sample_rate: output_sample_rate,
             input_audio_buffer_producer: input_audio_buffer_producer,
-            // we need buffered because this interfaces with speex which expects continuous buffers
-            input_audio_buffer_consumer: BufferedResampledCircularConsumer::<f32>::new(
-                input_sample_rate: input_sample_rate,
-                output_sample_rate: output_sample_rate,
-                resampler_quality: resampler_quality,
-                audio_buffer_seconds: audio_buffer_seconds, 
-                consumer: BufferedCircularConsumer::<f32>::new(input_audio_buffer_consumer)
-            )?,
             input_audio_buffer_metadata_producer: input_audio_buffer_metadata_producer,
-            input_audio_buffer_metadata_consumer: input_audio_buffer_metadata_consumer,
-            total_input_samples_remaining: 0, // variable to accumulate bc speex goes in chunks
             // alignment data, these are used to adjust resample rate so output stays aligned with true timings (according to sytem clock)
             start_time: None,
-            total_emitted_frames: 0,
             chunk_sizes: LocalRb::<Heap<usize>>::new(history_len),
             system_time_in_frames_when_chunk_ended: LocalRb::<Heap<i128>>::new(history_len),
         })
@@ -1247,20 +1222,19 @@ impl InputStreamAligner {
         best_estimate_of_when_most_recent_ended
     }
 
-    fn process_chunk(&mut self, chunk: &[f32]) {
+    fn process_chunk(&mut self, chunk: &[f32]) -> Option<std::time::Instant> {
         let recieved_timestamp = Instant::now(); // store this first so we are as precise as possible
-        if let None = self.start_time {
+        let return_start_time = if let Some(start_time_value) = self.start_time {
+            start_time_value
+        } else {
             // choose a start time so that frames_when_chunk_ended starts out equal to chunk len
-            self.start_time = Some(recieved_timestamp - Duration::from_micros(frames_to_micros(chunk.len() as i128, self.input_sample_rate as i128) as u64));
+            recieved_timestamp - Duration::from_micros(frames_to_micros(chunk.len() as i128, self.input_sample_rate as i128) as u64)
         }
-        
-        // now we have assigned start_time, get it
-        let frames_when_chunk_ended = if let Some(start_time) = self.start_time {
-            micros_to_frames(recieved_timestamp.duration_since(start_time).as_micros() as i128, i128::from(self.input_sample_rate))
-        }
-        else {
-            0
-        };
+
+        self.start_time = Some(return_start_time);
+
+        // now we have assigned start_time, get it in terms of frames
+        let frames_when_chunk_ended = micros_to_frames(recieved_timestamp.duration_since(return_start_time).as_micros() as i128, i128::from(self.input_sample_rate));
        
         let appended_count = self.input_audio_buffer_producer.push_slice(chunk);
         if appended_count < chunk.len() { // todo: auto resize
@@ -1285,15 +1259,52 @@ impl InputStreamAligner {
         }
     }
 
-    // do it very slowly
-    fn decrease_dynamic_sample_rate(&mut self) {
-        self.dynamic_output_sample_rate = (((self.output_sample_rate as f32) * 0.95) as i128).max((self.dynamic_output_sample_rate-1) as i128) as u32;
-        self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
+}
+
+
+struct InputStreamAlignerConsumer {
+    input_sample_rate: u32,
+    output_sample_rate: u32,
+    dynamic_output_sample_rate: u32,
+    input_audio_buffer_consumer: ResampledBufferedCircularConsumer,
+    input_audio_buffer_metadata_consumer: HeapCons<AudioBufferMetadata>,
+    total_emitted_frames: i128,
+}
+
+impl InputStreamAlignerConsumer {
+    // Takes input audio and resamples it to the target rate
+    // May slightly stretch or squeeze the audio (via resampling)
+    // to ensure the outputs stay aligned with system clock
+    fn new(input_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, input_audio_buffer_consumer: HeapCons<f32>, input_audio_buffer_metadata_consumer: HeapCons<AudioBufferMetadata>) -> Result<Self, Box<dyn Error>>  {
+        Ok(Self {
+            input_sample_rate: input_sample_rate,
+            output_sample_rate: output_sample_rate,
+            dynamic_output_sample_rate: output_sample_rate,
+            // we need buffered because this interfaces with speex which expects continuous buffers
+            input_audio_buffer_consumer: BufferedResampledCircularConsumer::<f32>::new(
+                input_sample_rate: input_sample_rate,
+                output_sample_rate: output_sample_rate,
+                resampler_quality: resampler_quality,
+                audio_buffer_seconds: audio_buffer_seconds, 
+                consumer: BufferedCircularConsumer::<f32>::new(input_audio_buffer_consumer)
+            )?,
+            input_audio_buffer_metadata_consumer: input_audio_buffer_metadata_consumer,
+            // alignment data, these are used to adjust resample rate so output stays aligned with true timings (according to sytem clock)
+            total_emitted_frames: 0,
+        })
     }
 
-    fn increase_dynamic_sample_rate(&mut self) {
+    // do it very slowly
+    fn decrease_dynamic_sample_rate(&mut self)  -> Result<(), Box<dyn std::error::Error>>  {
+        self.dynamic_output_sample_rate = (((self.output_sample_rate as f32) * 0.95) as i128).max((self.dynamic_output_sample_rate-1) as i128) as u32;
+        self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
+        Ok(())
+    }
+
+    fn increase_dynamic_sample_rate(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.dynamic_output_sample_rate = (((self.output_sample_rate as f32) * 1.05) as i128).min((self.dynamic_output_sample_rate+1) as i128) as u32;
         self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
+        Ok(())
     }
 
     fn handle_metadata(&mut self, metadata: AudioBufferMetadata) -> Result<(), Box<dyn std::error::Error>> {
@@ -1304,15 +1315,15 @@ impl InputStreamAligner {
         // dynamic adjustment to synchronize input devices to global clock:
         // not enough frames, we need to increase dynamic sample rate (to get more samples)
         if updated_total_frames_emitted < target_emitted_frames {
-            self.increase_dynamic_sample_rate();
+            self.increase_dynamic_sample_rate()?;
         }
         // too many frames, we need to decrease dynamic sample rate (to get less samples)
         else if updated_total_frames_emitted > target_emitted_frames {
-            self.decrease_dynamic_sample_rate();
+            self.decrease_dynamic_sample_rate()?;
         }
 
         //// do resampling ////
-        let (_consumed, produced) = self.input_audio_buffer_consumer.resample(num_available_frames)?;
+        let (_consumed, produced) = self.input_audio_buffer_consumer.resample(num_available_frames as u32)?;
 
         // the main downside of this is that it'll be persistently behind by 0.6ms or so (the resample frame size), but we'll quickly adjust for that so this shouldn't be a major issue
         // todo: think about how to fix this better (maybe current solution is as good as we can do, and it should average out to correct since past ones accumulated will result in more for this one, still, it's likely to stay behind by this amount)
@@ -1321,14 +1332,39 @@ impl InputStreamAligner {
         Ok(())
     }
 
-    fn get_chunk_to_read(&mut self, size: usize) -> Result<&[T], Box<dyn std::error::Error>> {
+    fn get_chunk_to_read(&mut self, size: usize) -> Result<&[f32], Box<dyn std::error::Error>> {
         // first, do resampling of any recieved chunks
         while let Some(meta) = self.input_audio_buffer_metadata_consumer.try_pop() {
             self.handle_metadata(meta)?;
         }
         // then emit them
-        Ok(self.input_audio_buffer_consumer.get_chunk_to_read(size)?)
+        Ok(self.input_audio_buffer_consumer.get_chunk_to_read(size))
     }
+}
+
+
+fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, audio_buffer_seconds: u32, resampler_quality: i32) -> Result<(InputStreamAlignerProducer, InputStreamAlignerConsumer), Box<dyn Error>> {
+    let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
+    let (input_audio_buffer_metadata_producer, input_audio_buffer_metadata_consumer) = HeapRb::<AudioBufferMetadata>::new(1000).split(); // should be plenty for any practical use since it shouldn't get very behind
+
+    let producer = InputStreamAlignerProducer::new(
+        input_sample_rate,
+        output_sample_rate,
+        history_len,
+        input_audio_buffer_producer,
+        input_audio_buffer_metadata_producer
+    )?;
+
+    let consumer = InputStreamAlignerConsumer::new(
+        input_sample_rate,
+        output_sample_rate,
+        audio_buffer_seconds,
+        resampler_quality,
+        input_audio_buffer_consumer,
+        input_audio_buffer_metadata_consumer
+    )?;
+
+    Ok((producer, consumer))
 }
 
 type StreamId = u64;
@@ -1340,16 +1376,15 @@ enum HeapConsSendMsg {
 }
 
 struct OutputStreamAligner {
-    input_sample_rate: u32,
+    device_sample_rate: u32,
     output_sample_rate: u32,
     heap_cons_sender: mpsc::Sender<HeapConsSendMsg>,
     heap_cons_reciever: mpsc::Receiver<HeapConsSendMsg>,
     input_audio_buffer_producer: BufferedCircularProducer<f32>,
-    input_audio_buffer_consumer: ResampledBufferedCircularConsumer<f32>,
+    input_audio_buffer_consumer: ResampledBufferedCircularConsumer,
     device_audio_producer: BufferedCircularProducer<f32>,
-    stream_consumers: HashMap<StreamId, ResampledBufferedCircularConsumer<f32>>,
+    stream_consumers: HashMap<StreamId, ResampledBufferedCircularConsumer>,
     cur_stream_id: Arc<AtomicU64>,
-    resampler: Resampler,
 }
 
 // allows for playing audio on top of each other (mixing) or just appending to buffer
@@ -1366,22 +1401,22 @@ impl OutputStreamAligner {
             heap_cons_reciever: heap_cons_reciever,
             input_audio_buffer_producer: BufferedCircularProducer::new(input_audio_buffer_producer),
             input_audio_buffer_consumer: ResampledBufferedCircularConsumer::new(
-                input_sample_rate: device_sample_rate,
-                output_sample_rate: output_sample_rate,
-                resampler_quality: resampler_quality,
-                audio_buffer_seconds: audio_buffer_seconds,
-                consumer: BufferedCircularConsumer::new(input_audio_buffer_consumer)
+                device_sample_rate,
+                output_sample_rate,
+                resampler_quality,
+                audio_buffer_seconds,
+                BufferedCircularConsumer::new(input_audio_buffer_consumer)
             )?,
-            device_audio_producer: device_audio_producer,
+            device_audio_producer: BufferedCircularProducer::new(device_audio_producer),
             stream_consumers: HashMap::new(),
             cur_stream_id: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    fn begin_audio_stream(&self, audio_buffer_seconds: u32, sample_rate: u32, resampler_quality: u32) -> (StreamId, HeapProd<f32>) {
+    fn begin_audio_stream(&self, audio_buffer_seconds: u32, sample_rate: u32, resampler_quality: i32) -> (StreamId, HeapProd<f32>) {
         // this assigns unique ids in a thread-safe way
         let stream_index = self.cur_stream_id.fetch_add(1, Ordering::Relaxed);
-        let (producer, consumer) = HeapRb::<f32>::new((audio_buffer_seconds * (sample_rate as usize)) as usize).split();
+        let (producer, consumer) = HeapRb::<f32>::new((audio_buffer_seconds * sample_rate) as usize).split();
         // send the consumer to the consume thread
         self.heap_cons_sender.send(HeapConsSendMsg::Add(stream_index, sample_rate, audio_buffer_seconds, resampler_quality, consumer)).unwrap();
         (stream_index, producer)
@@ -1510,7 +1545,7 @@ struct AecConfig {
 }
 
 
-fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, Vec<InputStreamAligner>), Box<dyn std::error::Error>>  {
+fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, Vec<InputStreamAlignerConsumer>), Box<dyn std::error::Error>>  {
 
     let device = select_device(
         device_config.host.input_devices(),
@@ -1527,26 +1562,28 @@ fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &Aec
         "Input",
     )?;
     
-    let mut aligners = Vec::new();
+    let mut aligner_producers = Vec::new();
+    let mut aligner_consumers = Vec::new();
+
     for channel in 0..device_config.channels {
-        let aligner = InputStreamAligner::new(
-            input_sample_rate: device_config.sample_rate,
-            output_sample_rate: aec_config.target_sample_rate,
-            history_len: device_config.history_len,
-            audio_buffer_seconds: device_config.audio_buffer_seconds,
-            resampler_quality: device_config.resampler_quality,
-        );
-        aligners.push(aligner);
+        let (producer, consumer) = create_input_stream_aligner(
+            device_config.sample_rate,
+            aec_config.target_sample_rate,
+            device_config.history_len,
+            device_config.audio_buffer_seconds,
+            device_config.resampler_quality)?;
+        aligner_producers.push(producer);
+        aligner_consumers.push(consumer);
     }
 
     let stream = build_input_alignment_stream(
-        device: device,
-        config: device_config,
-        supported_config: supported_config,
-        aligners: aligners,
-    )
+        &device,
+        device_config,
+        supported_config,
+        aligner_producers,
+    )?;
 
-    return (stream, aligners);
+    Ok((stream, aligner_consumers))
 }
 
 fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, Vec<OutputStreamAligner>), Box<dyn std::error::Error>> {
@@ -1566,40 +1603,40 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
         "Output",
     )?;
     
-    let mut aligners = Vec::new();
+    let mut aligners = Vec::<OutputStreamAligner>::new();
     let mut device_audio_channel_consumers = Vec::new();
     for channel in 0..device_config.channels {
         let (device_audio_producer, device_audio_consumer) = HeapRb::<f32>::new((device_config.audio_buffer_seconds * device_config.sample_rate) as usize).split();
         let aligner = OutputStreamAligner::new(
-            device_sample_rate: device_config.sample_rate,
-            output_sample_rate: aec_config.target_sample_rate,
-            audio_buffer_seconds: device_config.audio_buffer_seconds,
-            resampler_quality: device_config.resampler_quality,
-            device_audio_producer: device_audio_producer
-        );
+            device_config.sample_rate,
+            aec_config.target_sample_rate,
+            device_config.audio_buffer_seconds,
+            device_config.resampler_quality,
+            device_audio_producer,
+        )?;
         aligners.push(aligner);
-        device_audio_channel_consumers.push(device_audio_consumer);
+        device_audio_channel_consumers.push(BufferedCircularConsumer::new(device_audio_consumer));
     }
 
     let stream = build_output_alignment_stream(
-        device: device,
-        config: device_config,
-        supported_config: supported_config,
-        device_audio_channel_consumers: device_audio_channel_consumers
-    )
+        &device,
+        device_config,
+        supported_config,
+        device_audio_channel_consumers
+    )?;
 
-    return (stream, aligners);
+    Ok((stream, aligners))
 }
 
 struct AecStream {
     aec: Option<EchoCanceller>,
     aec_config: AecConfig,
-    input_streams: HashMap<String, Stream>
-    output_streams: HashMap<String, Stream>
-    input_aligners: HashMap<String, Vec<InputStreamAligner>>,
+    input_streams: HashMap<String, Stream>,
+    output_streams: HashMap<String, Stream>,
+    input_aligners: HashMap<String, Vec<InputStreamAlignerConsumer>>,
     output_aligners: HashMap<String, Vec<OutputStreamAligner>>,
-    sorted_input_aligners: Vec<&String>,
-    sorted_output_aligners: Vec<&String>,
+    sorted_input_aligners: Vec<String>,
+    sorted_output_aligners: Vec<String>,
     input_channels: usize,
     output_channels: usize
 }
@@ -1608,11 +1645,11 @@ impl AecStream {
     fn new(
         aec_config: AecConfig
     ) -> Result<Self, Box<dyn Error>> {
-        if target_sample_rate < 0 {
-            return Err(format!("Target sample rate is {}, it must be greater than zero.", target_sample_rate).into());
+        if aec_config.target_sample_rate < 0 {
+            return Err(format!("Target sample rate is {}, it must be greater than zero.", aec_config.target_sample_rate).into());
         }
 
-        return Ok(Self {
+        Ok(Self {
            aec: None,
            aec_config: aec_config,
            input_streams: HashMap::new(),
@@ -1634,23 +1671,25 @@ impl AecStream {
         self.output_aligners.values().flatten().count()
     }
 
-    fn reinitialize_aec(&mut self) {
+    fn reinitialize_aec(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.input_channels = self.num_input_channels();
         self.output_channels = self.num_output_channels();
 
         // store a consistent ordering
-        self.sorted_input_aligners = self.input_aligners.keys().collect();
+        self.sorted_input_aligners = self.input_aligners.keys().cloned().collect();
         self.sorted_input_aligners.sort();
 
-        self.sorted_output_aligners = self.output_aligners.keys().collect();
+        self.sorted_output_aligners = self.output_aligners.keys().cloned().collect();
         self.sorted_output_aligners.sort();
 
-        self.aec = Some(EchoCanceller::new_multichannel(
-            frame_size: self.aec_config.frame_size,
-            filter_length: self.aec_config.filter_length,
-            mic_channels: self.input_channels,
-            speaker_channels: self.output_channels,
-        ))
+        self.aec = EchoCanceller::new_multichannel(
+            self.aec_config.frame_size,
+            self.aec_config.filter_length,
+            self.input_channels,
+            self.output_channels,
+        );
+
+        Ok(())
     }
 
     fn update_aec(&mut self) {
@@ -1671,7 +1710,7 @@ impl AecStream {
         Ok(())
     }
 
-    fn add_output_device(config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn add_output_device(&mut self, config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
         let (stream, aligners) = get_output_stream_aligners(config, &self.aec_config)?;
         if let Some(stream) = self.output_streams.get(&config.device_name) {
             stream.pause()?;
@@ -1705,9 +1744,9 @@ impl AecStream {
         Ok(())
     }
 
-    fn update() {
+    fn update(&self) {
         // todo: grab the buffers from stream aligners, feed them to aec, the send them back as outputs
-        for input_key in self.sorted_input_aligners {
+        for input_key in &self.sorted_input_aligners {
 
         }
     }
@@ -1719,11 +1758,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn select_device(
-    devices: Result<cpal::Devices, cpal::DevicesError>,
-    target: &String,
+fn select_device<I>(
+    devices: Result<I, cpal::DevicesError>,
+    target: &str,
     kind: &str,
-) -> Result<Device, Box<dyn Error>> {
+) -> Result<Device, Box<dyn Error>>
+where
+    I: IntoIterator<Item = Device> {
     match devices {
         Ok(device_iter) => {
             let mut available = Vec::new();
@@ -1819,9 +1860,8 @@ fn build_input_alignment_stream(
     device: &Device,
     config: &InputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    channel_aligners: Vec<InputStreamAligner>,
+    channel_aligners: Vec<InputStreamAlignerProducer>,
 ) -> Result<Stream, cpal::BuildStreamError> {
-    let label = device_name.to_string();
     match config.sample_format {
         SampleFormat::I16 => build_input_alignment_stream_typed::<i16>(
             device,
@@ -1843,7 +1883,8 @@ fn build_input_alignment_stream(
         ),
         other => {
             eprintln!(
-                "Input device '{device_name}' uses unsupported sample format {other:?}; cannot build StreamAligner."
+                "Input device '{0}' uses unsupported sample format {other:?}; cannot build StreamAligner.",
+                config.device_name
             );
             Err(cpal::BuildStreamError::StreamConfigNotSupported)
         }
@@ -1854,7 +1895,7 @@ fn build_input_alignment_stream_typed<T>(
     device: &Device,
     config: &InputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    channel_aligners: Vec<InputStreamAligner>,
+    mut channel_aligners: Vec<InputStreamAlignerProducer>,
 ) -> Result<Stream, cpal::BuildStreamError>
 where
     T: Sample + SizedSample,
@@ -1867,6 +1908,8 @@ where
         .map(|_| Vec::<f32>::with_capacity(per_channel_capacity as usize))
         .collect::<Vec<_>>();
     
+    let device_name = config.device_name.clone();
+    let channels = config.channels as usize;
     device.build_input_stream(
         &supported_config.config(),
         move |data: &[T], _info: &InputCallbackInfo| {
@@ -1879,7 +1922,7 @@ where
             // undo the interleaving and convert to f32
             // todo: do this looping per channel in outermost instead of get_mut each time
             // (if it becomes a performance issue)
-            for frame in data.chunks(config.channels as usize) {
+            for frame in data.chunks(channels) {
                 for (channel_idx, sample) in frame.iter().enumerate() {
                     if let Some(buffer) = channel_buffers.get_mut(channel_idx) {
                         buffer.push(f32::from_sample(*sample));
@@ -1890,11 +1933,11 @@ where
                 if buffer.is_empty() {
                     continue;
                 }
-                aligner.process_chunk(buffer.as_slice());
+                channel_aligner.process_chunk(buffer.as_slice());
                 buffer.clear();
             }
         },
-        move |err| eprintln!("Input stream '{device_label}' error: {err}"),
+        move |err| eprintln!("Input stream '{device_name}' error: {err}",),
         None,
     )
 }
@@ -1903,9 +1946,8 @@ fn build_output_alignment_stream(
     device: &Device,
     config: &OutputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    device_audio_channel_consumers: Vec<BufferedCircularConsumer>
+    device_audio_channel_consumers: Vec<BufferedCircularConsumer<f32>>
 ) -> Result<Stream, cpal::BuildStreamError> {
-    let label = device_name.to_string();
     match config.sample_format {
         SampleFormat::I16 => build_output_alignment_stream_typed::<i16>(
             device,
@@ -1927,7 +1969,8 @@ fn build_output_alignment_stream(
         ),
         other => {
             eprintln!(
-                "Output device '{device_name}' uses unsupported sample format {other:?}; cannot build StreamAligner."
+                "Output device '{0}' uses unsupported sample format {other:?}; cannot build StreamAligner.",
+                config.device_name
             );
             Err(cpal::BuildStreamError::StreamConfigNotSupported)
         }
@@ -1938,16 +1981,18 @@ fn build_output_alignment_stream_typed<T>(
     device: &Device,
     config: &OutputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    device_audio_channel_consumers: Vec<BufferedCircularConsumer>
+    mut device_audio_channel_consumers: Vec<BufferedCircularConsumer<f32>>
 ) -> Result<Stream, cpal::BuildStreamError>
 where
     T: Sample + SizedSample,
     T: FromSample<f32>,
 {
+    let device_name = config.device_name.clone();
+    let channels = config.channels as usize;
     device.build_output_stream(
         &supported_config.config(),
         move |data: &mut [T], _| {
-            let frames = data.len() / (config.channels as usize);
+            let frames = data.len() / channels;
             if frames == 0 {
                 return;
             }
@@ -1963,14 +2008,14 @@ where
 
                 let samples_to_write = chunk.len().min(frames);
                 for (frame_idx, &sample) in chunk.iter().take(samples_to_write).enumerate() {
-                    let dst = frame_idx * config.channels + channel_idx;
+                    let dst = frame_idx * channels + channel_idx;
                     data[dst] = T::from_sample(sample);
                 }
 
                 consumer.finish_read(samples_to_write);
             }
         },
-        move |err| eprintln!("Output stream '{device_label}' error: {err}"),
+        move |err| eprintln!("Output stream '{device_name}' error: {err}"),
         None,
     )
 }
