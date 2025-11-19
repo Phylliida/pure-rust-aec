@@ -1834,13 +1834,25 @@ impl AecStream {
 
     fn update(&self, chunk_size: usize) {
         // todo: grab the buffers from stream aligners, feed them to aec, the send them back as outputs
-        for input_key in &self.sorted_input_aligners {
+        let input_audio_buffer = // todo set input buffer
+        let output_audio_buffer = // todo get output audio buffer
+        for (input_i, input_key) in &self.sorted_input_aligners.iter().enumerate() {
             if let Some(input_aligner) = self.input_aligners.get(input_key) {
-                input_aligner.get_chunk_to_read(chunk_size)
+                let input_channel_i_data = input_aligner.get_chunk_to_read(chunk_size);
+                // todo: assign into input_audio_buffer
             } else {
-                
+                // todo: set input_audio_buffer values to 0 for this channel
             };
         }
+        for (output_i, output_key) in &self.sorted_output_aligners.iter().enumerate() {
+            if let Some(output_aligner) = self.output_aligners.get(output_key) {
+                let output_channel_i_data = output_aligner.get_chunk_to_read(chunk_size);
+                // todo: assign into output_audio_buffer
+            } else {
+                // todo: set output_audio_buffer values to 0 for this channel
+            };
+        }
+        // todo: send input_audio_buffer and output_audio_buffer in self.aec
     }
 }
     
