@@ -1852,10 +1852,10 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
 }
 
 enum DeviceUpdateMessage {
-    AddInputDevice(InputDeviceConfig),
-    RemoveInputDevice(InputDeviceConfig),
-    AddOutputDevice(OutputDeviceConfig),
-    RemoveOutputDevice(OutputDeviceConfig)
+    AddInputDevice(&InputDeviceConfi, Stream, Vec<InputStreamAlignerConsumer>),
+    RemoveInputDevice(&InputDeviceConfig),
+    AddOutputDevice(&OutputDeviceConfig, Stream, Vec<OutputStreamAligner>),
+    RemoveOutputDevice(&OutputDeviceConfig)
 }
 
 struct AecStream {
@@ -1872,11 +1872,11 @@ struct AecStream {
     sorted_output_aligners: Vec<String>,
     input_channels: usize,
     output_channels: usize,
-    start_miros: Option<u128>,
+    start_micros: Option<u128>,
     total_frames_emitted: u128,
-    input_audio_frame: Vec<i16>,
-    output_audio_frame: Vec<i16>,
-    aec_audio_frame: Vec<i16>,
+    input_audio_buffer: Vec<i16>,
+    output_audio_buffer: Vec<i16>,
+    aec_audio_buffer: Vec<i16>,
 }
 
 impl AecStream {
@@ -1903,9 +1903,9 @@ impl AecStream {
            output_channels: 0,
            start_micros: None,
            total_frames_emitted: 0,
-           input_audio_frame: Vec::new(),
-           output_audio_frame: Vec::New(),
-           aec_audio_frame: Vec::new()
+           input_audio_buffer: Vec::new(),
+           output_audio_buffer: Vec::New(),
+           aec_audio_buffer: Vec::new()
         })
     }
 
@@ -1935,50 +1935,54 @@ impl AecStream {
             self.output_channels,
         );
 
-        self.input_audio_frame.clear();
-        self.input_audio_frame.resize(self.input_channels, 0 as i16);
-        self.output_audio_frame.clear();
-        self.output_audio_frame.resize(self.output_channels, 0 as i16)
-        self.aec_audio_frame.clear();
-        self.aec_audio_frame.resize(self.input_channels, 0 as i16);
+        self.input_audio_buffer.clear();
+        self.input_audio_buffer.resize(self.input_channels, 0 as i16);
+        self.output_audio_buffer.clear();
+        self.output_audio_buffer.resize(self.output_channels, 0 as i16)
+        self.aec_audio_buffer.clear();
+        self.aec_audio_buffer.resize(self.input_channels, 0 as i16);
         Ok(())
     }
 
     fn add_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        self.device_update_sender.send(DeviceUpdateMessage::AddInputDevice(config.clone()))
+        let (stream, aligners) = get_input_stream_aligners(config, &self.aec_config)?;
+        self.device_update_sender.send(DeviceUpdateMessage::AddInputDevice(config.clone(), stream, aligners))?;
+        Ok(())
     }
 
     fn add_output_device(&mut self, config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        self.device_update_sender.send(DeviceUpdateMessage::AddOutputDevice(config.clone()))
+        let (stream, aligners) = get_output_stream_aligners(config, &self.aec_config)?;
+        self.device_update_sender.send(DeviceUpdateMessage::AddOutputDevice(config.clone(), stream, aligners))?;
+        Ok(())
     }
 
     fn remove_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
         self.device_update_sender.send(DeviceUpdateMessage::RemoveInputDevice(config.clone()))?;
+        Ok(())
     }
 
     fn remove_output_device(&mut self, config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
         self.device_update_sender.send(DeviceUpdateMessage::RemoveOutputDevice(config.clone()))?;
+        Ok(())
     }
 
     fn update(&self, chunk_size: usize) {
         let start_micros = if let Some(start_micros_value) = self.start_micros {
             start_micros_value
         } else {
-            let start_micros_value = Instant::now().duration_since(UNIX_EPOCH).as_micros() - frames_to_micros(chunk_size, self.aec_config.target_sample_rate);
+            let start_micros_value = SystemTime::now().duration_since(UNIX_EPOCH).as_micros() - frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128);
             self.start_micros = Some(start_micros_value);
-            start_micros_value;
+            start_micros_value
         }
-        let chunk_start_micros = frames_to_micros(self.total_frames_emitted, self.aec_config.target_sample_rate) + start_micros;
-        let chunk_end_micros = chunk_start_micros + frames_to_micros(chunk_size, self.aec_config.target_sample_rate);
-
-        self.total_frames_emitted += start_micros;
+        let chunk_start_micros = frames_to_micros(self.total_frames_emitted, self.aec_config.target_sample_rate as u128) + start_micros;
+        let chunk_end_micros = chunk_start_micros + frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128);
+        self.total_frames_emitted += chunk_size as u128;
         // todo: move to crossbeam to avoid mpsc locks
         loop {
             match receiver.try_recv() {
                 Ok(msg) => {
                     Ok(msg) => match msg {
-                        DeviceUpdateMessage::AddInputDevice(config) {
-                            let (stream, aligners) = get_input_stream_aligners(config, &self.aec_config)?;
+                        DeviceUpdateMessage::AddInputDevice(config, stream, aligners) {
                             if let Some(stream) = self.input_streams.get(&config.device_name) {
                                 stream.pause()?;
                             }
@@ -2000,8 +2004,7 @@ impl AecStream {
                             self.reinitialize_aec();
                             Ok(())
                         }
-                        DeviceUpdateMessage::AddOutputDevice(config) {
-                            let (stream, aligners) = get_output_stream_aligners(config, &self.aec_config)?;
+                        DeviceUpdateMessage::AddOutputDevice(config, stream, aligners) {
                             if let Some(stream) = self.output_streams.get(&config.device_name) {
                                 stream.pause()?;
                             }
@@ -2070,6 +2073,7 @@ impl AecStream {
             self.reinitialize_aec();
         }
 
+        let input_channel = 0;
         for key in &self.sorted_input_aligners {
             if let Some(channel_aligners) = self.input_aligners.get_mut(key) {
                 for aligner in channel_aligners {
@@ -2077,23 +2081,23 @@ impl AecStream {
                     if ok {
                         Self::write_channel_from_f32(
                             chunk,
-                            self.input_audio_buffer,
+                            input_channel,
                             self.input_channels,
                             chunk_size,
-                            &mut mic_frame,
+                            &mut self.input_audio_buffer,
                         );
                         aligner.finish_read(chunk.len().min(chunk_size));
                     } else {
                         Self::clear_channel(mic_channel, self.input_channels, chunk_size, &mut mic_frame);
                     }
-                    mic_channel += 1;
+                    input_channel += 1;
                 }
             }
         }
 
-        for (output_i, output_key) in &self.sorted_output_aligners.iter().enumerate() {
+        for (output_i, output_key) in self.sorted_output_aligners.iter().enumerate() {
             if let Some(output_aligner) = self.output_aligners.get(output_key) {
-                let output_channel_i_data = output_aligner.get_chunk_to_read(chunk_size);
+                //let output_channel_i_data = output_aligner.get_chunk_to_read(chunk_size);
                 // todo: assign into output_audio_buffer
             } else {
                 // todo: set output_audio_buffer values to 0 for this channel
