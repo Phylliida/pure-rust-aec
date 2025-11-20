@@ -2116,19 +2116,24 @@ impl AecStream {
         for key in &self.sorted_input_aligners {
             if let Some(channel_aligners) = self.input_aligners.get_mut(key) {
                 for aligner in channel_aligners.iter_mut() {
-                    let (ok, chunk) = aligner.get_chunk_to_read(chunk_size);
-                    if ok {
-                        Self::write_channel_from_f32(
-                            chunk,
-                            input_channel,
-                            self.input_channels,
-                            chunk_size,
-                            &mut self.input_audio_buffer,
-                        );
-                        aligner.finish_read(chunk.len().min(chunk_size) as usize);
-                    } else {
-                        Self::clear_channel(input_channel, self.input_channels, chunk_size, &mut self.input_audio_buffer);
-                    }
+                    let samples_used = {
+                        let (ok, chunk) = aligner.get_chunk_to_read(chunk_size);
+                        if ok {
+                            Self::write_channel_from_f32(
+                                chunk,
+                                input_channel,
+                                self.input_channels,
+                                chunk_size,
+                                &mut self.input_audio_buffer,
+                            );
+                            chunk.len().min(chunk_size) as usize
+                        } else {
+                            Self::clear_channel(input_channel, self.input_channels, chunk_size, &mut self.input_audio_buffer);
+                            0
+                        }
+                    };
+                    
+                    aligner.finish_read(samples_used);
                     input_channel += 1;
                 }
             }
