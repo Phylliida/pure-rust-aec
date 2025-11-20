@@ -2142,51 +2142,53 @@ impl AecStream {
             }
         }
 
-        if self.output_channels == 0 {
+        let aec_output = if self.output_channels == 0 {
             // simply pass through input_channels, no need for aec
-            return Ok(&self.input_audio_buffer);
+            self.input_audio_buffer
         }
-        
-        let mut output_channel = 0;
-        self.output_audio_buffer.fill(0 as i16);
-        for (output_i, output_key) in self.sorted_output_aligners.iter().enumerate() {
-            if let Some(output_aligner) = self.output_aligners.get_mut(output_key) {
-                let samples_used = {
-                    let output_channel_i_data = output_aligner.get_chunk_to_read(chunk_size);
-                    Self::write_channel_from_f32(
-                        output_channel_i_data,
-                        output_channel,
-                        self.output_channels,
-                        chunk_size,
-                        &mut self.output_audio_buffer,
-                    );
-                    output_channel_i_data.len();
+        else {
+            let mut output_channel = 0;
+            self.output_audio_buffer.fill(0 as i16);
+            for (output_i, output_key) in self.sorted_output_aligners.iter().enumerate() {
+                if let Some(output_aligner) = self.output_aligners.get_mut(output_key) {
+                    let samples_used = {
+                        let output_channel_i_data = output_aligner.get_chunk_to_read(chunk_size);
+                        Self::write_channel_from_f32(
+                            output_channel_i_data,
+                            output_channel,
+                            self.output_channels,
+                            chunk_size,
+                            &mut self.output_audio_buffer,
+                        );
+                        output_channel_i_data.len();
+                    }
+                    output_aligner.finish_read(samples_used);
+                    output_channel += 1;
                 }
-                output_aligner.finish_read(samples_used);
-                output_channel += 1;
             }
-        }
 
-        self.aec_audio_buffer.fill(0 as i16)
+            self.aec_audio_buffer.fill(0 as i16)
 
-        unsafe {
-            speex_echo_cancellation(
-                aec.as_ptr(),
-                self.input_audio_buffer.as_ptr(),
-                if self.output_channels == 0 {
-                    std::ptr::null()
-                } else {
-                    self.output_audio_buffer.as_ptr()
-                },
-                self.aec_audio_buffer.as_mut_ptr(),
-            );
-        }
-
-        for (out, sample) in self.aec_out_audio_buffer.iter_mut().zip(self.aec_audio_buffer.iter()) {
+            unsafe {
+                speex_echo_cancellation(
+                    aec.as_ptr(),
+                    self.input_audio_buffer.as_ptr(),
+                    if self.output_channels == 0 {
+                        std::ptr::null()
+                    } else {
+                        self.output_audio_buffer.as_ptr()
+                    },
+                    self.aec_audio_buffer.as_mut_ptr(),
+                );
+            }
+            self.aec_audio_buffer
+        };
+        
+        for (out, &sample) in self.aec_out_audio_buffer.iter_mut().zip(aec_output) {
             *out = f32::from_sample(*sample);
         }
 
-        Ok(&self.aec_out_audio_buffer)
+        Ok(&self.aec_out_audio_buffer.as_slice())
 
         
         // todo: send input_audio_buffer and output_audio_buffer in self.aec
