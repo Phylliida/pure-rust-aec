@@ -1213,8 +1213,12 @@ impl InputStreamAlignerProducer {
             u128::MAX
         };
         let mut frames_until_most_recent = 0 as u128;
+
+
         // iterate from most recent backwards (that's what .rev() does)
-        for (chunk_size, micros_when_chunk_ended) in self.chunk_sizes.iter().zip(self.system_time_micros_when_chunk_ended.iter()).rev() {
+        let mut chunk_iter = self.chunk_sizes.iter().rev();
+        let mut time_iter = self.system_time_micros_when_chunk_ended.iter().rev();
+        while let (Some(chunk_size), Some(micros_when_chunk_ended)) = (chunk_iter.next(), time_iter.next()) {
             let micros_until_most_recent_ended = frames_to_micros(frames_until_most_recent as u128, self.input_sample_rate as u128);
             let estimate_of_micros_most_recent_ended = *micros_when_chunk_ended + micros_until_most_recent_ended;
             best_estimate_of_when_most_recent_ended = (estimate_of_micros_most_recent_ended).min(best_estimate_of_when_most_recent_ended);
@@ -2000,7 +2004,7 @@ impl AecStream {
         Ok(())
     }
 
-    fn update(&self, chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
+    fn update(&mut self, chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
         let start_micros = if let Some(start_micros_value) = self.start_micros {
             start_micros_value
         } else {
@@ -2071,7 +2075,7 @@ impl AecStream {
             return Ok(());
         }
         let Some(aec) = self.aec.as_mut() else { 
-            return Err("no aec").into();
+            return Err("no aec".into());
         };
         if self.output_channels == 0 {
             // todo: simply pass through input_channels, no need for aec
@@ -2081,30 +2085,34 @@ impl AecStream {
         // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
         for key in &self.sorted_input_aligners {
-            if let Some(aligners_in_progress) = self.input_aligners_in_progress.get_mut(key) {
-                let finished_aligners = Vec::new();
-                let remove_indices = Vec::new();
-                for (index, aligner) in aligners_in_progress.iter().enumerate() {
-                    // returns true and skips ahead once it is calibrated and ready
+            if let Some(in_progress) = self.input_aligners_in_progress.get_mut(key) {
+                let mut ready = Vec::new();
+                let mut remaining = Vec::new();
+
+                for mut aligner in in_progress.drain(..) {
                     if aligner.is_ready_to_read(chunk_end_micros, chunk_size) {
-                        remove_indices.push(index);
-                        finished_aligners.push(*aligner);
+                        ready.push(aligner);
+                    } else {
+                        remaining.push(aligner);
                     }
                 }
-                if let Some(ready_aligners) = self.input_aligners.get_mut(key) {
-                    for (remove_index, finished_aligner) in remove_indices.iter().zip(finished_aligners.iter()) {
-                        aligners_in_progress.remove(*remove_index);
-                        ready_aligners.push(*finished_aligner);
-                        modified_aligners = true;
+
+                *in_progress = remaining;
+
+                if !ready.is_empty() {
+                    modified_aligners = true;
+                    if let Some(ready_aligners) = self.input_aligners.get_mut(key) {
+                        ready_aligners.extend(ready);
                     }
                 }
             }
         }
+
         if modified_aligners {
             self.reinitialize_aec();
         }
 
-        let input_channel = 0;
+        let mut input_channel = 0;
         for key in &self.sorted_input_aligners {
             if let Some(channel_aligners) = self.input_aligners.get_mut(key) {
                 for aligner in channel_aligners.iter_mut() {
