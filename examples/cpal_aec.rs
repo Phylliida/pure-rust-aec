@@ -1416,16 +1416,19 @@ impl InputStreamAlignerResampler {
 }
 
 struct InputStreamAlignerConsumer {
+    sample_rate: u32,
     final_audio_buffer_consumer: BufferedCircularConsumer<f32>,
     thread_message_sender: mpsc::Sender<AudioBufferMetadata>,
     finished_message_reciever: mpsc::Reciever<ResamplingMetadata>,
     initial_metadata: Vec<ResamplingMetadata>,
+    samples_recieved: u128,
     calibrated: bool,
 }
 
 impl InputStreamAlignerConsumer {
-    fn new(final_audio_buffer_consumer: BufferedCircularConsumer<f32>, thread_message_sender: mpsc::Sender<AudioBufferMetadata>, finished_message_reciever: mpsc::Receiver<ResamplingMetadata>) {
+    fn new(sample_rate: u32, final_audio_buffer_consumer: BufferedCircularConsumer<f32>, thread_message_sender: mpsc::Sender<AudioBufferMetadata>, finished_message_reciever: mpsc::Receiver<ResamplingMetadata>) {
         Self {
+            sample_rate: sample_rate,
             final_audio_buffer_consumer: final_audio_buffer_consumer,
             thread_message_sender: thread_message_sender,
             finished_message_reciever: finished_message_reciever,
@@ -1439,8 +1442,12 @@ impl InputStreamAlignerConsumer {
         }
     }
 
-    fn get_chunk_to_read_at_micros(&self, micros_packet_finished: u128, size: usize) {
-        // non blocking cause maybe it's just not ready yet
+    // used to poll for when an input stream is actually ready to output data
+    // we allow some initial calibration time to synchronize the clocks
+    // (it needs some extra time because packets can be delayed sometimes 
+    // so waiting and min over a history lets us get better estimate)
+    fn is_ready_to_read(&mut self, micros_packet_finished: u128, size: usize) -> bool {
+        // non blocking cause maybe it's just not ready (initialized) yet
         loop {
             match self.finished_message_reciever.try_recv() {
                 Ok(msg) => {
@@ -1448,6 +1455,7 @@ impl InputStreamAlignerConsumer {
                         ResamplingMetadata::Arrive(frames_recieved, system_micros_after_packet_finishes, calibrated) => {
                             self.calibrated = calibrated;
                             self.initial_metadata.push(msg.clone());
+                            self.samples_recieved += frames_recieved;
                         }
                     }
                 }
@@ -1461,22 +1469,57 @@ impl InputStreamAlignerConsumer {
                 }
             }
         }
-        
-        let mut calibrated = false;
 
+        // we need to skip ahead to be frame aligned
+        if self.calibrated {
+            let micros_packet_started = micros_packet_finished - frames_to_micros(size, self.sample_rate);
+            let mut samples_to_ignore = 0;
+            for metadata in self.initial_metadata.iter() {
+                match metadata {
+                    ResamplingMetadata::Arrive(frames_recieved, micros_metadata_finished, calibrated) => {
+                        let micros_metadata_started = micros_metadata_finished - frames_to_micros(frames_recieved, self.sample_rate);
+                        // whole packet is behind, ignore entire thing
+                        if micros_metadata_finished < micros_packet_started {
+                            samples_to_ignore += frames_recieved;
+                        }
+                        // keep all data
+                        else if micros_metadata_started >= micros_packet_started{
+                            
+                        } 
+                        // it overlaps, only keep stuff before this packet
+                        else {
+                            let micros_ignoring = micros_packet_started - micros_metadata_started;
+                            samples_to_ignore += micros_to_frames(micros_ignoring, self.sample_rate) - 1; // 1 for rounding, to avoid always throwing stuff out
+                        }
+
+                    }
+                }
+            }
+            let available_samples = self.samples_recieved - samples_to_ignore;
+            // not enough samples for this chunk (maybe we started in the middle)
+            // return false, and retry next time (we will ignore samples then)
+            if available_samples < size {
+                false
+            }
+            else {
+                // enough samples! ignore the ones we need to ignore and then let the sampling happen elsewhere
+                self.final_audio_buffer_consumer.finish_read(samples_to_ignore);
+                true
+            }
+        } else {
+            false
+        }
     }
 
     // waits until we have at least that much data
     // (or something errors)
     // returns (success, audio_buffer)
-    fn get_chunk_to_read(&self, size: usize) -> (bool, bool, &[f32]) {
+    fn get_chunk_to_read(&self, size: usize) -> (bool, &[f32]) {
         while self.final_audio_buffer_consumer.available() <= size {
             // wait for data to arrive
             match self.finished_message_reciever.recv() {
-                Ok(data) =>  match data {
-                    ResamplingMetadata::Arrive(frames_recieved, system_micros_after_packet_finishes, calibrated) => {
+                Ok(data) => {
 
-                    }                    
                 }
                 Err(err) => {
                     eprintln!("channel closed: {err}");
