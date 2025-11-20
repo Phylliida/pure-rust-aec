@@ -23,6 +23,7 @@
 //! omitted, the demo defaults to 48 kHz and transparently resamples the devices if needed.
 
 use std::{
+    thread,
     collections::{hash_map::Entry, HashMap, VecDeque},
     env,
     error::Error,
@@ -53,7 +54,7 @@ use speex_rust_aec::{
     speex_echo_cancellation, speex_echo_ctl, EchoCanceller, Resampler, SPEEX_ECHO_SET_SAMPLING_RATE,
 };
 
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Instant, UNIX_EPOCH, SystemTime};
 
 
 const DEFAULT_AEC_RATE: u32 = 48_000;
@@ -1095,7 +1096,7 @@ struct ResampledBufferedCircularProducer {
     resampled_producer: BufferedCircularProducer<f32>,
     input_sample_rate: u32,
     output_sample_rate: u32,
-    total_input_samples_remaining: i128,
+    total_input_samples_remaining: u128,
     resampler: Resampler
 }
 
@@ -1132,14 +1133,6 @@ impl ResampledBufferedCircularProducer {
     fn available_to_resample(&self) -> usize {
         self.consumer.available()
     }
-
-    fn available(&self) -> usize {
-        self.resampled_consumer.available()
-    }
-
-    fn finish_read(&mut self, num_read: usize) -> usize {
-        self.resampled_consumer.finish_read(num_read)
-    }
 }
 
 impl ResampledBufferedCircularProducer {
@@ -1153,7 +1146,7 @@ impl ResampledBufferedCircularProducer {
             return Ok((0,0));
         }
         // there might be some leftover from last call, so use state
-        self.total_input_samples_remaining += num_available_frames as i128;
+        self.total_input_samples_remaining += num_available_frames as u128;
 
         let input_buf = self.consumer.get_chunk_to_read(self.total_input_samples_remaining as usize);
         let target_output_samples_count = input_to_output_frames(self.total_input_samples_remaining, self.input_sample_rate, self.output_sample_rate) + 10; // add a few extra for rounding
@@ -1165,7 +1158,7 @@ impl ResampledBufferedCircularProducer {
         self.consumer.finish_read(consumed);
         self.resampled_producer.finish_write(need_to_write_outputs, produced);
 
-        self.total_input_samples_remaining -= consumed as i128;
+        self.total_input_samples_remaining -= consumed as u128;
         Ok((consumed, produced))
     }
 }
@@ -1177,7 +1170,6 @@ enum AudioBufferMetadata {
 
 
 struct InputStreamAlignerProducer {
-    start_time_micros: Option<u128>,
     input_sample_rate: u32,
     output_sample_rate: u32,
     input_audio_buffer_producer: HeapProd<f32>,
@@ -1187,6 +1179,7 @@ struct InputStreamAlignerProducer {
     num_calibration_packets: u32,
     num_packets_recieved: u64,
     num_emitted_frames: u128,
+    start_time_micros: Option<u128>,
 }
 
 impl InputStreamAlignerProducer {
@@ -1202,6 +1195,7 @@ impl InputStreamAlignerProducer {
             num_calibration_packets: num_calibration_packets,
             num_packets_recieved: 0,
             num_emitted_frames: 0
+            start_time_micros: None,
         })
     }
 
@@ -1212,7 +1206,7 @@ impl InputStreamAlignerProducer {
         // it does not account for hardware latency, but we cannot account for that without manual calibration
         // (btw, CPAL timestamps do not work because they may be different for different devices)
         // (wheras this synchronizes us to global system time)
-        let mut best_estimate_of_when_most_recent_ended = if let Some(most_recent_time) = self.system_time_in_frames_when_chunk_ended.last() {
+        let mut best_estimate_of_when_most_recent_ended = if let Some(most_recent_time) = self.system_time_micros_when_chunk_ended.last() {
             *most_recent_time
         }
         else {
@@ -1221,7 +1215,7 @@ impl InputStreamAlignerProducer {
         let mut frames_until_most_recent = 0 as u128;
         // iterate from most recent backwards (that's what .rev() does)
         for (chunk_size, micros_when_chunk_ended) in self.chunk_sizes.iter().zip(self.system_time_micros_when_chunk_ended.iter()).rev() {
-            let micros_until_most_recent_ended = frames_to_micros(frames_until_most_recent as u128, self.input_sample_rate);
+            let micros_until_most_recent_ended = frames_to_micros(frames_until_most_recent as u128, self.input_sample_rate as u128);
             let estimate_of_micros_most_recent_ended = *micros_when_chunk_ended + micros_until_most_recent_ended;
             best_estimate_of_when_most_recent_ended = (estimate_of_micros_most_recent_ended).min(best_estimate_of_when_most_recent_ended);
             // timestamps are at end, not at start, so only increment this after
@@ -1231,7 +1225,7 @@ impl InputStreamAlignerProducer {
     }
 
     fn process_chunk(&mut self, chunk: &[f32]) -> Result<(), Box<dyn Error>> {\
-        let micros_when_chunk_received = Instant::now().duration_since(UNIX_EPOCH).as_micros();
+        let micros_when_chunk_received = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock went backwards").as_micros();
 
        
         let appended_count = self.input_audio_buffer_producer.push_slice(chunk);
@@ -1241,14 +1235,14 @@ impl InputStreamAlignerProducer {
         if appended_count > 0 {
             // delibrately overwrite once we pass history len, we keep a rolling buffer of last 100 or so
             self.chunk_sizes.push_overwrite(appended_count);
-            self.system_time_in_frames_when_chunk_ended.push_overwrite(micros_when_chunk_received);
+            self.system_time_micros_when_chunk_ended.push_overwrite(micros_when_chunk_received);
 
             // use our estimate to suggest how many frames we should have emitted
             // this is used to dynamically adjust sample rate until we actually emit that many frames
             // that ensures that we stay synchronized to the system clock and do not drift
             let micros_when_chunk_ended = self.estimate_micros_when_most_recent_ended();
 
-            self.num_emitted_frames += appended_count;
+            self.num_emitted_frames += appended_count as u128;
 
             let target_emitted_frames, calibrated = if self.num_packets_recieved < self.num_calibration_packets {
                 // until we've recieved enough calibration packets, we don't have good enough time estimate
@@ -1299,7 +1293,7 @@ struct InputStreamAlignerResampler {
     input_sample_rate: u32,
     output_sample_rate: u32,
     dynamic_output_sample_rate: u32,
-    input_audio_buffer_consumer: BufferedCircularConsumer,
+    input_audio_buffer_consumer: BufferedCircularConsumer<f32>,
     input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>,
     total_emitted_frames: u128,
     total_received_frames: u128,
@@ -1607,9 +1601,9 @@ struct OutputStreamAligner {
     heap_cons_sender: mpsc::Sender<HeapConsSendMsg>,
     heap_cons_reciever: mpsc::Receiver<HeapConsSendMsg>,
     input_audio_buffer_producer: BufferedCircularProducer<f32>,
-    input_audio_buffer_consumer: BufferedCircularConsumer,
+    input_audio_buffer_consumer: BufferedCircularConsumer<f32>,
     device_audio_producer: BufferedCircularProducer<f32>,
-    stream_consumers: HashMap<StreamId, BufferedCircularConsumer>,
+    stream_consumers: HashMap<StreamId, BufferedCircularConsumer<f32>>,
     cur_stream_id: Arc<AtomicU64>,
 }
 
@@ -1865,7 +1859,7 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
 }
 
 enum DeviceUpdateMessage {
-    AddInputDevice(&InputDeviceConfi, Stream, Vec<InputStreamAlignerConsumer>),
+    AddInputDevice(&InputDeviceConfig, Stream, Vec<InputStreamAlignerConsumer>),
     RemoveInputDevice(&InputDeviceConfig),
     AddOutputDevice(&OutputDeviceConfig, Stream, Vec<OutputStreamAligner>),
     RemoveOutputDevice(&OutputDeviceConfig)
@@ -1983,7 +1977,7 @@ impl AecStream {
         let start_micros = if let Some(start_micros_value) = self.start_micros {
             start_micros_value
         } else {
-            let start_micros_value = SystemTime::now().duration_since(UNIX_EPOCH).as_micros() - frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128);
+            let start_micros_value = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock went backwards").as_micros() - frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128);
             self.start_micros = Some(start_micros_value);
             start_micros_value
         }
@@ -1992,7 +1986,7 @@ impl AecStream {
         self.total_frames_emitted += chunk_size as u128;
         // todo: move to crossbeam to avoid mpsc locks
         loop {
-            match receiver.try_recv() {
+            match self.device_update_receiver.try_recv() {
                 Ok(msg) => {
                     Ok(msg) => match msg {
                         DeviceUpdateMessage::AddInputDevice(config, stream, aligners) {
@@ -2101,7 +2095,7 @@ impl AecStream {
                         );
                         aligner.finish_read(chunk.len().min(chunk_size) as usize);
                     } else {
-                        Self::clear_channel(mic_channel, self.input_channels, chunk_size, &mut mic_frame);
+                        Self::clear_channel(input_channel, self.input_channels, chunk_size, &mut self.input_audio_buffer);
                     }
                     input_channel += 1;
                 }
