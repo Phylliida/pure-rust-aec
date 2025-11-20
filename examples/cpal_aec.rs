@@ -1889,6 +1889,7 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
     Ok((stream, aligners))
 }
 
+
 enum DeviceUpdateMessage {
     AddInputDevice(String, Stream, Vec<InputStreamAlignerConsumer>),
     RemoveInputDevice(String),
@@ -1915,6 +1916,7 @@ struct AecStream {
     input_audio_buffer: Vec<i16>,
     output_audio_buffer: Vec<i16>,
     aec_audio_buffer: Vec<i16>,
+    aec_out_audio_buffer: Vec<f32>
 }
 
 impl AecStream {
@@ -1943,7 +1945,8 @@ impl AecStream {
            total_frames_emitted: 0,
            input_audio_buffer: Vec::new(),
            output_audio_buffer: Vec::new(),
-           aec_audio_buffer: Vec::new()
+           aec_audio_buffer: Vec::new(),
+           aec_out_audio_buffer: Vec::new(),
         })
     }
 
@@ -1974,11 +1977,13 @@ impl AecStream {
         );
 
         self.input_audio_buffer.clear();
-        self.input_audio_buffer.resize(self.input_channels, 0 as i16);
+        self.input_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as i16);
         self.output_audio_buffer.clear();
-        self.output_audio_buffer.resize(self.output_channels, 0 as i16);
+        self.output_audio_buffer.resize(self.aec_config.frame_size * self.output_channels, 0 as i16);
         self.aec_audio_buffer.clear();
-        self.aec_audio_buffer.resize(self.input_channels, 0 as i16);
+        self.aec_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as i16);
+        self.aec_out_audio_buffer.clear();
+        self.aec_out_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as f32);
         Ok(())
     }
 
@@ -2004,7 +2009,8 @@ impl AecStream {
         Ok(())
     }
 
-    fn update(&mut self, chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
+    fn update(&mut self) -> Result<&[f32], Box<dyn std::error::Error>> {
+        let chunk_size = self.aec_config.frame_size;
         let start_micros = if let Some(start_micros_value) = self.start_micros {
             start_micros_value
         } else {
@@ -2016,6 +2022,7 @@ impl AecStream {
         let chunk_end_micros = chunk_start_micros + frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128);
         self.total_frames_emitted += chunk_size as u128;
         // todo: move to crossbeam to avoid mpsc locks
+        // todo: use actual timestamps on mac osx because they are system-wide (on linux they are device-wide so we have to do something else)
         loop {
             match self.device_update_receiver.try_recv() {
                 Ok(msg) => match msg {
@@ -2070,17 +2077,12 @@ impl AecStream {
         }
         // similarly, if we initialize an output device here
         // we may not get any audio for a little bit
-        // won't get 
         if chunk_size == 0 {
-            return Ok(());
+            return Ok(&[]);
         }
         let Some(aec) = self.aec.as_mut() else { 
             return Err("no aec".into());
         };
-        if self.output_channels == 0 {
-            // todo: simply pass through input_channels, no need for aec
-            return Ok(());
-        }
 
         // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
@@ -2113,6 +2115,7 @@ impl AecStream {
         }
 
         let mut input_channel = 0;
+        self.input_audio_buffer.fill(0 as i16);
         for key in &self.sorted_input_aligners {
             if let Some(channel_aligners) = self.input_aligners.get_mut(key) {
                 for aligner in channel_aligners.iter_mut() {
@@ -2139,16 +2142,53 @@ impl AecStream {
             }
         }
 
+        if self.output_channels == 0 {
+            // simply pass through input_channels, no need for aec
+            return Ok(&self.input_audio_buffer);
+        }
+        
+        let mut output_channel = 0;
+        self.output_audio_buffer.fill(0 as i16);
         for (output_i, output_key) in self.sorted_output_aligners.iter().enumerate() {
-            if let Some(output_aligner) = self.output_aligners.get(output_key) {
-                //let output_channel_i_data = output_aligner.get_chunk_to_read(chunk_size);
-                // todo: assign into output_audio_buffer
-            } else {
-                // todo: set output_audio_buffer values to 0 for this channel
-            };
+            if let Some(output_aligner) = self.output_aligners.get_mut(output_key) {
+                let samples_used = {
+                    let output_channel_i_data = output_aligner.get_chunk_to_read(chunk_size);
+                    Self::write_channel_from_f32(
+                        output_channel_i_data,
+                        output_channel,
+                        self.output_channels,
+                        chunk_size,
+                        &mut self.output_audio_buffer,
+                    );
+                    output_channel_i_data.len();
+                }
+                output_aligner.finish_read(samples_used);
+                output_channel += 1;
+            }
         }
 
-        Ok(())
+        self.aec_audio_buffer.fill(0 as i16)
+
+        unsafe {
+            speex_echo_cancellation(
+                aec.as_ptr(),
+                self.input_audio_buffer.as_ptr(),
+                if self.output_channels == 0 {
+                    std::ptr::null()
+                } else {
+                    self.output_audio_buffer.as_ptr()
+                },
+                self.aec_audio_buffer.as_mut_ptr(),
+            );
+        }
+
+        for (out, sample) in self.aec_out_audio_buffer.iter_mut().zip(self.aec_audio_buffer.iter()) {
+            *out = f32::from_sample(*sample);
+        }
+
+        Ok(&self.aec_out_audio_buffer)
+
+        
         // todo: send input_audio_buffer and output_audio_buffer in self.aec
     }
     fn write_channel_from_f32(
