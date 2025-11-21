@@ -1773,6 +1773,33 @@ struct InputDeviceConfig {
     resampler_quality: i32
 }
 
+impl InputDeviceConfig {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        host: Host,
+        device_name: impl Into<String>,
+        channels: u16,
+        sample_rate: u32,
+        sample_format: SampleFormat,
+        history_len: usize,
+        calibration_packets: u32,
+        audio_buffer_seconds: u32,
+        resampler_quality: i32,
+    ) -> Self {
+        Self {
+            host,
+            device_name: device_name.into(),
+            channels,
+            sample_rate,
+            sample_format,
+            history_len,
+            calibration_packets,
+            audio_buffer_seconds,
+            resampler_quality,
+        }
+    }
+}
+
 struct OutputDeviceConfig {
     host: Host,
     device_name: String,
@@ -1789,12 +1816,41 @@ struct OutputDeviceConfig {
     frame_size: u32,
 }
 
+impl OutputDeviceConfig {
+    fn new(
+        host: Host,
+        device_name: impl Into<String>,
+        channels: u16,
+        sample_rate: u32,
+        sample_format: SampleFormat,
+        audio_buffer_seconds: u32,
+        resampler_quality: i32,
+        frame_size: u32,
+    ) -> Self {
+        Self {
+            host,
+            device_name: device_name.into(),
+            channels,
+            sample_rate,
+            sample_format,
+            audio_buffer_seconds,
+            resampler_quality,
+            frame_size,
+        }
+    }
+}
+
 struct AecConfig {
     target_sample_rate: u32,
     frame_size: usize,
     filter_length: usize
 }
 
+impl AecConfig {
+    fn new(target_sample_rate: u32, frame_size: usize, filter_length: usize) -> Self {
+        Self { target_sample_rate, frame_size, filter_length }
+    }
+}
 
 fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, Vec<InputStreamAlignerConsumer>), Box<dyn std::error::Error>>  {
 
@@ -2227,9 +2283,60 @@ impl AecStream {
 
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let frame_size_ms = 10;
+    let filter_length_ms = 200;
+    let aec_sample_rate = 16000;
+    let aec_config = AecConfig::new(
+        aec_sample_rate,
+        (aec_sample_rate * frame_size_ms / 1000) as usize,
+        (aec_sample_rate * filter_length_ms / 1000) as usize,
+    );
+    let stream = AecStream::new(aec_config);
+
+    let host_ids = cpal::available_hosts();
+    for host_id in host_ids {
+        println!("Host: '{}'", host_id.name());
+
+        // If you want to inspect devices:
+        let host = cpal::host_from_id(host_id)?;
+        for dev in host.input_devices()? {
+            println!("  input: '{}'", dev.name()?);
+            match supported_device_configs_to_string(&dev, &dev.name()?, "Input") {
+                Ok(cfgs) => println!("      {cfgs}"),
+                Err(err) => println!("      {err}"),
+            }
+        }
+        for dev in host.output_devices()? {
+            println!("  output: '{}'", dev.name()?);
+            match supported_device_configs_to_string(&dev, &dev.name()?, "Output") {
+                Ok(cfgs) => println!("      {cfgs}"),
+                Err(err) => println!("      {err}"),
+            }
+        }
+    }
+
+    let host = get_host_by_name("ALSA").unwrap_or_else(cpal::default_host);
+    let input_device = select_device(host.input_devices(), "front:CARD=Beyond,DEV=0", "Input");
+    let default_input_device_config = input_device.default_input_config()?;
+    let input_device = get_device_by_name(host, );
+
+    
+
+    let input_device = InputDeviceConfig::from_default()
+
     Ok(())
 }
 
+fn get_device_by_name()
+
+fn get_host_by_name(target: &str) -> Option<Host> {
+    for host_id in cpal::available_hosts() {
+        if host_id.name().eq_ignore_ascii_case(target) {
+            return cpal::host_from_id(host_id).ok();
+        }
+    }
+    None
+}
 fn select_device<I>(
     devices: Result<I, cpal::DevicesError>,
     target: &str,
@@ -2262,6 +2369,42 @@ where
         }
         Err(err) => Err(format!("Failed to enumerate {kind} devices: {err}").into()),
     }
+}
+
+fn supported_device_configs_to_string(
+    device: &Device,
+    device_name: &String,
+    direction: &'static str
+) -> Result<String, Box<dyn Error>> {
+    let configs : Vec<_> = match direction {
+        "Input" => device.supported_input_configs().map(|configs| configs.collect())
+            .map_err(|err| format!("Unable to enumerate input configs for '{device_name}': {err}"))?,
+        "Output" => device.supported_output_configs().map(|configs| configs.collect())
+            .map_err(|err| format!("Unable to enumerate output configs for '{device_name}': {err}"))?,
+        other => {
+            return Err(format!("Unknown device direction '{other}' when validating {device_name}., should be input or output").into());
+        }
+    };
+
+    Ok(configs
+        .iter()
+        .enumerate()
+        .map(|(idx, cfg)| {
+            let min_rate = cfg.min_sample_rate().0;
+            let max_rate = cfg.max_sample_rate().0;
+            let rate_desc = if min_rate == max_rate {
+                format!("{min_rate} Hz")
+            } else {
+                format!("{min_rate}-{max_rate} Hz")
+            };
+            format!(
+                "{} channel(s), {:?}, sample rates: {rate_desc}",
+                cfg.channels(),
+                cfg.sample_format()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n      "))
 }
 
 fn find_matching_device_config(
@@ -2311,13 +2454,13 @@ fn find_matching_device_config(
                     format!("{min_rate}-{max_rate} Hz")
                 };
                 format!(
-                    "#{idx}: {} channel(s), {:?}, sample rates: {rate_desc}",
+                    "{} channel(s), {:?}, sample rates: {rate_desc}",
                     cfg.channels(),
                     cfg.sample_format()
                 )
             })
             .collect::<Vec<_>>()
-            .join("; ");
+            .join("\n      ");
 
         Err(format!(
             "{} device '{}' does not support {} channel(s), {:?} at {} Hz. Supported configs: {}",
@@ -2326,6 +2469,8 @@ fn find_matching_device_config(
         .into())
     }
 }
+
+
 
 
 fn build_input_alignment_stream(
