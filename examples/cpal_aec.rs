@@ -1608,6 +1608,7 @@ enum HeapConsSendMsg {
 struct OutputStreamAligner {
     device_sample_rate: u32,
     output_sample_rate: u32,
+    frame_size: u32,
     heap_cons_sender: mpsc::Sender<HeapConsSendMsg>,
     heap_cons_reciever: mpsc::Receiver<HeapConsSendMsg>,
     input_audio_buffer_producer: BufferedCircularProducer<f32>,
@@ -1620,7 +1621,7 @@ struct OutputStreamAligner {
 
 // allows for playing audio on top of each other (mixing) or just appending to buffer
 impl OutputStreamAligner {
-    fn new(device_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, device_audio_producer: HeapProd<f32>) -> Result<Self, Box<dyn Error>>  {
+    fn new(device_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, frame_size: u32, device_audio_producer: HeapProd<f32>) -> Result<Self, Box<dyn Error>>  {
 
         // used to send across threads
         let (heap_cons_sender, heap_cons_reciever) = mpsc::channel::<HeapConsSendMsg>();
@@ -1629,6 +1630,7 @@ impl OutputStreamAligner {
         Ok(Self {
             device_sample_rate: device_sample_rate,
             output_sample_rate: output_sample_rate,
+            frame_size: frame_size,
             heap_cons_sender: heap_cons_sender,
             heap_cons_reciever: heap_cons_reciever,
             input_audio_buffer_producer: BufferedCircularProducer::new(input_audio_buffer_producer),
@@ -1684,14 +1686,15 @@ impl OutputStreamAligner {
         Ok(())
     }
     
-    // frame size should be small, on the order of 1-2ms or less.
-    // otherwise you may get skipping if you do not provide audio via enqueue_audio fast enough
-    // larger frame sizes will also prevent immediate interruption, as interruption can only happen between each frame
-    fn get_chunk_to_read(&mut self, input_frame_size: usize, output_chunk_size: usize) -> Result<&[f32], Box<dyn std::error::Error>> {
-        while self.resample_audio_buffer_consumer.available() < output_chunk_size {
-            self.mix_audio_streams(input_frame_size)?;
+    fn get_chunk_to_read(&mut self, size: usize) -> Result<&[f32], Box<dyn std::error::Error>> {
+        while self.resample_audio_buffer_consumer.available() < size {
+            self.mix_audio_streams(self.frame_size as usize)?;
         }
-        Ok(self.resample_audio_buffer_consumer.get_chunk_to_read(output_chunk_size))
+        Ok(self.resample_audio_buffer_consumer.get_chunk_to_read(size))
+    }
+
+    fn finish_read(&mut self, size: usize) -> usize {
+        self.resample_audio_buffer_consumer.finish_read(size)
     }
 
     fn mix_audio_streams(&mut self, input_chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -1779,7 +1782,11 @@ struct OutputDeviceConfig {
     
     // how long buffer of output audio to store, should only really need a few seconds as things are mostly streamed
     audio_buffer_seconds: u32,
-    resampler_quality: i32
+    resampler_quality: i32,
+    // frame size (in terms of samples) should be small, on the order of 1-2ms or less.
+    // otherwise you may get skipping if you do not provide audio via enqueue_audio fast enough
+    // larger frame sizes will also prevent immediate interruption, as interruption can only happen between each frame
+    frame_size: u32,
 }
 
 struct AecConfig {
@@ -1873,6 +1880,7 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
             aec_config.target_sample_rate,
             device_config.audio_buffer_seconds,
             device_config.resampler_quality,
+            device_config.frame_size,
             device_audio_producer,
         )?;
         aligners.push(aligner);
@@ -2080,9 +2088,6 @@ impl AecStream {
         if chunk_size == 0 {
             return Ok(&[]);
         }
-        let Some(aec) = self.aec.as_mut() else { 
-            return Err("no aec".into());
-        };
 
         // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
@@ -2144,30 +2149,36 @@ impl AecStream {
 
         let aec_output = if self.output_channels == 0 {
             // simply pass through input_channels, no need for aec
-            self.input_audio_buffer
+            &self.input_audio_buffer
         }
         else {
             let mut output_channel = 0;
             self.output_audio_buffer.fill(0 as i16);
             for (output_i, output_key) in self.sorted_output_aligners.iter().enumerate() {
-                if let Some(output_aligner) = self.output_aligners.get_mut(output_key) {
-                    let samples_used = {
-                        let output_channel_i_data = output_aligner.get_chunk_to_read(chunk_size);
-                        Self::write_channel_from_f32(
-                            output_channel_i_data,
-                            output_channel,
-                            self.output_channels,
-                            chunk_size,
-                            &mut self.output_audio_buffer,
-                        );
-                        output_channel_i_data.len();
+                if let Some(output_aligners) = self.output_aligners.get_mut(output_key) {
+                    for output_aligner in output_aligners.iter_mut() {
+                        let samples_used = {
+                            let output_channel_i_data = output_aligner.get_chunk_to_read(chunk_size)?;
+                            Self::write_channel_from_f32(
+                                output_channel_i_data,
+                                output_channel,
+                                self.output_channels,
+                                chunk_size,
+                                &mut self.output_audio_buffer,
+                            );
+                            output_channel_i_data.len()
+                        };
+                        output_aligner.finish_read(samples_used);
+                        output_channel += 1;
                     }
-                    output_aligner.finish_read(samples_used);
-                    output_channel += 1;
                 }
             }
 
-            self.aec_audio_buffer.fill(0 as i16)
+            self.aec_audio_buffer.fill(0 as i16);
+
+            let Some(aec) = self.aec.as_mut() else { 
+                return Err("no aec".into());
+            };
 
             unsafe {
                 speex_echo_cancellation(
@@ -2181,17 +2192,14 @@ impl AecStream {
                     self.aec_audio_buffer.as_mut_ptr(),
                 );
             }
-            self.aec_audio_buffer
+            &self.aec_audio_buffer
         };
         
-        for (out, &sample) in self.aec_out_audio_buffer.iter_mut().zip(aec_output) {
+        for (out, sample) in self.aec_out_audio_buffer.iter_mut().zip(aec_output) {
             *out = f32::from_sample(*sample);
         }
 
         Ok(&self.aec_out_audio_buffer.as_slice())
-
-        
-        // todo: send input_audio_buffer and output_audio_buffer in self.aec
     }
     fn write_channel_from_f32(
         src: &[f32],
