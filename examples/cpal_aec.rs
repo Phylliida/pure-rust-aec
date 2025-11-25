@@ -406,7 +406,7 @@ impl InputStreamAlignerProducer {
 
 #[derive(Clone)]
 enum ResamplingMetadata {
-    Arrive(usize, u128, bool),
+    Arrive(usize, u128, u128, bool),
 }
 
 struct InputStreamAlignerResampler {
@@ -520,7 +520,8 @@ impl InputStreamAlignerResampler {
                     };
                     // will always be positive because it's relative to 1970
                     let system_micros_after_resampled_packet_finishes = (system_micros_after_packet_finishes as i128) - micros_earlier;
-                    self.finished_resampling_producer.send(ResamplingMetadata::Arrive(produced, system_micros_after_resampled_packet_finishes as u128, calibrated))?;
+                    let system_micros_at_start_of_packet = (system_micros_after_resampled_packet_finishes as u128) - micros_to_frames(consumed as u128, self.input_sample_rate as u128);
+                    self.finished_resampling_producer.send(ResamplingMetadata::Arrive(produced, system_micros_at_start_of_packet, system_micros_after_resampled_packet_finishes as u128, calibrated))?;
                     Ok(true)
                 },
                 AudioBufferMetadata::Teardown() => {
@@ -565,7 +566,7 @@ impl InputStreamAlignerConsumer {
             match self.finished_message_reciever.try_recv() {
                 Ok(msg) => {
                     match msg {
-                        ResamplingMetadata::Arrive(frames_recieved, _system_micros_after_packet_finishes, calibrated) => {
+                        ResamplingMetadata::Arrive(frames_recieved, _system_micros_at_start_of_packet, _system_micros_after_packet_finishes, calibrated) => {
                             self.calibrated = calibrated;
                             self.initial_metadata.push(msg.clone());
                             self.samples_recieved += frames_recieved as u128;
@@ -617,20 +618,18 @@ impl InputStreamAlignerConsumer {
         let mut samples_to_ignore = 0 as u128;
         for metadata in self.initial_metadata.iter() {
             match metadata {
-                ResamplingMetadata::Arrive(frames_recieved, micros_metadata_finished, _calibrated) => {
-                    // no underflow issue because this is all relative to 1970
-                    let micros_metadata_started = *micros_metadata_finished - frames_to_micros(*frames_recieved as u128, self.sample_rate as u128);
+                ResamplingMetadata::Arrive(frames_recieved, micros_metadata_started, micros_metadata_finished, _calibrated) => {
                     // whole packet is behind, ignore entire thing
                     if *micros_metadata_finished < micros_packet_started {
                         samples_to_ignore += *frames_recieved as u128;
                     }
                     // keep all data
-                    else if micros_metadata_started >= micros_packet_started{
+                    else if *micros_metadata_started >= micros_packet_started{
                         
                     } 
                     // it overlaps, only ignore stuff before this packet
                     else {
-                        let micros_ignoring = micros_packet_started - micros_metadata_started;
+                        let micros_ignoring = micros_packet_started - *micros_metadata_started;
                         samples_to_ignore += micros_to_frames(micros_ignoring as u128, self.sample_rate as u128);
                     }
 
