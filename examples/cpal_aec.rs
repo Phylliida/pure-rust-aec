@@ -1929,7 +1929,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         3, // frame_size_millis (3 millis of audio per frame)
     )?;
 
-    let num_channels = stream.add_input_device(&input_device_config)?;
+    stream.add_input_device(&input_device_config)?;
     let stream_output_creator = stream.add_output_device(&output_device_config)?;
 
     // output wav files for debugging
