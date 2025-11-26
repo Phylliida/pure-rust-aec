@@ -813,25 +813,23 @@ impl OutputStreamAlignerProducer {
     }
 }
 
-struct OutputStreamAlignerConsumer {
+struct OutputStreamAlignerMixer {
     channels: usize,
     device_sample_rate: u32,
     output_sample_rate: u32,
     frame_size: u32,
     input_audio_buffer_producer: BufferedCircularProducer<f32>,
     resample_audio_buffer_producer: ResampledBufferedCircularProducer,
-    resample_audio_buffer_consumer: BufferedCircularConsumer<f32>,
     device_audio_producer: BufferedCircularProducer<f32>,
     stream_consumers: HashMap<StreamId, (u32, usize, HashMap<usize, usize>, ResampledBufferedCircularProducer, BufferedCircularConsumer<f32>)>,
     output_stream_receiver: mpsc::Receiver<OutputStreamMessage>,
 }
 
 // allows for playing audio on top of each other (mixing) or just appending to buffer
-impl OutputStreamAlignerConsumer {
-    fn new(channels: usize, device_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, frame_size: u32, output_stream_receiver:  mpsc::Receiver<OutputStreamMessage>, device_audio_producer: HeapProd<f32>) -> Result<Self, Box<dyn Error>>  {
+impl OutputStreamAlignerMixer {
+    fn new(channels: usize, device_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, frame_size: u32, output_stream_receiver:  mpsc::Receiver<OutputStreamMessage>, device_audio_producer: HeapProd<f32>, resampled_audio_buffer_producer: HeapProd<f32>) -> Result<Self, Box<dyn Error>>  {
         // used to send across threads
         let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * device_sample_rate *(channels as u32)) as usize).split();
-        let (resampled_audio_buffer_producer, resampled_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * output_sample_rate * (channels as u32)) as usize).split();
         Ok(Self {
             channels: channels,
             device_sample_rate: device_sample_rate,
@@ -846,22 +844,10 @@ impl OutputStreamAlignerConsumer {
                 BufferedCircularConsumer::new(input_audio_buffer_consumer),
                 BufferedCircularProducer::new(resampled_audio_buffer_producer)
             )?,
-            resample_audio_buffer_consumer: BufferedCircularConsumer::new(resampled_audio_buffer_consumer),
             device_audio_producer: BufferedCircularProducer::new(device_audio_producer),
             output_stream_receiver: output_stream_receiver,
             stream_consumers: HashMap::new(),
         })
-    }
-    
-    fn get_chunk_to_read(&mut self, size: usize) -> Result<&[f32], Box<dyn std::error::Error>> {
-        while self.resample_audio_buffer_consumer.available() < size {
-            self.mix_audio_streams(self.frame_size as usize)?;
-        }
-        Ok(self.resample_audio_buffer_consumer.get_chunk_to_read(size))
-    }
-
-    fn finish_read(&mut self, size: usize) -> usize {
-        self.resample_audio_buffer_consumer.finish_read(size)
     }
 
     fn mix_audio_streams(&mut self, input_chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -896,7 +882,7 @@ impl OutputStreamAlignerConsumer {
             // this doesn't work because it'll stall for very large audio
             // resample_producer.resample_all()?; // do resampling of any available data
             // instead, do it streaming
-            resample_producer.resample((target_input_samples as u32) * (*channels as u32) * 4); // do * 2 so we also grab some leftovers if there are some, this is an upper bound
+            resample_producer.resample((target_input_samples as u32) * (*channels as u32) * 2); // do * 2 so we also grab some leftovers if there are some, this is an upper bound
             let buf_from_stream = resample_consumer.get_chunk_to_read(round_to_channels(actual_input_chunk_size as u32, *channels) as usize);
             let frames = (buf_from_stream.len() / *channels as usize).min(frames_cap);
             if frames == 0 {
@@ -934,6 +920,27 @@ impl OutputStreamAlignerConsumer {
         // resample any available data
         self.resample_audio_buffer_producer.resample_all()?;
         Ok(())
+    }
+}
+
+struct OutputStreamAlignerConsumer {
+    channels: usize,
+    resample_audio_buffer_consumer: BufferedCircularConsumer<f32>,
+}
+
+impl OutputStreamAlignerConsumer {
+    fn new(channels: usize, resample_audio_buffer_consumer: BufferedCircularConsumer<f32>) -> Self {
+        Self {
+            channels: channels,
+            resample_audio_buffer_consumer: resample_audio_buffer_consumer
+        }
+    }
+    fn get_chunk_to_read(&mut self, size: usize) -> Result<&[f32], Box<dyn std::error::Error>> {
+        Ok(self.resample_audio_buffer_consumer.get_chunk_to_read(size))
+    }
+
+    fn finish_read(&mut self, size: usize) -> usize {
+        self.resample_audio_buffer_consumer.finish_read(size)
     }
 }
 
@@ -1167,6 +1174,7 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
 
     let (device_audio_producer, device_audio_consumer) = HeapRb::<f32>::new((device_config.audio_buffer_seconds * device_config.sample_rate * (device_config.channels as u32)) as usize).split();
     let (output_stream_sender, output_stream_receiver) = mpsc::channel::<OutputStreamMessage>();
+    let (resampled_audio_buffer_producer, resampled_audio_buffer_consumer) = HeapRb::<f32>::new((device_config.audio_buffer_seconds * aec_config.target_sample_rate * (device_config.channels as u32)) as usize).split();
 
     let producer = OutputStreamAlignerProducer::new(
         device_config.channels as usize, // channels
@@ -1174,7 +1182,7 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
         output_stream_sender
     );
 
-    let consumer = OutputStreamAlignerConsumer::new(
+    let mixer = OutputStreamAlignerMixer::new(
         device_config.channels as usize,
         device_config.sample_rate,
         aec_config.target_sample_rate,
@@ -1183,13 +1191,21 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
         device_config.frame_size,
         output_stream_receiver,
         device_audio_producer,
+        resampled_audio_buffer_producer,
     )?;
+
+    let consumer = OutputStreamAlignerConsumer::new(
+        device_config.channels as usize,
+        BufferedCircularConsumer::new(resampled_audio_buffer_consumer)
+    );
+
     let device_audio_channel_consumer = BufferedCircularConsumer::new(device_audio_consumer);
 
     let stream = build_output_alignment_stream(
         &device,
         device_config,
         supported_config,
+        mixer,
         device_audio_channel_consumer
     )?;
 
@@ -1773,6 +1789,7 @@ fn build_output_alignment_stream(
     device: &Device,
     config: &OutputDeviceConfig,
     supported_config: SupportedStreamConfig,
+    mixer: OutputStreamAlignerMixer,
     device_audio_channel_consumer: BufferedCircularConsumer<f32>
 ) -> Result<Stream, cpal::BuildStreamError> {
     match config.sample_format {
@@ -1780,18 +1797,21 @@ fn build_output_alignment_stream(
             device,
             config,
             supported_config,
+            mixer,
             device_audio_channel_consumer,
         ),
         SampleFormat::F32 => build_output_alignment_stream_typed::<f32>(
             device,
             config,
             supported_config,
+            mixer,
             device_audio_channel_consumer,
         ),
         SampleFormat::U16 => build_output_alignment_stream_typed::<u16>(
             device,
             config,
             supported_config,
+            mixer,
             device_audio_channel_consumer,
         ),
         other => {
@@ -1808,6 +1828,7 @@ fn build_output_alignment_stream_typed<T>(
     device: &Device,
     config: &OutputDeviceConfig,
     supported_config: SupportedStreamConfig,
+    mut mixer: OutputStreamAlignerMixer,
     mut device_audio_channel_consumer: BufferedCircularConsumer<f32>
 ) -> Result<Stream, cpal::BuildStreamError>
 where
@@ -1824,9 +1845,11 @@ where
             }
             // in case we don't have enough data yet
             //data.fill(T::from_sample(0.0f32));
+            while device_audio_channel_consumer.available() < frames {
+                mixer.mix_audio_streams(mixer.frame_size as usize);
+            }
             let chunk = device_audio_channel_consumer.get_chunk_to_read(frames);
             
-            println!("Requested {} and got {}", frames, chunk.len());
             if chunk.is_empty() {
                 return;
             }
@@ -1952,13 +1975,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Enqueued {} audio samples", wav_samples.len());
     stream_output = stream_output_creator.queue_audio(stream_output, wav_samples.as_slice());
     println!("Enqueued {} audio samples", wav_samples.len());
-
-    for _i in 0..1000 {
+    while stream.num_input_channels() == 0 || stream.num_output_channels() == 0 {
         let (aligned_input, aligned_output, aec_applied) = stream.update_debug()?;
-        //for &s in aligned_input { in_wav.write_sample(s)?; }
-        //for &s in aligned_output { out_wav.write_sample(s)?; }
-        //for &s in aec_applied { aec_wav.write_sample(s)?; }
-
+        for &s in aligned_input { in_wav.write_sample(s)?; }
+        for &s in aligned_output { out_wav.write_sample(s)?; }
+        for &s in aec_applied { aec_wav.write_sample(s)?; }
+    }
+    for _i in 0..100000 {
+        let (aligned_input, aligned_output, aec_applied) = stream.update_debug()?;
+        for &s in aligned_input { in_wav.write_sample(s)?; }
+        for &s in aligned_output { out_wav.write_sample(s)?; }
+        for &s in aec_applied { aec_wav.write_sample(s)?; }
+        println!("Got {} samples", aec_applied.len());
     }
 
     stream.remove_input_device(&input_device_config)?;
