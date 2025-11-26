@@ -248,6 +248,9 @@ impl ResampledBufferedCircularProducer {
 impl ResampledBufferedCircularProducer {
     // resample all data available
     fn resample_all(&mut self) -> Result<(usize, usize), Box<dyn std::error::Error>>  {
+        // set this to zero since we just read num samples available from available_to_resample()
+        // which would have double counted below
+        self.total_input_samples_remaining = 0; 
         self.resample(self.available_to_resample() as u32)
     }
 
@@ -522,7 +525,7 @@ impl InputStreamAlignerResampler {
                     };
                     // will always be positive because it's relative to 1970
                     let system_micros_after_resampled_packet_finishes = (system_micros_after_packet_finishes as i128) - micros_earlier;
-                    let system_micros_at_start_of_packet = (system_micros_after_resampled_packet_finishes as u128) - micros_to_frames(consumed as u128, self.input_sample_rate as u128);
+                    let system_micros_at_start_of_packet = (system_micros_after_resampled_packet_finishes as u128) - frames_to_micros(consumed as u128, self.input_sample_rate as u128);
                     self.finished_resampling_producer.send(ResamplingMetadata::Arrive(produced, system_micros_at_start_of_packet, system_micros_after_resampled_packet_finishes as u128, calibrated))?;
                     Ok(true)
                 },
@@ -570,6 +573,7 @@ impl InputStreamAlignerConsumer {
                     match msg {
                         ResamplingMetadata::Arrive(frames_recieved, _system_micros_at_start_of_packet, _system_micros_after_packet_finishes, calibrated) => {
                             self.calibrated = calibrated;
+                            // this is fine to just accumulate since we don't add any more after we are done with calibration
                             self.initial_metadata.push(msg.clone());
                             self.samples_recieved += frames_recieved as u128;
                         }
@@ -645,6 +649,19 @@ impl InputStreamAlignerConsumer {
     // (or something errors)
     // returns (success, audio_buffer)
     fn get_chunk_to_read(&mut self, size: usize) -> (bool, &[f32]) {
+        // drain anything in buffer (non blocking)
+        loop {
+            match self.finished_message_reciever.try_recv() {
+                Ok(msg) => {},
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // sender dropped; receiver will never get more messages
+                    eprintln!("Error: InputStreamAlignerConsumer message send disconnected");
+                    break;
+                }
+            }
+        }
+
         while self.final_audio_buffer_consumer.available() < size {
             // wait for data to arrive
             match self.finished_message_reciever.recv() {
@@ -1255,6 +1272,13 @@ impl AecStream {
         Ok(())
     }
 
+    // calls update, but returns all involved audio buffers
+    // (if needed for diagnostic reasons, usually .update() (which returns aec'd inputs) should be all you need)
+    fn update_debug(&mut self) -> Result<(&[i16], &[i16], &[f32]), Box<dyn std::error::Error>> {
+        self.update()?;
+        return Ok((self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), self.aec_out_audio_buffer.as_slice()));
+    } 
+
     fn update(&mut self) -> Result<&[f32], Box<dyn std::error::Error>> {
         let chunk_size = self.aec_config.frame_size;
         let start_micros = if let Some(start_micros_value) = self.start_micros {
@@ -1495,6 +1519,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    let resampler_quality = 5;
+
     let host = get_host_by_name("ALSA").unwrap_or_else(cpal::default_host);
     let input_device_config = InputDeviceConfig::from_default(
         host.id(),
@@ -1506,14 +1532,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         20, // calibration_packets
         // how long buffer of input audio to store, should only really need a few seconds as things are mostly streamed
         20, // audio_buffer_seconds
-        3 // resampler_quality
+        resampler_quality // resampler_quality
     )?;
 
     let output_device_config = OutputDeviceConfig::from_default(
         host.id(),
         "hdmi:CARD=NVidia,DEV=0".to_string(),
         60*10, // audio_buffer_seconds, 10 minutes (for longer audio you may need longer)
-        3, // resampler_quality
+        resampler_quality, // resampler_quality
         3, // frame_size_millis (3 millis of audio per frame)
     )?;
 
@@ -1521,11 +1547,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     stream.add_output_device(&output_device_config)?;
 
     for _i in 0..1000 {
-        let _samples = stream.update()?;
+        let (aligned_input, aligned_output, aec_applied) = stream.update_debug()?;
+        println!("Got {} samples", aec_applied.len());
     }
     stream.remove_input_device(&input_device_config)?;
     stream.remove_output_device(&output_device_config)?;
-
 
     Ok(())
 }
