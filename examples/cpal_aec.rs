@@ -1546,10 +1546,11 @@ impl AecStream {
         let mut captured_outputs: Vec<Vec<f32>> = vec![Vec::new(); output_channel_ranges.len()];
         let mut captured_micros: u128 = 0;
         let target_micros: u128 = ((capture_secs as u128) * 1_000_000) as u128;
+        let total_in_ch = self.input_channels.max(1);
+        let total_out_ch = self.output_channels.max(1);
         while captured_micros < target_micros {
             let (input_slices, output_slices, _aec_out, start_time, end_time) = self.update_debug()?;
             let chunk_micros = end_time.saturating_sub(start_time);
-            let total_in_ch = self.input_channels.max(1);
             if !input_slices.is_empty() && total_in_ch > 0 {
                 let frames = input_slices.len() / total_in_ch;
                 for frame_idx in 0..frames {
@@ -1564,7 +1565,6 @@ impl AecStream {
                     }
                 }
             }
-            let total_out_ch = self.output_channels.max(1);
             if !output_slices.is_empty() && total_out_ch > 0 {
                 let frames = output_slices.len() / total_out_ch;
                 for frame_idx in 0..frames {
@@ -2297,9 +2297,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         resampler_quality
     )?;
 
-    // enqueues audio samples to be played after each other
-    stream_output = stream_output_creator.queue_audio(stream_output, wav_samples.as_slice());
-    stream_output = stream_output_creator.queue_audio(stream_output, wav_samples.as_slice());
 
     // waits for channels to calibrate
     while stream.num_input_channels() == 0 || stream.num_output_channels() == 0 {
@@ -2309,7 +2306,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         // which makes it annoying to check alignments in audacity
     }
 
+    println!("Computing calibration");
     let _offsets = stream.calibrate(std::slice::from_mut(&mut stream_output_creator))?;
+    println!("calibrated");
+
+    // enqueues audio samples to be played after each other
+    stream_output = stream_output_creator.queue_audio(stream_output, wav_samples.as_slice());
+    stream_output = stream_output_creator.queue_audio(stream_output, wav_samples.as_slice());
+
 
     for _i in 0..1000 {
         let (aligned_input, aligned_output, aec_applied, _start_time, _end_time) = stream.update_debug()?;
