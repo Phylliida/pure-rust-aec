@@ -294,7 +294,8 @@ enum AudioBufferMetadata {
 }
 
 
-struct InputStreamAlignerProducer {
+struct StreamAlignerProducer {
+    channels: usize,
     input_sample_rate: u32,
     output_sample_rate: u32,
     input_audio_buffer_producer: HeapProd<f32>,
@@ -307,9 +308,10 @@ struct InputStreamAlignerProducer {
     start_time_micros: Option<u128>,
 }
 
-impl InputStreamAlignerProducer {
-    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, num_calibration_packets: u32, input_audio_buffer_producer: HeapProd<f32>, input_audio_buffer_metadata_producer: mpsc::Sender<AudioBufferMetadata>) -> Result<Self, Box<dyn Error>>  {
+impl StreamAlignerProducer {
+    fn new(channels: usize, input_sample_rate: u32, output_sample_rate: u32, history_len: usize, num_calibration_packets: u32, input_audio_buffer_producer: HeapProd<f32>, input_audio_buffer_metadata_producer: mpsc::Sender<AudioBufferMetadata>) -> Result<Self, Box<dyn Error>>  {
         Ok(Self {
+            channels: channels,
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
             input_audio_buffer_producer: input_audio_buffer_producer,
@@ -424,7 +426,8 @@ enum ResamplingMetadata {
     Arrive(usize, u128, u128, bool),
 }
 
-struct InputStreamAlignerResampler {
+struct StreamAlignerResampler {
+    channels: usize,
     input_sample_rate: u32,
     output_sample_rate: u32,
     dynamic_output_sample_rate: u32,
@@ -436,11 +439,12 @@ struct InputStreamAlignerResampler {
     finished_resampling_producer: mpsc::Sender<ResamplingMetadata>
 }
 
-impl InputStreamAlignerResampler {
+impl StreamAlignerResampler {
     // Takes input audio and resamples it to the target rate
     // May slightly stretch or squeeze the audio (via resampling)
     // to ensure the outputs stay aligned with system clock
     fn new(
+        channels: usize,
         input_sample_rate: u32,
         output_sample_rate: u32,
         resampler_quality: i32,
@@ -450,12 +454,13 @@ impl InputStreamAlignerResampler {
         finished_resampling_producer: mpsc::Sender<ResamplingMetadata>
     ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
+            channels: channels,
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
             dynamic_output_sample_rate: output_sample_rate,
             // we need buffered because this interfaces with speex which expects continuous buffers
             input_audio_buffer_consumer: ResampledBufferedCircularProducer::new(
-                1, // channel size, we treat each channel seperately
+                channels,
                 input_sample_rate,
                 output_sample_rate,
                 resampler_quality,
@@ -551,7 +556,8 @@ impl InputStreamAlignerResampler {
     }
 }
 
-struct InputStreamAlignerConsumer {
+struct StreamAlignerConsumer {
+    channels: usize,
     sample_rate: u32,
     final_audio_buffer_consumer: BufferedCircularConsumer<f32>,
     thread_message_sender: mpsc::Sender<AudioBufferMetadata>,
@@ -561,9 +567,10 @@ struct InputStreamAlignerConsumer {
     calibrated: bool,
 }
 
-impl InputStreamAlignerConsumer {
-    fn new(sample_rate: u32, final_audio_buffer_consumer: BufferedCircularConsumer<f32>, thread_message_sender: mpsc::Sender<AudioBufferMetadata>, finished_message_reciever: mpsc::Receiver<ResamplingMetadata>) -> Self {
+impl StreamAlignerConsumer {
+    fn new(channels: usize, sample_rate: u32, final_audio_buffer_consumer: BufferedCircularConsumer<f32>, thread_message_sender: mpsc::Sender<AudioBufferMetadata>, finished_message_reciever: mpsc::Receiver<ResamplingMetadata>) -> Self {
         Self {
+            channels: channels,
             sample_rate: sample_rate,
             final_audio_buffer_consumer: final_audio_buffer_consumer,
             thread_message_sender: thread_message_sender,
@@ -669,7 +676,7 @@ impl InputStreamAlignerConsumer {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // sender dropped; receiver will never get more messages
-                    eprintln!("Error: InputStreamAlignerConsumer message send disconnected");
+                    eprintln!("Error: StreamAlignerConsumer message send disconnected");
                     break;
                 }
             }
@@ -696,7 +703,7 @@ impl InputStreamAlignerConsumer {
     }
 }
 
-impl Drop for InputStreamAlignerConsumer {
+impl Drop for StreamAlignerConsumer {
     fn drop(&mut self) {
         if let Err(err) = self.thread_message_sender.send(AudioBufferMetadata::Teardown()) {
             eprintln!("failed to send shutdown signal: {}", err);
@@ -705,12 +712,13 @@ impl Drop for InputStreamAlignerConsumer {
 }
 
 // make (producer (recieves audio data from device), resampler (resamples input audio to target rate), consumer (contains resampled data)) for input audio alignment
-fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, calibration_packets: u32, audio_buffer_seconds: u32, resampler_quality: i32) -> Result<(InputStreamAlignerProducer, InputStreamAlignerResampler, InputStreamAlignerConsumer), Box<dyn Error>> {
-    let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
+fn create_stream_aligner(channels: usize, input_sample_rate: u32, output_sample_rate: u32, history_len: usize, calibration_packets: u32, audio_buffer_seconds: u32, resampler_quality: i32) -> Result<(StreamAlignerProducer, StreamAlignerResampler, StreamAlignerConsumer), Box<dyn Error>> {
+    let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate * (channels as u32)) as usize).split();
     let (input_audio_buffer_metadata_producer, input_audio_buffer_metadata_consumer) = mpsc::channel::<AudioBufferMetadata>();
     let additional_input_audio_buffer_metadata_producer = input_audio_buffer_metadata_producer.clone(); // make another one, this is ok because it is multiple producer single consumer 
     // this recieves data from audio buffer
-    let producer = InputStreamAlignerProducer::new(
+    let producer = StreamAlignerProducer::new(
+        channels,
         input_sample_rate,
         output_sample_rate,
         history_len,
@@ -721,11 +729,12 @@ fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, 
 
     let (finished_resampling_producer, finished_resampling_consumer) = mpsc::channel::<ResamplingMetadata>();
 
-    let (output_audio_buffer_producer, output_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * output_sample_rate) as usize).split();
+    let (output_audio_buffer_producer, output_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * output_sample_rate * (channels as u32)) as usize).split();
     // resampled_consumer: BufferedCircularConsumer::<f32>::new(resampled_consumer))
     // this resamples, designed to run on a seperate thread
     
-    let resampler = InputStreamAlignerResampler::new(
+    let resampler = StreamAlignerResampler::new(
+        channels,
         input_sample_rate,
         output_sample_rate,
         resampler_quality,
@@ -736,7 +745,8 @@ fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, 
     )?;
 
    
-    let consumer = InputStreamAlignerConsumer::new(
+    let consumer = StreamAlignerConsumer::new(
+        channels,
         output_sample_rate,
         BufferedCircularConsumer::new(output_audio_buffer_consumer),
         additional_input_audio_buffer_metadata_producer, // give it ability to send shutdown signal to thread
@@ -819,15 +829,15 @@ struct OutputStreamAlignerMixer {
     output_sample_rate: u32,
     frame_size: u32,
     input_audio_buffer_producer: BufferedCircularProducer<f32>,
-    resample_audio_buffer_producer: ResampledBufferedCircularProducer,
     device_audio_producer: BufferedCircularProducer<f32>,
+    resample_audio_buffer_producer: StreamAlignerProducer,
     stream_consumers: HashMap<StreamId, (u32, usize, HashMap<usize, usize>, ResampledBufferedCircularProducer, BufferedCircularConsumer<f32>)>,
     output_stream_receiver: mpsc::Receiver<OutputStreamMessage>,
 }
 
 // allows for playing audio on top of each other (mixing) or just appending to buffer
 impl OutputStreamAlignerMixer {
-    fn new(channels: usize, device_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, frame_size: u32, output_stream_receiver:  mpsc::Receiver<OutputStreamMessage>, device_audio_producer: HeapProd<f32>, resampled_audio_buffer_producer: HeapProd<f32>) -> Result<Self, Box<dyn Error>>  {
+    fn new(channels: usize, device_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, frame_size: u32, output_stream_receiver:  mpsc::Receiver<OutputStreamMessage>, device_audio_producer: HeapProd<f32>, resampled_audio_buffer_producer: StreamAlignerProducer) -> Result<Self, Box<dyn Error>>  {
         // used to send across threads
         let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * device_sample_rate *(channels as u32)) as usize).split();
         Ok(Self {
@@ -836,16 +846,9 @@ impl OutputStreamAlignerMixer {
             output_sample_rate: output_sample_rate,
             frame_size: frame_size,
             input_audio_buffer_producer: BufferedCircularProducer::new(input_audio_buffer_producer),
-            resample_audio_buffer_producer: ResampledBufferedCircularProducer::new(
-                channels,
-                device_sample_rate,
-                output_sample_rate,
-                resampler_quality,
-                BufferedCircularConsumer::new(input_audio_buffer_consumer),
-                BufferedCircularProducer::new(resampled_audio_buffer_producer)
-            )?,
             device_audio_producer: BufferedCircularProducer::new(device_audio_producer),
             output_stream_receiver: output_stream_receiver,
+            resample_audio_buffer_producer: resample_audio_buffer_producer,
             stream_consumers: HashMap::new(),
         })
     }
@@ -875,7 +878,7 @@ impl OutputStreamAlignerMixer {
 
         let (need_to_write_input_values, input_buf_write) = self.input_audio_buffer_producer.get_chunk_to_write(input_chunk_size*(self.channels as usize));
         let actual_input_chunk_size = input_buf_write.len();
-        let frames_cap = input_buf_write.len() / (self.channels as usize);
+        let frames_cap = input_buf_write.len() / (self.channels);
         input_buf_write.fill(0.0);
         for (_stream_id, (input_sample_rate, channels, channel_map, resample_producer, resample_consumer)) in self.stream_consumers.iter_mut() {
             let target_input_samples = input_to_output_frames(frames_cap as u128, self.device_sample_rate, *input_sample_rate);
@@ -889,8 +892,8 @@ impl OutputStreamAlignerMixer {
                 continue;
             }
 
-            let dst_stride = self.channels as usize;
-            let src_stride = *channels as usize;
+            let dst_stride = self.channels;
+            let src_stride = *channels;
             // map virtual channels to real channels via channel_map
             for (s_idx, dst_ch) in channel_map.iter() {
                 if *dst_ch >= self.channels { continue; } // guard bad maps
@@ -905,24 +908,24 @@ impl OutputStreamAlignerMixer {
                     src_idx += src_stride;
                 }
             }
-            let num_read = frames * (*channels as usize);
+            let num_read = frames * (*channels);
             resample_consumer.finish_read(num_read);
         }
         // send mixed values to the output device
         let (need_to_write_device_values, device_buf_write) = self.device_audio_producer.get_chunk_to_write(actual_input_chunk_size);
         let samples_to_copy = device_buf_write.len().min(actual_input_chunk_size);
         device_buf_write[..samples_to_copy].copy_from_slice(&input_buf_write[..samples_to_copy]);
+        // send output downstream to the eac
+        resample_audio_buffer_producer.process_chunk(device_buf_write);
+        // finish writing to output device buffer
         self.device_audio_producer.finish_write(need_to_write_device_values, samples_to_copy);
-        
         // finish writing to the input buffer
         self.input_audio_buffer_producer.finish_write(need_to_write_input_values, actual_input_chunk_size);
-        
-        // resample any available data
-        self.resample_audio_buffer_producer.resample_all()?;
         Ok(())
     }
 }
 
+/*
 struct OutputStreamAlignerConsumer {
     channels: usize,
     resample_audio_buffer_consumer: BufferedCircularConsumer<f32>,
@@ -943,11 +946,12 @@ impl OutputStreamAlignerConsumer {
         self.resample_audio_buffer_consumer.finish_read(size)
     }
 }
+*/
 
 struct InputDeviceConfig {
     host_id: cpal::HostId,
     device_name: String,
-    channels: u16,
+    channels: usize,
     sample_rate: u32,
     sample_format: SampleFormat,
     
@@ -965,7 +969,7 @@ impl InputDeviceConfig {
     fn new(
         host_id: cpal::HostId,
         device_name: String,
-        channels: u16,
+        channels: usize,
         sample_rate: u32,
         sample_format: SampleFormat,
         history_len: usize,
@@ -1002,7 +1006,7 @@ impl InputDeviceConfig {
         Ok(Self::new(
             host_id,
             input_device.name()?,
-            default_config.channels(),
+            default_config.channels() as usize,
             default_config.sample_rate().0,
             default_config.sample_format(),
             history_len,
@@ -1016,7 +1020,7 @@ impl InputDeviceConfig {
 struct OutputDeviceConfig {
     host_id: cpal::HostId,
     device_name: String,
-    channels: u16,
+    channels: usize,
     sample_rate: u32,
     sample_format: SampleFormat,
     
@@ -1033,7 +1037,7 @@ impl OutputDeviceConfig {
     fn new(
         host_id: cpal::HostId,
         device_name: String,
-        channels: u16,
+        channels: usize,
         sample_rate: u32,
         sample_format: SampleFormat,
         audio_buffer_seconds: u32,
@@ -1069,7 +1073,7 @@ impl OutputDeviceConfig {
         Ok(Self::new(
             host_id,
             output_device.name()?,
-            default_config.channels(),
+            default_config.channels() as usize,
             default_config.sample_rate().0,
             default_config.sample_format(),
             audio_buffer_seconds,
@@ -1091,7 +1095,7 @@ impl AecConfig {
     }
 }
 
-fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, Vec<InputStreamAlignerConsumer>), Box<dyn std::error::Error>>  {
+fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, Vec<StreamAlignerConsumer>), Box<dyn std::error::Error>>  {
 
     let host = cpal::host_from_id(device_config.host_id)?;
     let device = select_device(
@@ -1109,51 +1113,45 @@ fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &Aec
         "Input",
     )?;
     
-    let mut aligner_producers = Vec::new();
-    let mut aligner_consumers = Vec::new();
 
-    for _channel in 0..device_config.channels {
-        let (producer, mut resampler, consumer) = create_input_stream_aligner(
-            device_config.sample_rate,
-            aec_config.target_sample_rate,
-            device_config.history_len,
-            device_config.calibration_packets,
-            device_config.audio_buffer_seconds,
-            device_config.resampler_quality)?;
-        aligner_producers.push(producer);
+    let (producer, mut resampler, consumer) = create_stream_aligner(
+        device_config.channels,
+        device_config.sample_rate,
+        aec_config.target_sample_rate,
+        device_config.history_len,
+        device_config.calibration_packets,
+        device_config.audio_buffer_seconds,
+        device_config.resampler_quality)?;
 
-        // start the resampler thread
-        thread::spawn(move || {
-            // it returns true when signaled to stop (such as when consumer goes out of scope)
-            loop {
-                match resampler.resample() {
-                    Ok(true) => continue,
-                    Ok(false) => break,
-                    Err(err) => {
-                        eprintln!("resampler error: {err}");
-                        break;
-                    }
+    // start the resampler thread
+    thread::spawn(move || {
+        // it returns true when signaled to stop (such as when consumer goes out of scope)
+        loop {
+            match resampler.resample() {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(err) => {
+                    eprintln!("resampler error: {err}");
+                    break;
                 }
             }
-        });
-
-        aligner_consumers.push(consumer);
-    }
+        }
+    });
 
     let stream = build_input_alignment_stream(
         &device,
         device_config,
         supported_config,
-        aligner_producers,
+        producer,
     )?;
 
     // start input stream
     stream.play()?;
 
-    Ok((stream, aligner_consumers))
+    Ok((stream, consumer))
 }
 
-fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, OutputStreamAlignerProducer, OutputStreamAlignerConsumer), Box<dyn std::error::Error>> {
+fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, OutputStreamAlignerProducer, StreamAlignerConsumer), Box<dyn std::error::Error>> {
 
     let host = cpal::host_from_id(device_config.host_id)?;
 
@@ -1174,16 +1172,24 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
 
     let (device_audio_producer, device_audio_consumer) = HeapRb::<f32>::new((device_config.audio_buffer_seconds * device_config.sample_rate * (device_config.channels as u32)) as usize).split();
     let (output_stream_sender, output_stream_receiver) = mpsc::channel::<OutputStreamMessage>();
-    let (resampled_audio_buffer_producer, resampled_audio_buffer_consumer) = HeapRb::<f32>::new((device_config.audio_buffer_seconds * aec_config.target_sample_rate * (device_config.channels as u32)) as usize).split();
 
-    let producer = OutputStreamAlignerProducer::new(
-        device_config.channels as usize, // channels
+    let output_producer = OutputStreamAlignerProducer::new(
+        device_config.channels, // channels
         device_config.sample_rate, // device_sample_rate
         output_stream_sender
     );
 
+    let (producer, mut resampler, consumer) = create_stream_aligner(
+        device_config.channels,
+        device_config.sample_rate,
+        aec_config.target_sample_rate,
+        device_config.history_len,
+        device_config.calibration_packets,
+        device_config.audio_buffer_seconds,
+        device_config.resampler_quality)?;
+    
     let mixer = OutputStreamAlignerMixer::new(
-        device_config.channels as usize,
+        device_config.channels,
         device_config.sample_rate,
         aec_config.target_sample_rate,
         device_config.audio_buffer_seconds,
@@ -1191,35 +1197,44 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
         device_config.frame_size,
         output_stream_receiver,
         device_audio_producer,
-        resampled_audio_buffer_producer,
+        producer,
     )?;
+    
 
-    let consumer = OutputStreamAlignerConsumer::new(
-        device_config.channels as usize,
-        BufferedCircularConsumer::new(resampled_audio_buffer_consumer)
-    );
-
-    let device_audio_channel_consumer = BufferedCircularConsumer::new(device_audio_consumer);
+    // start the resampler thread
+    thread::spawn(move || {
+        // it returns true when signaled to stop (such as when consumer goes out of scope)
+        loop {
+            match resampler.resample() {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(err) => {
+                    eprintln!("resampler error: {err}");
+                    break;
+                }
+            }
+        }
+    });
 
     let stream = build_output_alignment_stream(
         &device,
         device_config,
         supported_config,
         mixer,
-        device_audio_channel_consumer
+        BufferedCircularConsumer::new(device_audio_consumer)
     )?;
 
     // start output stream
     stream.play()?;
 
-    Ok((stream, producer, consumer))
+    Ok((stream, output_producer, consumer))
 }
 
 
 enum DeviceUpdateMessage {
-    AddInputDevice(String, Stream, Vec<InputStreamAlignerConsumer>),
+    AddInputDevice(String, Stream, Vec<StreamAlignerConsumer>),
     RemoveInputDevice(String),
-    AddOutputDevice(String, Stream, OutputStreamAlignerConsumer),
+    AddOutputDevice(String, Stream, StreamAlignerConsumer),
     RemoveOutputDevice(String)
 }
 
@@ -1230,9 +1245,10 @@ struct AecStream {
     device_update_receiver: mpsc::Receiver<DeviceUpdateMessage>,
     input_streams: HashMap<String, Stream>,
     output_streams: HashMap<String, Stream>,
-    input_aligners: HashMap<String, Vec<InputStreamAlignerConsumer>>,
-    input_aligners_in_progress: HashMap<String, Vec<InputStreamAlignerConsumer>>,
-    output_aligners: HashMap<String, OutputStreamAlignerConsumer>,
+    input_aligners: HashMap<String, StreamAlignerConsumer>,
+    input_aligners_in_progress: HashMap<String, StreamAlignerConsumer>,
+    output_aligners: HashMap<String, StreamAlignerConsumer>,
+    output_aligners_in_progress: HashMap<String, StreamAlignerConsumer>,
     sorted_input_aligners: Vec<String>,
     sorted_output_aligners: Vec<String>,
     input_channels: usize,
@@ -1263,6 +1279,7 @@ impl AecStream {
            input_aligners: HashMap::new(),
            input_aligners_in_progress: HashMap::new(),
            output_aligners: HashMap::new(),
+           output_aligners_in_progress: HashMap::new(),
            sorted_input_aligners: Vec::new(),
            sorted_output_aligners: Vec::new(),
            input_channels: 0,
@@ -1277,13 +1294,16 @@ impl AecStream {
     }
 
     fn num_input_channels(&self) -> usize {
-        self.input_aligners.values().flatten().count()
+        self.input_aligners
+            .values()
+            .map(|aligner| aligner.channels)
+            .sum();
     }
 
     fn num_output_channels(&self) -> usize {
         self.output_aligners
             .values()
-            .map(|aligner| aligner.channels as usize)
+            .map(|aligner| aligner.channels)
             .sum()
     }
 
@@ -1366,11 +1386,11 @@ impl AecStream {
         loop {
             match self.device_update_receiver.try_recv() {
                 Ok(msg) => match msg {
-                    DeviceUpdateMessage::AddInputDevice(device_name, stream, aligners) => {
+                    DeviceUpdateMessage::AddInputDevice(device_name, stream, aligner) => {
                         // old stream is stopped by default when it goes out of scope
                         self.input_streams.insert(device_name.clone(), stream);
-                        self.input_aligners_in_progress.insert(device_name.clone(), aligners);
-                        self.input_aligners.insert(device_name.clone(), Vec::new());
+                        self.input_aligners.remove(device_name.clone());
+                        self.input_aligners_in_progress.insert(device_name.clone(), aligner);
 
                         self.reinitialize_aec()?;
                     }
@@ -1382,21 +1402,17 @@ impl AecStream {
 
                         self.reinitialize_aec()?;
                     }
-                    DeviceUpdateMessage::AddOutputDevice(device_name, stream, aligners) => {
-                        if let Some(stream) = self.output_streams.get(&device_name) {
-                            stream.pause()?;
-                        }
+                    DeviceUpdateMessage::AddOutputDevice(device_name, stream, aligner) => {
                         self.output_streams.insert(device_name.clone(), stream);
-                        self.output_aligners.insert(device_name.clone(), aligners);
+                        self.output_aligners.remove(device_name.clone());
+                        self.output_aligners_in_progress.insert(device_name.clone(), aligner);
 
                         self.reinitialize_aec()?;
                     }
                     DeviceUpdateMessage::RemoveOutputDevice(device_name) => {
-                        if let Some(stream) = self.output_streams.get(&device_name) {
-                            stream.pause()?;
-                        }
                         self.output_streams.remove(&device_name);
                         self.output_aligners.remove(&device_name);
+                        self.output_aligners_in_progress.remove(&device_name);
 
                         self.reinitialize_aec()?;
                     }
@@ -1438,6 +1454,26 @@ impl AecStream {
                 if !ready.is_empty() {
                     modified_aligners = true;
                     if let Some(ready_aligners) = self.input_aligners.get_mut(key) {
+                        ready_aligners.extend(ready);
+                    }
+                }
+            }
+        }
+
+        for key in &self.sorted_output_aligners {
+            if let Some(aligner) = self.output_aligners_in_progress.get_mut(key) {
+            
+                if aligner.is_ready_to_read(chunk_end_micros, chunk_size) {
+                    ready.push(aligner);
+                } else {
+                    remaining.push(aligner);
+                }
+
+                *in_progress = remaining;
+
+                if !ready.is_empty() {
+                    modified_aligners = true;
+                    if let Some(ready_aligners) = self.output_aligners.get_mut(key) {
                         ready_aligners.extend(ready);
                     }
                 }
@@ -1700,7 +1736,7 @@ fn build_input_alignment_stream(
     device: &Device,
     config: &InputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    channel_aligners: Vec<InputStreamAlignerProducer>,
+    channel_aligners: Vec<StreamAlignerProducer>,
 ) -> Result<Stream, cpal::BuildStreamError> {
     match config.sample_format {
         SampleFormat::I16 => build_input_alignment_stream_typed::<i16>(
@@ -1735,7 +1771,7 @@ fn build_input_alignment_stream_typed<T>(
     device: &Device,
     config: &InputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    mut channel_aligners: Vec<InputStreamAlignerProducer>,
+    mut channel_aligners: Vec<StreamAlignerProducer>,
 ) -> Result<Stream, cpal::BuildStreamError>
 where
     T: Sample + SizedSample,
