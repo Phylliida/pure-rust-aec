@@ -1024,9 +1024,14 @@ struct OutputDeviceConfig {
     sample_rate: u32,
     sample_format: SampleFormat,
     
-    // how long buffer of output audio to store, should only really need a few seconds as things are mostly streamed
+    // number of audio chunks to hold in memory, for aligning input devices's values when dropped frames/clock offsets. 100 or so is fine
+    history_len: usize,
+    // number of packets recieved before we start getting audio data
+    // a larger value here will take longer to connect, but result in more accurate timing alignments
+    calibration_packets: u32,
+    // how long buffer of input audio to store, should only really need a few seconds as things are mostly streamed
     audio_buffer_seconds: u32,
-    resampler_quality: i32,
+    resampler_quality: i32
     // frame size (in terms of samples) should be small, on the order of 1-2ms or less.
     // otherwise you may get skipping if you do not provide audio via enqueue_audio fast enough
     // larger frame sizes will also prevent immediate interruption, as interruption can only happen between each frame
@@ -1095,7 +1100,7 @@ impl AecConfig {
     }
 }
 
-fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, Vec<StreamAlignerConsumer>), Box<dyn std::error::Error>>  {
+fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, StreamAlignerConsumer), Box<dyn std::error::Error>>  {
 
     let host = cpal::host_from_id(device_config.host_id)?;
     let device = select_device(
@@ -1232,7 +1237,7 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
 
 
 enum DeviceUpdateMessage {
-    AddInputDevice(String, Stream, Vec<StreamAlignerConsumer>),
+    AddInputDevice(String, Stream, StreamAlignerConsumer),
     RemoveInputDevice(String),
     AddOutputDevice(String, Stream, StreamAlignerConsumer),
     RemoveOutputDevice(String)
@@ -1297,7 +1302,7 @@ impl AecStream {
         self.input_aligners
             .values()
             .map(|aligner| aligner.channels)
-            .sum();
+            .sum()
     }
 
     fn num_output_channels(&self) -> usize {
@@ -1389,7 +1394,7 @@ impl AecStream {
                     DeviceUpdateMessage::AddInputDevice(device_name, stream, aligner) => {
                         // old stream is stopped by default when it goes out of scope
                         self.input_streams.insert(device_name.clone(), stream);
-                        self.input_aligners.remove(device_name.clone());
+                        self.input_aligners.remove(&device_name);
                         self.input_aligners_in_progress.insert(device_name.clone(), aligner);
 
                         self.reinitialize_aec()?;
@@ -1404,7 +1409,7 @@ impl AecStream {
                     }
                     DeviceUpdateMessage::AddOutputDevice(device_name, stream, aligner) => {
                         self.output_streams.insert(device_name.clone(), stream);
-                        self.output_aligners.remove(device_name.clone());
+                        self.output_aligners.remove(&device_name);
                         self.output_aligners_in_progress.insert(device_name.clone(), aligner);
 
                         self.reinitialize_aec()?;
@@ -1660,7 +1665,7 @@ fn supported_device_configs_to_string(
 fn find_matching_device_config(
     device: &Device,
     device_name: &String,
-    channels: u16,
+    channels: usize,
     sample_rate: u32,
     format: SampleFormat,
     direction: &'static str,
@@ -1686,7 +1691,7 @@ fn find_matching_device_config(
     let desired_rate = SampleRate(sample_rate);
     let matching_config = configs
         .iter()
-        .filter(|cfg| cfg.channels() == channels && cfg.sample_format() == format)
+        .filter(|cfg| cfg.channels() == (channels as u16) && cfg.sample_format() == format)
         .find_map(|cfg| cfg.clone().try_with_sample_rate(desired_rate));
     
     if let Some(config) = matching_config {
@@ -1945,7 +1950,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // output wav files for debugging
     let pcm_spec = WavSpec {
-        channels: input_device_config.channels,
+        channels: input_device_config.channels as u16,
         sample_rate: aec_sample_rate, // 16_000 in your config
         bits_per_sample: 16,
         sample_format: HoundSampleFormat::Int,
