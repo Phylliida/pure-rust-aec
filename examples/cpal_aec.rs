@@ -1437,45 +1437,30 @@ impl AecStream {
         // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
         for key in &self.sorted_input_aligners {
-            if let Some(in_progress) = self.input_aligners_in_progress.get_mut(key) {
-                let mut ready = Vec::new();
-                let mut remaining = Vec::new();
+            let ready = self
+                .input_aligners_in_progress
+                .get_mut(key)
+                .map(|a| a.is_ready_to_read(chunk_end_micros, chunk_size))
+                .unwrap_or(false);
 
-                for mut aligner in in_progress.drain(..) {
-                    if aligner.is_ready_to_read(chunk_end_micros, chunk_size) {
-                        ready.push(aligner);
-                    } else {
-                        remaining.push(aligner);
-                    }
-                }
-
-                *in_progress = remaining;
-
-                if !ready.is_empty() {
+            if ready {
+                if let Some(aligner) = self.input_aligners_in_progress.remove(key) {
+                    self.input_aligners.insert(key.clone(), aligner);
                     modified_aligners = true;
-                    if let Some(ready_aligners) = self.input_aligners.get_mut(key) {
-                        ready_aligners.extend(ready);
-                    }
                 }
             }
         }
-
         for key in &self.sorted_output_aligners {
-            if let Some(aligner) = self.output_aligners_in_progress.get_mut(key) {
-            
-                if aligner.is_ready_to_read(chunk_end_micros, chunk_size) {
-                    ready.push(aligner);
-                } else {
-                    remaining.push(aligner);
-                }
+            let ready = self
+                .output_aligners_in_progress
+                .get_mut(key)
+                .map(|a| a.is_ready_to_read(chunk_end_micros, chunk_size))
+                .unwrap_or(false);
 
-                *in_progress = remaining;
-
-                if !ready.is_empty() {
+            if ready {
+                if let Some(aligner) = self.output_aligners_in_progress.remove(key) {
+                    self.output_aligners.insert(key.clone(), aligner);
                     modified_aligners = true;
-                    if let Some(ready_aligners) = self.output_aligners.get_mut(key) {
-                        ready_aligners.extend(ready);
-                    }
                 }
             }
         }
@@ -1484,31 +1469,30 @@ impl AecStream {
             self.reinitialize_aec()?;
         }
 
+        // recieve audio data and interleave it into our buffers
         let mut input_channel = 0;
         self.input_audio_buffer.fill(0 as i16);
         for key in &self.sorted_input_aligners {
-            if let Some(channel_aligners) = self.input_aligners.get_mut(key) {
-                for aligner in channel_aligners.iter_mut() {
-                    let samples_used = {
-                        let (ok, chunk) = aligner.get_chunk_to_read(chunk_size);
-                        if ok {
-                            Self::write_channel_from_f32(
-                                chunk,
-                                input_channel,
-                                self.input_channels,
-                                chunk_size,
-                                &mut self.input_audio_buffer,
-                            );
-                            chunk.len().min(chunk_size) as usize
-                        } else {
-                            Self::clear_channel(input_channel, self.input_channels, chunk_size, &mut self.input_audio_buffer);
-                            0
+            if let Some(aligner) = self.input_aligners.get_mut(key) {
+                let channels = aligner.channels;
+                let needed = chunk_size * channels;
+                let (ok, chunk) = aligner.get_chunk_to_read(needed);
+                let frames = chunk.len() / channels;
+
+                if ok && frames > 0 {
+                    for c in 0..channels {
+                        let mut src_idx = c;
+                        let mut dst = input_channel + c;
+                        for _ in 0..frames_to_write {
+                            self.input_audio_buffer[dst] = Self::f32_to_i16(chunk[src_idx]);
+                            dst += self.input_channels;
+                            src_idx += channels;
                         }
-                    };
-                    
-                    aligner.finish_read(samples_used);
-                    input_channel += 1;
+                    }
                 }
+
+                aligner.finish_read(frames * channels);
+                input_channel += channels;
             }
         }
 
@@ -1517,27 +1501,33 @@ impl AecStream {
             &self.input_audio_buffer
         }
         else {
+                
             let mut output_channel = 0;
             self.output_audio_buffer.fill(0 as i16);
             for key in &self.sorted_output_aligners {
                 if let Some(aligner) = self.output_aligners.get_mut(key) {
-                    let channels = aligner.channels as usize; // store this on the aligner
-                    let chunk = aligner.get_chunk_to_read(chunk_size * channels)?; // interleaved
+                    let channels = aligner.channels;
+                    let needed = chunk_size * channels;
+                    let (ok, chunk) = aligner.get_chunk_to_read(needed);
                     let frames = chunk.len() / channels;
-                    // take interleaved per channel for this device ->
-                    // put into interleaved based on total number of channels from all devices
-                    for frame in 0..frames.min(chunk_size) {
+
+                    if ok && frames > 0 {
                         for c in 0..channels {
-                            let sample = chunk.get(frame * channels + c).copied().unwrap_or(0.0);
-                            let dst = frame * self.output_channels + output_channel + c;
-                            self.output_audio_buffer[dst] = Self::f32_to_i16(sample);
+                            let mut src_idx = c;
+                            let mut dst = output_channel + c;
+                            for _ in 0..frames_to_write {
+                                self.output_audio_buffer[dst] = Self::f32_to_i16(chunk[src_idx]);
+                                dst += self.output_channels;
+                                src_idx += channels;
+                            }
                         }
+                        aligner.finish_read(frames * channels);
                     }
 
-                    aligner.finish_read(frames * channels); // consumed samples
                     output_channel += channels;
                 }
             }
+
             self.aec_audio_buffer.fill(0 as i16);
 
             if self.input_channels == 0 {
@@ -1736,7 +1726,7 @@ fn build_input_alignment_stream(
     device: &Device,
     config: &InputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    channel_aligners: Vec<StreamAlignerProducer>,
+    channel_aligners: StreamAlignerProducer,
 ) -> Result<Stream, cpal::BuildStreamError> {
     match config.sample_format {
         SampleFormat::I16 => build_input_alignment_stream_typed::<i16>(
@@ -1771,7 +1761,7 @@ fn build_input_alignment_stream_typed<T>(
     device: &Device,
     config: &InputDeviceConfig,
     supported_config: SupportedStreamConfig,
-    mut channel_aligners: Vec<StreamAlignerProducer>,
+    mut channel_aligner: StreamAlignerProducer,
 ) -> Result<Stream, cpal::BuildStreamError>
 where
     T: Sample + SizedSample,
@@ -1780,40 +1770,25 @@ where
     let per_channel_capacity = config.sample_rate
         .saturating_div(20) // ~50 ms of audio per channel
         .max(1024);
-    let mut channel_buffers = (0..config.channels)
-        .map(|_| Vec::<f32>::with_capacity(per_channel_capacity as usize))
-        .collect::<Vec<_>>();
+    let mut interleaved_buffer =
+        Vec::<f32>::with_capacity((per_channel_capacity as usize) * (config.channels as usize));
     
     let device_name = config.device_name.clone();
     let device_name_inner = config.device_name.clone();
-    let channels = config.channels as usize;
     device.build_input_stream(
         &supported_config.config(),
         move |data: &[T], _info: &InputCallbackInfo| {
             if data.is_empty() {
                 return;
             }
-            for buffer in channel_buffers.iter_mut() {
-                buffer.clear();
+
+            interleaved_buffer.clear();
+            interleaved_buffer.reserve(data.len()); // usually already sized, but cheap
+            for &s in data {
+                interleaved_buffer.push(f32::from_sample(s));
             }
-            // undo the interleaving and convert to f32
-            // todo: do this looping per channel in outermost instead of get_mut each time
-            // (if it becomes a performance issue)
-            for frame in data.chunks(channels) {
-                for (channel_idx, sample) in frame.iter().enumerate() {
-                    if let Some(buffer) = channel_buffers.get_mut(channel_idx) {
-                        buffer.push(f32::from_sample(*sample));
-                    }
-                }
-            }
-            for (buffer, channel_aligner) in channel_buffers.iter_mut().zip(channel_aligners.iter_mut()) {
-                if buffer.is_empty() {
-                    continue;
-                }
-                if let Err(err) = channel_aligner.process_chunk(buffer.as_slice()) {
-                    eprintln!("Input stream '{device_name_inner}' error when process chunk {err}");
-                }
-                buffer.clear();
+            if let Err(err) = channel_aligner.process_chunk(interleaved_buffer.as_slice()) {
+                eprintln!("Input stream '{device_name_inner}' error when process chunk {err}");
             }
         },
         move |err| eprintln!("Input stream '{device_name}' error: {err}",),
