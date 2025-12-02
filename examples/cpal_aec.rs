@@ -102,13 +102,34 @@ fn generate_probe_tone_16k_with_freqs(duration_ms: f32, freqs: &[f32]) -> Vec<f3
 }
 
 /// Convenience: derive a distinct probe for each device index by nudging the frequencies.
-/// Keeps tones in the 1–3.5 kHz band (works at 16 kHz sample rate).
-fn generate_probe_tone_16k_for_device(device_index: usize, duration_ms: f32) -> Vec<f32> {
+/// Keeps tones in the 1–3.5 kHz band (works at typical 16–48 kHz sample rates).
+fn generate_probe_tone_for_device(device_index: usize, duration_ms: f32, sample_rate: f32) -> Vec<f32> {
     let base = [1_000.0f32, 1_800.0f32, 2_600.0f32];
     // Small offset per device to make correlation peaks separable.
     let offset = (device_index as f32 % 5.0) * 120.0;
     let freqs: Vec<f32> = base.iter().map(|f| f + offset).collect();
-    generate_probe_tone_16k_with_freqs(duration_ms, &freqs)
+    generate_probe_tone_with_freqs(duration_ms, sample_rate, &freqs)
+}
+
+/// Generate a short, Hann-windowed multi-tone probe at arbitrary sample rate.
+/// Pass distinct frequency sets per device to keep probes identifiable.
+fn generate_probe_tone_with_freqs(duration_ms: f32, sample_rate: f32, freqs: &[f32]) -> Vec<f32> {
+    if freqs.is_empty() || sample_rate <= 0.0 {
+        return Vec::new();
+    }
+    let samples = (duration_ms * sample_rate / 1000.0).ceil().max(1.0) as usize;
+    let mut buf = Vec::with_capacity(samples);
+    for n in 0..samples {
+        let t = n as f32 / sample_rate;
+        let w = 0.5
+            * (1.0
+                - (2.0 * PI * n as f32 / (samples.saturating_sub(1).max(1) as f32)).cos());
+        let sum = freqs
+            .iter()
+            .fold(0.0f32, |acc, f| acc + (2.0 * PI * f * t).sin());
+        buf.push(w * (sum / freqs.len() as f32) * 0.25);
+    }
+    buf
 }
 
 /// Brute-force normalized cross-correlation to detect which device probe is present and where it starts.
@@ -847,6 +868,8 @@ enum OutputStreamMessage {
 // because that ensures that multi-channel audio is synchronized properly
 // when sent to output device
 struct OutputStreamAlignerProducer {
+    host_id: HostId,
+    device_name: String,
     channels: usize,
     device_sample_rate: u32,
     output_stream_sender: mpsc::Sender<OutputStreamMessage>,
@@ -855,8 +878,10 @@ struct OutputStreamAlignerProducer {
 
 impl OutputStreamAlignerProducer {
 
-    fn new(channels: usize, device_sample_rate: u32, output_stream_sender: mpsc::Sender<OutputStreamMessage>) -> Self {
+    fn new(host_id: HostId, device_name: String, channels: usize, device_sample_rate: u32, output_stream_sender: mpsc::Sender<OutputStreamMessage>) -> Self {
         Self {
+            host_id: host_id,
+            device_name: device_name,
             channels: channels,
             device_sample_rate: device_sample_rate,
             output_stream_sender: output_stream_sender,
@@ -1257,6 +1282,8 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
     let (output_stream_sender, output_stream_receiver) = mpsc::channel::<OutputStreamMessage>();
 
     let output_producer = OutputStreamAlignerProducer::new(
+        device_config.host_id,
+        device_config.device_name.clone(),
         device_config.channels, // channels
         device_config.sample_rate, // device_sample_rate
         output_stream_sender
@@ -1473,8 +1500,10 @@ impl AecStream {
         // 1) Emit a distinct probe on each output device (all channels).
         let mut starts_by_output: HashMap<usize, usize> = HashMap::new();
         let streams = Vec::new();
-        for (idx, (name, producer)) in output_producers.iter_mut().enumerate() {
-            let tone = generate_probe_tone_16k_for_device(idx, tone_ms);
+        for key in &self.sorted_output_aligners {
+            // find which producer.device_name == key and go in that order
+        for (idx, producer) in output_producers.iter_mut().enumerate() {
+            let tone = generate_probe_tone_for_device(idx, tone_ms, sample_rate);
             if tone.is_empty() { continue; }
 
             // map tone input channel to every output channel for the probe
@@ -1486,12 +1515,11 @@ impl AecStream {
                 1, // 1 channel
                 channel_map,
                 2,                           // seconds of buffer for this probe
-                16000, // tone sample rate
+                sample_rate, // tone sample rate
                 5,                           // resampler quality
             )?;
             let stream = producer.queue_audio(stream, &tone);
             streams.push((stream_id, stream));
-            let _ = name; // kept if you want to log
         }
 
         // 2) Capture ~3s of aligned input/output/aec data.
@@ -1499,13 +1527,7 @@ impl AecStream {
         let deadline = Instant::now() + Duration::from_secs_f32(capture_secs);
         while Instant::now() < deadline {
             let (input_slices, output_slices, aec_out) = self.update_debug()?; // we only need input/output; using input_audio_buffer below
-            for (dev_name, aligner) in self.input_aligners.iter() {
-                let needed = self.aec_config.frame_size * aligner.channels;
-                let (ok, chunk) = aligner.get_chunk_to_read(needed);
-                if ok && !chunk.is_empty() {
-                    captured_inputs.entry(dev_name.clone()).or_default().extend_from_slice(chunk);
-                }
-            }
+            // use input_slices and output_slices and store them to an array, that's our input and output device data
         }
 
         // 3) Detect probes and compute offsets relative to output device 0.
