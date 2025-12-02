@@ -2014,7 +2014,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for &s in aec_applied { aec_wav.write_sample(s)?; }
     }
 
-    for _i in 0..10000 {
+    for _i in 0..1000 {
         let (aligned_input, aligned_output, aec_applied) = stream.update_debug()?;
         for &s in aligned_input { in_wav.write_sample(s)?; }
         for &s in aligned_output { out_wav.write_sample(s)?; }
