@@ -50,6 +50,7 @@ use ringbuf::storage::Heap;
 use speex_rust_aec::{
     speex_echo_cancellation, EchoCanceller, Resampler,
 };
+use std::f32::consts::PI;
 
 use std::time::{UNIX_EPOCH, SystemTime};
 use hound::{WavReader,SampleFormat as HoundSampleFormat, WavSpec, WavWriter};
@@ -76,6 +77,80 @@ fn frames_to_micros(frames: u128, sample_rate: u128) -> u128 {
     // frames = (microseconds * sample_rate / 1 000 000)
     // frames * 1_000_000 = microseconds * sample_rate
     frames * 1000000 / sample_rate // = microseconds
+}
+
+/// Generate a short, Hann-windowed multi-tone probe at 16 kHz sample rate.
+/// Pass distinct frequency sets per device to keep probes identifiable.
+fn generate_probe_tone_16k_with_freqs(duration_ms: f32, freqs: &[f32]) -> Vec<f32> {
+    if freqs.is_empty() {
+        return Vec::new();
+    }
+    let sample_rate = 16_000.0f32;
+    let samples = (duration_ms * sample_rate / 1000.0).ceil().max(1.0) as usize;
+    let mut buf = Vec::with_capacity(samples);
+    for n in 0..samples {
+        let t = n as f32 / sample_rate;
+        let w = 0.5
+            * (1.0
+                - (2.0 * PI * n as f32 / (samples.saturating_sub(1).max(1) as f32)).cos());
+        let sum = freqs
+            .iter()
+            .fold(0.0f32, |acc, f| acc + (2.0 * PI * f * t).sin());
+        buf.push(w * (sum / freqs.len() as f32) * 0.25);
+    }
+    buf
+}
+
+/// Convenience: derive a distinct probe for each device index by nudging the frequencies.
+/// Keeps tones in the 1–3.5 kHz band (works at 16 kHz sample rate).
+fn generate_probe_tone_16k_for_device(device_index: usize, duration_ms: f32) -> Vec<f32> {
+    let base = [1_000.0f32, 1_800.0f32, 2_600.0f32];
+    // Small offset per device to make correlation peaks separable.
+    let offset = (device_index as f32 % 5.0) * 120.0;
+    let freqs: Vec<f32> = base.iter().map(|f| f + offset).collect();
+    generate_probe_tone_16k_with_freqs(duration_ms, &freqs)
+}
+
+/// Brute-force normalized cross-correlation to detect which device probe is present and where it starts.
+/// Returns (device_index, start_sample, score) if a match is found.
+fn detect_probe_tone_16k(input: &[f32], num_devices: usize, duration_ms: f32) -> Option<(usize, usize, f32)> {
+    if num_devices == 0 {
+        return None;
+    }
+    let mut best: Option<(usize, usize, f32)> = None;
+    for device in 0..num_devices {
+        let probe = generate_probe_tone_16k_for_device(device, duration_ms);
+        if probe.is_empty() || probe.len() > input.len() {
+            continue;
+        }
+        let probe_energy = probe.iter().map(|v| v * v).sum::<f32>();
+        if probe_energy == 0.0 {
+            continue;
+        }
+        let window = probe.len();
+        let mut window_energy: f32 = input[..window].iter().map(|v| v * v).sum();
+        let mut start = 0usize;
+        while start + window <= input.len() {
+            let dot: f32 = input[start..start + window]
+                .iter()
+                .zip(probe.iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            let denom = (window_energy * probe_energy).sqrt();
+            let score = if denom > 0.0 { dot / denom } else { 0.0 };
+            if best.map_or(true, |(_, _, s)| score > s) {
+                best = Some((device, start, score));
+            }
+            start += 1;
+            if start + window <= input.len() {
+                // update window energy incrementally
+                let removed = input[start - 1];
+                let added = input[start + window - 1];
+                window_energy += added * added - removed * removed;
+            }
+        }
+    }
+    best
 }
 
 /// Producer-side sibling to `BufferedCircularProducer`.
@@ -1375,14 +1450,104 @@ impl AecStream {
         Ok(())
     }
 
+    fn calibrate(&mut self, output_producers: Vec<OutputStreamAlignerProducer>) {
+        // code goes here
+        // it should generate one tone for each device
+        // then play the tone on all channels of that devices
+        // then recieve input buffer data via update_debug
+        // until we have recieved 3 seconds of data
+        // now we'll have a buffer for every input device and every output device
+        // so we can detect where the tones were played
+        // We want to align everything to output device 0
+        // so final outputs should be an offset in ms (positive or negative)
+        // that if applied to that device, aligns its audio with output device 0
+        let sample_rate = self.aec_config.target_sample_rate as f32;
+        let tone_ms = 8.0;
+        let capture_secs = 3.0;
+
+        let (start_micros, end_micros) = {
+            let (_, start_micros, end_micros) = self.update();
+            (start_micros, end_micros)
+        };
+        
+        // 1) Emit a distinct probe on each output device (all channels).
+        let mut starts_by_output: HashMap<usize, usize> = HashMap::new();
+        let streams = Vec::new();
+        for (idx, (name, producer)) in output_producers.iter_mut().enumerate() {
+            let tone = generate_probe_tone_16k_for_device(idx, tone_ms);
+            if tone.is_empty() { continue; }
+
+            // map tone input channel to every output channel for the probe
+            let mut channel_map = HashMap::new();
+            for ch in 0..producer.channels {
+                channel_map.insert(0, ch);
+            }
+            let (stream_id, stream) = producer.begin_audio_stream(
+                1, // 1 channel
+                channel_map,
+                2,                           // seconds of buffer for this probe
+                16000, // tone sample rate
+                5,                           // resampler quality
+            )?;
+            let stream = producer.queue_audio(stream, &tone);
+            streams.push((stream_id, stream));
+            let _ = name; // kept if you want to log
+        }
+
+        // 2) Capture ~3s of aligned input/output/aec data.
+        let mut captured_inputs: HashMap<String, Vec<f32>> = HashMap::new();
+        let deadline = Instant::now() + Duration::from_secs_f32(capture_secs);
+        while Instant::now() < deadline {
+            let (input_slices, output_slices, aec_out) = self.update_debug()?; // we only need input/output; using input_audio_buffer below
+            for (dev_name, aligner) in self.input_aligners.iter() {
+                let needed = self.aec_config.frame_size * aligner.channels;
+                let (ok, chunk) = aligner.get_chunk_to_read(needed);
+                if ok && !chunk.is_empty() {
+                    captured_inputs.entry(dev_name.clone()).or_default().extend_from_slice(chunk);
+                }
+            }
+        }
+
+        // 3) Detect probes and compute offsets relative to output device 0.
+        let mut offsets_ms = HashMap::new();
+        let mut ref_start: Option<usize> = None;
+        for (dev_name, buf) in captured_inputs.iter() {
+            if let Some((dev_idx, start, score)) =
+                detect_probe_tone_16k(buf, output_producers.len(), tone_ms)
+            {
+                if dev_idx == 0 {
+                    ref_start = Some(start);
+                }
+                offsets_ms.insert((dev_idx, dev_name.clone()), start);
+                println!("Probe hit on {dev_name} for out#{dev_idx} at {start} (score {score})");
+            }
+        }
+        let Some(ref_start) = ref_start else {
+            eprintln!("No reference probe detected; cannot compute offsets");
+            return Ok(HashMap::new());
+        };
+
+        // Convert to ms offsets relative to output 0.
+        let mut result = HashMap::new();
+        for ((dev_idx, dev_name), start) in offsets_ms {
+            let delta_samples = start as i64 - ref_start as i64;
+            let delta_ms = delta_samples as f32 * 1000.0 / sample_rate;
+            result.insert(format!("out#{dev_idx}:{dev_name}"), delta_ms);
+        }
+        Ok(result)
+    }
+
     // calls update, but returns all involved audio buffers
     // (if needed for diagnostic reasons, usually .update() (which returns aec'd inputs) should be all you need)
-    fn update_debug(&mut self) -> Result<(&[i16], &[i16], &[f32]), Box<dyn std::error::Error>> {
-        self.update()?;
-        return Ok((self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), self.aec_out_audio_buffer.as_slice()));
-    } 
+    fn update_debug(&mut self) -> Result<(&[i16], &[i16], &[f32], u128, u128), Box<dyn std::error::Error>> {
+        let (start_time, end_time) = {
+            let (_, start_time, end_time) = self.update()?;
+            (start_time, end_time)
+        }
+        return Ok((self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), self.aec_out_audio_buffer.as_slice(), start_time, end_time));
+    }
 
-    fn update(&mut self) -> Result<&[f32], Box<dyn std::error::Error>> {
+    fn update(&mut self) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
         let chunk_size = self.aec_config.frame_size;
         let start_micros = if let Some(start_micros_value) = self.start_micros {
             start_micros_value
@@ -1572,7 +1737,7 @@ impl AecStream {
         //println!("{diff} chunk_size {frame_size_seconds}");
      
 
-        Ok(self.aec_out_audio_buffer.as_slice())
+        Ok(self.aec_out_audio_buffer.as_slice(), chunk_start_micros, chunk_end_micros)
     }
     fn write_channel_from_f32(
         src: &[f32],
@@ -2025,6 +2190,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         // that device will have more samples written
         // which makes it annoying to check alignments in audacity
     }
+
+    stream.calibrate();
 
     for _i in 0..1000 {
         let (aligned_input, aligned_output, aec_applied) = stream.update_debug()?;
