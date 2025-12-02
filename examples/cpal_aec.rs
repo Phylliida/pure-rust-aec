@@ -508,7 +508,7 @@ impl StreamAlignerResampler {
 
         // the main downside of this is that it'll be persistently behind by 0.6ms or so (the resample frame size), but we'll quickly adjust for that so this shouldn't be a major issue
         // todo: think about how to fix this better (maybe current solution is as good as we can do, and it should average out to correct since past ones accumulated will result in more for this one, still, it's likely to stay behind by this amount)
-        self.total_emitted_frames += produced as u128;
+        self.total_emitted_frames += (produced / self.channels) as u128;
 
         Ok((consumed, produced))
     }
@@ -562,7 +562,7 @@ struct StreamAlignerConsumer {
     thread_message_sender: mpsc::Sender<AudioBufferMetadata>,
     finished_message_reciever: mpsc::Receiver<ResamplingMetadata>,
     initial_metadata: Vec<ResamplingMetadata>,
-    samples_recieved: u128,
+    frames_recieved: u128,
     calibrated: bool,
 }
 
@@ -575,7 +575,7 @@ impl StreamAlignerConsumer {
             thread_message_sender: thread_message_sender,
             finished_message_reciever: finished_message_reciever,
             initial_metadata: Vec::new(),
-            samples_recieved: 0,
+            frames_recieved: 0,
             calibrated: false,
         }
     }
@@ -594,7 +594,7 @@ impl StreamAlignerConsumer {
                             self.calibrated = calibrated;
                             // this is fine to just accumulate since we don't add any more after we are done with calibration
                             self.initial_metadata.push(msg.clone());
-                            self.samples_recieved += frames_recieved as u128;
+                            self.frames_recieved += frames_recieved as u128;
                         }
                     }
                 }
@@ -611,16 +611,17 @@ impl StreamAlignerConsumer {
 
         // we need to skip ahead to be frame aligned
         if self.calibrated {
-            let num_samples_that_are_behind_current_packet = self.num_samples_that_are_behind_current_packet(micros_packet_finished, size);
-            let available_samples = self.samples_recieved as i128 - (num_samples_that_are_behind_current_packet as i128);
+            let size_in_frames = size / self.channels;
+            let num_frames_that_are_behind_current_packet = self.num_frames_that_are_behind_current_packet(micros_packet_finished, size_in_frames);
+            let available_frames = self.frames_recieved as i128 - (num_frames_that_are_behind_current_packet as i128);
             
-            if available_samples < size as i128 {
+            if available_frames < size_in_frames as i128 {
                 // we will be able to get all samples for this packet, block until we get them
-                if num_samples_that_are_behind_current_packet > 0 {
+                if num_frames_that_are_behind_current_packet > 0 {
                     // skip ahead so we are only getting samples for this packet
-                    self.final_audio_buffer_consumer.finish_read(num_samples_that_are_behind_current_packet as usize);
-                    let additional_samples_needed = (size as i128) - available_samples;
-                    let (_read_success, _samples) = self.get_chunk_to_read(additional_samples_needed as usize);
+                    self.final_audio_buffer_consumer.finish_read((num_frames_that_are_behind_current_packet * self.channels as u128) as usize);
+                    let additional_frames_needed = (size_in_frames as i128) - available_frames;
+                    let (_read_success, _samples) = self.get_chunk_to_read((additional_frames_needed * self.channels as i128) as usize);
                     true // we will read them again later, at which point we will do finish_read (this is delibrate reading them twice)
                 }
                 // we started in the middle of this packet, we can't get enough, wait until next packet
@@ -630,7 +631,7 @@ impl StreamAlignerConsumer {
             }
             else {
                 // enough samples! ignore the ones we need to ignore and then let the sampling happen elsewhere
-                self.final_audio_buffer_consumer.finish_read(num_samples_that_are_behind_current_packet as usize);
+                self.final_audio_buffer_consumer.finish_read(num_frames_that_are_behind_current_packet as usize);
                 true
             }
         } else {
@@ -638,15 +639,15 @@ impl StreamAlignerConsumer {
         }
     }
 
-    fn num_samples_that_are_behind_current_packet(&self, micros_packet_finished: u128, size: usize) -> u128 {
-        let micros_packet_started = micros_packet_finished - frames_to_micros(size as u128, self.sample_rate as u128);
-        let mut samples_to_ignore = 0 as u128;
+    fn num_frames_that_are_behind_current_packet(&self, micros_packet_finished: u128, size_in_frames: usize) -> u128 {
+        let micros_packet_started = micros_packet_finished - frames_to_micros(size_in_frames as u128, self.sample_rate as u128);
+        let mut frames_to_ignore = 0 as u128;
         for metadata in self.initial_metadata.iter() {
             match metadata {
                 ResamplingMetadata::Arrive(frames_recieved, micros_metadata_started, micros_metadata_finished, _calibrated) => {
                     // whole packet is behind, ignore entire thing
                     if *micros_metadata_finished < micros_packet_started {
-                        samples_to_ignore += *frames_recieved as u128;
+                        frames_to_ignore += *frames_recieved as u128;
                     }
                     // keep all data
                     else if *micros_metadata_started >= micros_packet_started{
@@ -655,13 +656,13 @@ impl StreamAlignerConsumer {
                     // it overlaps, only ignore stuff before this packet
                     else {
                         let micros_ignoring = micros_packet_started - *micros_metadata_started;
-                        samples_to_ignore += micros_to_frames(micros_ignoring as u128, self.sample_rate as u128);
+                        frames_to_ignore += micros_to_frames(micros_ignoring as u128, self.sample_rate as u128);
                     }
 
                 }
             }
         }
-        samples_to_ignore
+        frames_to_ignore
     }
 
     // waits until we have at least that much data
