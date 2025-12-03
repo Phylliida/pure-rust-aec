@@ -777,14 +777,22 @@ impl StreamAlignerResampler {
 
     // do it very slowly
     fn decrease_dynamic_sample_rate(&mut self)  -> Result<(), Box<dyn std::error::Error>>  {
-        self.dynamic_output_sample_rate = (((self.output_sample_rate as f32) * 0.95) as i128).max((self.dynamic_output_sample_rate-1) as i128) as u32;
-        self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
+        if self.dynamic_output_sample_rate >= self.output_sample_rate {
+            self.dynamic_output_sample_rate -= 1;
+            println!("Decrease dynamic sample");
+        }
+        //self.dynamic_output_sample_rate = (((self.output_sample_rate as f32) * 0.95) as i128).max((self.dynamic_output_sample_rate-1) as i128) as u32;
+        //self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
         Ok(())
     }
 
     fn increase_dynamic_sample_rate(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.dynamic_output_sample_rate = (((self.output_sample_rate as f32) * 1.05) as i128).min((self.dynamic_output_sample_rate+1) as i128) as u32;
-        self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
+        if self.dynamic_output_sample_rate <= self.output_sample_rate {
+            self.dynamic_output_sample_rate += 1;
+            println!("Increase dynamic sample");
+        }
+        //self.dynamic_output_sample_rate = (((self.output_sample_rate as f32) * 1.05) as i128).min((self.dynamic_output_sample_rate+1) as i128) as u32;
+        //self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
         Ok(())
     }
 
@@ -1734,9 +1742,11 @@ impl AecStream {
             println!("Shifting {shift_needed}");
             if let Some(aligner) = self.input_aligners.get_mut(&self.sorted_input_aligners[input_index].clone()) {
                 // skip ahead that many samples (* num channels bc it is multi channel)
-                let (ok, chunk) = aligner.get_chunk_to_read((shift_needed as usize) * aligner.channels);
-                let chunk_len = chunk.len();
-                aligner.finish_read(chunk_len);
+                if shift_needed > 0 {
+                    let (ok, chunk) = aligner.get_chunk_to_read((shift_needed as usize) * aligner.channels);
+                    let chunk_len = chunk.len();
+                    aligner.finish_read(chunk_len);
+                }
             }
         }
         Ok(())
@@ -2134,9 +2144,18 @@ impl AecStream {
                     //self.output_audio_buffer[i] = Self::f32_to_i16(output_audio_tmp[i]);
                 }
                 
-
-                //aec.cancel_frame(&self.input_audio_buffer[..chunk_size], &self.output_audio_buffer[..chunk_size], &mut self.aec_audio_buffer[..chunk_size]);
-                aec.cancel_frame(self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), &mut self.aec_audio_buffer.as_mut_slice());
+                // skip ahead if no output, as there's nothing to cancel
+                // this helps avoid needing to recalibrate every time we recieve audio
+                let output_energy = Self::energy(&self.output_audio_buffer);
+                let input_energy = Self::energy(&self.input_audio_buffer);
+                if energy < 0.003 {
+                    println!("skipping with energy {energy}");
+                    self.aec_audio_buffer.copy_from_slice(&self.input_audio_buffer);
+                }
+                else {
+                    //aec.cancel_frame(&self.input_audio_buffer[..chunk_size], &self.output_audio_buffer[..chunk_size], &mut self.aec_audio_buffer[..chunk_size]);
+                    aec.cancel_frame(self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), &mut self.aec_audio_buffer.as_mut_slice());
+                }
                 
                 /*
                 unsafe {
@@ -2164,6 +2183,11 @@ impl AecStream {
 
         Ok((self.aec_out_audio_buffer.as_slice(), chunk_start_micros, chunk_end_micros))
     }
+    
+    fn energy(buf: &[i16]) -> f64 {
+        buf.iter().map(|s| (f32::from_sample(*s)*f32::from_sample(*s)) as f64).sum::<f64>() / buf.len() as f64
+    }
+
     fn write_channel_from_f32(
         src: &[f32],
         channel: usize,
@@ -2606,7 +2630,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (_stream_id, mut stream_output) = stream_output_creator.begin_audio_stream(
         wav_channels as usize,
         channel_map,
-        ((wav_samples.len()/(wav_rate as usize) + 1)*2) as u32, // audio_buffer_seconds, needs to be long enough to hold all the audio
+        ((wav_samples.len()/(wav_rate as usize) + 1)*2000) as u32, // audio_buffer_seconds, needs to be long enough to hold all the audio
         wav_rate,
         resampler_quality
     )?;
@@ -2624,14 +2648,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     stream.calibrate(std::slice::from_mut(&mut stream_output_creator), true)?;
     println!("calibrated");
 
+    let silence = vec![0.0f32; wav_samples.len()];
     // enqueues audio samples to be played after each other
     stream_output.queue_audio(wav_samples.as_slice());
+    stream_output.queue_audio(&silence);
+    stream_output.queue_audio(&silence);
     stream_output.queue_audio(wav_samples.as_slice());
+    stream_output.queue_audio(&silence);
+    stream_output.queue_audio(&silence);
     stream_output.queue_audio(wav_samples.as_slice());
+    stream_output.queue_audio(&silence);
     stream_output.queue_audio(wav_samples.as_slice());
 
 
-    for _i in 0..500 {
+    for _i in 0..3000 {
         let num_input_channels = stream.num_input_channels();
         let (aligned_input, aligned_output, aec_applied, _start_time, _end_time) = stream.update_debug()?;
         let chunk_size = aligned_input.len() / num_input_channels;
