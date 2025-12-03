@@ -51,6 +51,8 @@ use speex_rust_aec::{
     speex_echo_cancellation, EchoCanceller, Resampler,
 };
 use std::f32::consts::PI;
+use rustfft::{FftPlanner};
+use rustfft::num_complex::Complex32;
 
 use std::time::{UNIX_EPOCH, SystemTime};
 use hound::{WavReader,SampleFormat as HoundSampleFormat, WavSpec, WavWriter};
@@ -132,57 +134,150 @@ fn generate_probe_tone_with_freqs(duration_ms: f32, sample_rate: f32, freqs: &[f
     buf
 }
 
-/// Brute-force normalized cross-correlation to detect each device probe and where it starts.
-/// `input_channels` is used to stride the interleaved data; detection runs on channel 0.
+/// Probe detection using GCC-PHAT to estimate lag between the captured stream and each probe.
 /// Returns best (device_index, start_sample, score) per device that produced a valid match.
-fn detect_probe_tones(input: &[f32], input_channels: usize, num_devices: usize, duration_ms: f32, sample_rate: f32) -> Vec<(usize, usize, f32)> {
+fn detect_probe_tones(input_mono: &[f32], num_devices: usize, duration_ms: f32, sample_rate: f32) -> Vec<(usize, i64, f32)> {
     let mut results = Vec::new();
-    if num_devices == 0 || input.is_empty() || input_channels == 0 {
+    if num_devices == 0 || input_mono.is_empty() {
         return results;
-    }
-    // de-interleave channel 0 for detection simplicity
-    let mut mono = Vec::with_capacity(input.len() / input_channels);
-    for frame in input.chunks(input_channels) {
-        mono.push(frame[0]);
     }
 
     for device in 0..num_devices {
         let probe = generate_probe_tone_for_device(device, duration_ms, sample_rate);
-        if probe.is_empty() || probe.len() > mono.len() {
+        if probe.is_empty() || probe.len() > input_mono.len() {
             continue;
         }
-        let probe_energy = probe.iter().map(|v| v * v).sum::<f32>();
-        if probe_energy == 0.0 {
-            continue;
-        }
-        let window = probe.len();
-        let mut window_energy: f32 = mono[..window].iter().map(|v| v * v).sum();
-        let mut best: Option<(usize, f32)> = None; // (start, score)
-        let mut start = 0usize;
-        while start + window <= mono.len() {
-            let dot: f32 = mono[start..start + window]
-                .iter()
-                .zip(probe.iter())
-                .map(|(a, b)| a * b)
-                .sum();
-            let denom = (window_energy * probe_energy).sqrt();
-            let score = if denom > 0.0 { dot / denom } else { 0.0 };
-            if best.map_or(true, |(_, s)| score > s) {
-                best = Some((start, score));
-            }
-            start += 1;
-            if start + window <= mono.len() {
-                // update window energy incrementally
-                let removed = mono[start - 1];
-                let added = mono[start + window - 1];
-                window_energy += added * added - removed * removed;
-            }
-        }
-        if let Some((start, score)) = best {
-            results.push((device, start, score));
+        // Pad probe to match captured length for GCC-PHAT.
+        let mut probe_padded = vec![0.0f32; input_mono.len()];
+        probe_padded[..probe.len()].copy_from_slice(&probe);
+        let margin = input_mono.len().saturating_sub(1);
+        if let Some((lag, score)) = gcc_phat_delay(&input_mono, &probe_padded, margin) {
+            // positive lag means probe leads capture; convert to start index in capture
+            println!("Got lag {lag} {score}");
+            results.push((device, -lag, score));
         }
     }
     results
+}
+
+/// Cross-correlate `input` with `probe` using FFT convolution.
+/// Returns (start_index, normalized_score) for the best match.
+fn detect_probe_fft(input: &[f32], probe: &[f32]) -> Option<(usize, f32)> {
+    if probe.is_empty() || probe.len() > input.len() {
+        return None;
+    }
+
+    let probe_energy = probe.iter().map(|v| v * v).sum::<f32>();
+    if probe_energy == 0.0 {
+        return None;
+    }
+
+    // Build reversed probe for correlation.
+    let mut b: Vec<Complex32> = probe
+        .iter()
+        .rev()
+        .map(|&v| Complex32::new(v, 0.0))
+        .collect();
+    let mut a: Vec<Complex32> = input.iter().map(|&v| Complex32::new(v, 0.0)).collect();
+
+    let conv_len = a.len() + b.len() - 1;
+    let n_fft = conv_len.next_power_of_two();
+    a.resize(n_fft, Complex32::ZERO);
+    b.resize(n_fft, Complex32::ZERO);
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(n_fft);
+    let ifft = planner.plan_fft_inverse(n_fft);
+
+    fft.process(&mut a);
+    fft.process(&mut b);
+    for (ai, bi) in a.iter_mut().zip(b.iter()) {
+        *ai *= *bi;
+    }
+    ifft.process(&mut a);
+
+    let scale = 1.0 / (n_fft as f32);
+
+    // Precompute input window energies for normalization.
+    let mut prefix_energy = Vec::with_capacity(input.len() + 1);
+    prefix_energy.push(0.0f32);
+    for &v in input {
+        let last = *prefix_energy.last().unwrap();
+        prefix_energy.push(last + v * v);
+    }
+
+    let mut best: Option<(usize, f32)> = None;
+    let valid_starts = input.len() - probe.len() + 1;
+    for lag in 0..valid_starts {
+        // correlation index aligned to lag
+        let idx = lag + probe.len() - 1;
+        let corr = a[idx].re * scale;
+        let win_energy = prefix_energy[lag + probe.len()] - prefix_energy[lag];
+        let denom = (win_energy * probe_energy).sqrt();
+        let score = if denom > 0.0 { corr / denom } else { 0.0 };
+        if best.map_or(true, |(_, s)| score > s) {
+            best = Some((lag, score));
+        }
+    }
+    best
+}
+
+/// GCC-PHAT delay estimator between two real signals.
+/// Returns (lag_in_samples, score), where positive lag means `sigb` leads `siga`.
+fn gcc_phat_delay(siga: &[f32], sigb: &[f32], margin: usize) -> Option<(i64, f32)> {
+    let n = siga.len().min(sigb.len());
+    if n == 0 {
+        return None;
+    }
+    let n_fft = n.next_power_of_two().max(1);
+
+    let mut a: Vec<Complex32> = vec![Complex32::ZERO; n_fft];
+    let mut b: Vec<Complex32> = vec![Complex32::ZERO; n_fft];
+    for (i, &v) in siga.iter().take(n).enumerate() {
+        a[i].re = v;
+    }
+    for (i, &v) in sigb.iter().take(n).enumerate() {
+        b[i].re = v;
+    }
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft_fwd = planner.plan_fft_forward(n_fft);
+    let fft_inv = planner.plan_fft_inverse(n_fft);
+
+    fft_fwd.process(&mut a);
+    fft_fwd.process(&mut b);
+
+    for (ai, bi) in a.iter_mut().zip(b.iter()) {
+        let mut v = *bi * ai.conj();
+        let mag = v.norm() + 1e-12;
+        v /= mag;
+        *ai = v;
+    }
+
+    fft_inv.process(&mut a);
+
+    let scale = 1.0 / (n_fft as f32);
+    let mut corr: Vec<f32> = a.iter().map(|c| c.re * scale).collect();
+
+    // fftshift so zero-lag is centered
+    let mut shifted = vec![0.0f32; n_fft];
+    let mid = n_fft / 2;
+    for i in 0..n_fft {
+        shifted[i] = corr[(i + mid) % n_fft];
+    }
+
+    let center = mid;
+    let max_margin = center.min(n_fft - center - 1);
+    let m = margin.min(max_margin);
+    let start = center.saturating_sub(m);
+    let end = (center + m + 1).min(n_fft);
+
+    let (rel_idx, &best_val) = shifted[start..end]
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+    let lag = (start + rel_idx) as i64 - center as i64;
+    Some((lag, best_val))
 }
 
 /// Producer-side sibling to `BufferedCircularProducer`.
@@ -870,9 +965,27 @@ fn create_stream_aligner(channels: usize, input_sample_rate: u32, output_sample_
 type StreamId = u64;
 
 enum OutputStreamMessage {
-    Add(StreamId, u32, usize, HashMap<usize, usize>, ResampledBufferedCircularProducer, ringbuf::HeapCons<f32>),
+    Add(StreamId, u32, usize, HashMap<usize, Vec<usize>>, ResampledBufferedCircularProducer, ringbuf::HeapCons<f32>),
     Remove(StreamId),
     InterruptAll(),
+}
+
+struct StreamProducer {
+    producer: HeapProd<f32>
+}
+
+impl StreamProducer {
+    fn new(producer: HeapProd<f32>) -> Self {
+        Self {
+            producer: producer
+        }
+    }
+    fn queue_audio(&mut self, audio_data: &[f32]) {
+        let num_pushed = self.producer.push_slice(audio_data);
+        if num_pushed < audio_data.len() {
+            eprintln!("Error: output audio buffer got behind, try increasing buffer size");
+        }
+    }
 }
 
 // we only have one per device (instead of one per channel)
@@ -900,7 +1013,7 @@ impl OutputStreamAlignerProducer {
         }
     }
 
-    fn begin_audio_stream(&self, channels: usize, channel_map: HashMap<usize, usize>, audio_buffer_seconds: u32, sample_rate: u32, resampler_quality: i32) -> Result<(StreamId, HeapProd<f32>), Box<dyn Error>> {
+    fn begin_audio_stream(&self, channels: usize, channel_map: HashMap<usize, Vec<usize>>, audio_buffer_seconds: u32, sample_rate: u32, resampler_quality: i32) -> Result<(StreamId, StreamProducer), Box<dyn Error>> {
         // this assigns unique ids in a thread-safe way
         let stream_index = self.cur_stream_id.fetch_add(1, Ordering::Relaxed);
         let (producer, consumer) = HeapRb::<f32>::new((audio_buffer_seconds * sample_rate * (channels as u32)) as usize).split();
@@ -917,7 +1030,7 @@ impl OutputStreamAlignerProducer {
         )?;
 
         self.output_stream_sender.send(OutputStreamMessage::Add(stream_index, sample_rate, channels, channel_map, resampled_producer, resampled_consumer))?;
-        Ok((stream_index, producer))
+        Ok((stream_index, StreamProducer::new(producer)))
     }
 
     fn queue_audio(&self, mut audio_producer: HeapProd<f32>, audio_data: &[f32]) -> HeapProd<f32> {
@@ -946,7 +1059,7 @@ struct OutputStreamAlignerMixer {
     frame_size: u32,
     device_audio_producer: BufferedCircularProducer<f32>,
     resampled_audio_buffer_producer: StreamAlignerProducer,
-    stream_consumers: HashMap<StreamId, (u32, usize, HashMap<usize, usize>, ResampledBufferedCircularProducer, BufferedCircularConsumer<f32>)>,
+    stream_consumers: HashMap<StreamId, (u32, usize, HashMap<usize, Vec<usize>>, ResampledBufferedCircularProducer, BufferedCircularConsumer<f32>)>,
     output_stream_receiver: mpsc::Receiver<OutputStreamMessage>,
 }
 
@@ -1008,17 +1121,19 @@ impl OutputStreamAlignerMixer {
             let dst_stride = self.channels;
             let src_stride = *channels;
             // map virtual channels to real channels via channel_map
-            for (s_idx, dst_ch) in channel_map.iter() {
-                if *dst_ch >= self.channels { continue; } // guard bad maps
-                let mut dst = *dst_ch as usize;
-                let mut src_idx = *s_idx as usize;
-                for _ in 0..frames {
-                    // just add to mix, do not average or clamp. Average results in too quiet, clamp is non-linear (so confuses eac, which only works with linear transformations), 
-                    // (fyi, resample is a linear operation in speex so it's safe to do while using eac)
-                    // see this https://dsp.stackexchange.com/a/3603
-                    device_buf_write[dst] += buf_from_stream[src_idx];
-                    dst += dst_stride;
-                    src_idx += src_stride;
+            for (s_idx, dst_chs) in channel_map.iter() {
+                for dst_ch in dst_chs.iter() {
+                    if *dst_ch >= self.channels { continue; } // guard bad maps
+                    let mut dst = *dst_ch as usize;
+                    let mut src_idx = *s_idx as usize;
+                    for _ in 0..frames {
+                        // just add to mix, do not average or clamp. Average results in too quiet, clamp is non-linear (so confuses eac, which only works with linear transformations), 
+                        // (fyi, resample is a linear operation in speex so it's safe to do while using eac)
+                        // see this https://dsp.stackexchange.com/a/3603
+                        device_buf_write[dst] += buf_from_stream[src_idx];
+                        dst += dst_stride;
+                        src_idx += src_stride;
+                    }
                 }
             }
             let num_read = frames * (*channels);
@@ -1489,13 +1604,17 @@ impl AecStream {
         Ok(())
     }
 
-    fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer]) -> Result<(HashMap<usize, f32>, HashMap<String, HashMap<usize, f32>>), Box<dyn std::error::Error>> {
+    fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(Vec<usize, Option<i64>>, Vec<usize, Vec<usize, Option<i64>>>), Box<dyn std::error::Error>> {
         let sample_rate = self.aec_config.target_sample_rate as f32;
-        let tone_ms = 8.0;
+        // Probe length (~0.1s) to stay quick but audible.
+        let tone_ms = 100.0;
         let capture_secs = 3.0;
 
         // 1) Emit a distinct probe on each output device (all channels), in sorted output order.
         let mut active_streams: Vec<(usize, usize, StreamId)> = Vec::new();
+        let mut tones = Vec::new();
+        let mut streams = Vec::new();
+
         for (idx, dev_name) in self.sorted_output_aligners.clone().iter().enumerate() {
             let Some(producer) = output_producers
                 .iter_mut()
@@ -1509,9 +1628,11 @@ impl AecStream {
             }
             let channels = producer.channels;
             let mut channel_map = HashMap::new();
+            let mut out_channels = Vec::new();
             for ch in 0..channels {
-                channel_map.insert(0, ch); // map first channel to play on all channels
+                out_channels.push(ch);
             }
+            channel_map.insert(0, out_channels); // map first channel to play on all channels
             let (stream_id, stream) = producer.begin_audio_stream(
                 1, // 1 channel
                 channel_map,
@@ -1519,8 +1640,13 @@ impl AecStream {
                 self.aec_config.target_sample_rate,
                 5, // resampler quality
             )?;
-            let _stream = producer.queue_audio(stream, &tone_mono);
+            tones.push(tone_mono);
             active_streams.push((idx, channels, stream_id));
+            streams.push(stream);
+        }
+
+        for (mut stream, tone) in streams.into_iter().zip(tones.into_iter()) {
+            stream.queue_audio(tone.as_slice());
         }
 
         // Build channel ranges for inputs and outputs (interleaved order).
@@ -1589,70 +1715,92 @@ impl AecStream {
             }
         }
 
+        if debug_wav {
+            // write captured inputs
+            for (i, (name, _, _)) in input_channel_ranges.iter().enumerate() {
+                let sanitized = Self::sanitize_filename(name);
+                let path = format!("calib_input_{sanitized}.wav");
+                let mut writer = WavWriter::create(
+                    path,
+                    WavSpec {
+                        channels: 1,
+                        sample_rate: self.aec_config.target_sample_rate,
+                        bits_per_sample: 16,
+                        sample_format: HoundSampleFormat::Int,
+                    },
+                )?;
+                for &s in &captured_inputs[i] {
+                    writer.write_sample(Self::f32_to_i16(s))?;
+                }
+                writer.finalize()?;
+            }
+            // write captured outputs
+            for (i, (name, _, _)) in output_channel_ranges.iter().enumerate() {
+                let sanitized = Self::sanitize_filename(name);
+                let path = format!("calib_output_{sanitized}.wav");
+                let mut writer = WavWriter::create(
+                    path,
+                    WavSpec {
+                        channels: 1,
+                        sample_rate: self.aec_config.target_sample_rate,
+                        bits_per_sample: 16,
+                        sample_format: HoundSampleFormat::Int,
+                    },
+                )?;
+                for &s in &captured_outputs[i] {
+                    writer.write_sample(Self::f32_to_i16(s))?;
+                }
+                writer.finalize()?;
+            }
+        }
+
         // 4) Detect probes on outputs to compute offsets relative to output device 0.
-        let mut output_offsets: HashMap<usize, f32> = HashMap::new();
+        // mapping of output device -> offset
+        let mut output_offsets: Vec<Option<i64>> = vec![None, output_channel_ranges.len()];
+        // mapping of input device -> (output device index, output device index offset)
+        let mut input_offsets: Vec<usize, Vec<usize, Option<i64>>> = vec![vec![None; output_channel_ranges.len()], input_channel_ranges.len()];
+
         if !captured_outputs.is_empty() {
-            // First detect reference on output 0.
-            let mut ref_start: Option<usize> = None;
-            let det_ref = detect_probe_tones(&captured_outputs[0], 1, output_producers.len(), tone_ms, sample_rate);
-            for (dev_idx, start, score) in det_ref {
-                if dev_idx == 0 {
-                    println!("Output probe out#0 at {start} (score {score})");
-                    ref_start = Some(start);
-                    break;
+            for (dev_idx, buf) in captured_outputs.iter().enumerate() {
+                let detections = detect_probe_tones(buf, output_producers.len(), tone_ms, sample_rate);
+                let mut start_for_dev: Option<(i64, f32)> = None;
+                for (d_idx, start, score) in detections {
+                    if d_idx == dev_idx { // just detect this device, no others should show up since it just forwards the data
+                        start_for_dev = Some((start, score));
+                        break;
+                    }
+                }
+                if let Some((start, score)) = start_for_dev {
+                    println!("Output {dev_idx} has offset {start} with score {score}");
+                    output_offsets[dev_idx] = start;
+                } else {
+                    eprintln!("No probe detected for output device index {dev_idx}");
                 }
             }
-            if let Some(ref_start) = ref_start {
-                for (dev_idx, buf) in captured_outputs.iter().enumerate() {
-                    let detections = detect_probe_tones(buf, 1, output_producers.len(), tone_ms, sample_rate);
-                    let mut start_for_dev: Option<(usize, f32)> = None;
-                    for (d_idx, start, score) in detections {
-                        if d_idx == dev_idx {
-                            start_for_dev = Some((start, score));
-                            break;
-                        }
-                    }
-                    if let Some((start, score)) = start_for_dev {
-                        let delta_samples = start as i64 - ref_start as i64;
-                        let delta_ms = delta_samples as f32 * 1000.0 / sample_rate;
-                        println!("Output probe out#{dev_idx} at {start} (score {score}), offset_ms={delta_ms}");
-                        output_offsets.insert(dev_idx, delta_ms);
-                    } else {
-                        eprintln!("No probe detected for output device index {dev_idx}");
+            for (input_idx, buf) in captured_inputs.iter().enumerate() {
+                let detections = detect_probe_tones(buf, output_producers.len(), tone_ms, sample_rate);
+                let mut start_for_dev: Option<(i64, f32)> = None;
+                for (output_idx, start, score) in detections {
+                    println!("Output {output_idx} -> Input {input_idx} has offset {start} with score {score}");
+                    input_offsets[input_idx][output_idx] = Some(start);
+                }
+                for output_idx in 0..output_channel_ranges.len() {
+                    if let None = input_offsets[input_idx][output_idx] {
+                        eprintln!("No probe detected for output {output_idx} -> input {input_idx} (that input could not hear that output, is the volume too low?)");
                     }
                 }
-            } else {
-                eprintln!("No reference probe detected on outputs; skipping output offsets");
             }
         }
 
         // 5) Detect probes and compute offsets relative to output device 0, per input device.
-        let mut input_result: HashMap<String, HashMap<usize, f32>> = HashMap::new();
-        for (in_idx, (name, _start_ch, _ch_count)) in input_channel_ranges.iter().enumerate() {
-            let detections = detect_probe_tones(&captured_inputs[in_idx], 1, output_producers.len(), tone_ms, sample_rate);
-            let mut ref_start: Option<usize> = None;
-            let mut starts = HashMap::new();
-            for (dev_idx, start, score) in detections {
-                if dev_idx == 0 {
-                    ref_start = Some(start);
-                }
-                starts.insert(dev_idx, (start, score));
-            }
-            let Some(ref_start) = ref_start else {
-                eprintln!("No reference probe detected for input '{name}'; skipping");
-                continue;
-            };
+        
+        Ok((output_offsets, input_offsets))
+    }
 
-            let mut offsets = HashMap::new();
-            for (dev_idx, (start, score)) in starts {
-                let delta_samples = start as i64 - ref_start as i64;
-                let delta_ms = delta_samples as f32 * 1000.0 / sample_rate;
-                println!("Input '{name}': probe for out#{dev_idx} at {start} (score {score}), offset_ms={delta_ms}");
-                offsets.insert(dev_idx, delta_ms);
-            }
-            input_result.insert(name.clone(), offsets);
-        }
-        Ok((output_offsets, input_result))
+    fn sanitize_filename(name: &str) -> String {
+        name.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
     }
 
     // calls update, but returns all involved audio buffers
@@ -2286,7 +2434,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut channel_map = HashMap::new();
     for i in 0..wav_channels {
-        channel_map.insert(i, 0); // map all wav channels to first output channel, for testing
+        let mut mapped_to_channels = Vec::new();
+        mapped_to_channels.push(0);
+        channel_map.insert(i, mapped_to_channels); // map all wav channels to first output channel, for testing
     }
 
     let (_stream_id, mut stream_output) = stream_output_creator.begin_audio_stream(
@@ -2307,12 +2457,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!("Computing calibration");
-    let _offsets = stream.calibrate(std::slice::from_mut(&mut stream_output_creator))?;
+    let _offsets = stream.calibrate(std::slice::from_mut(&mut stream_output_creator), true)?;
     println!("calibrated");
 
     // enqueues audio samples to be played after each other
-    stream_output = stream_output_creator.queue_audio(stream_output, wav_samples.as_slice());
-    stream_output = stream_output_creator.queue_audio(stream_output, wav_samples.as_slice());
+    stream_output.queue_audio(wav_samples.as_slice());
+    stream_output.queue_audio(wav_samples.as_slice());
 
 
     for _i in 0..1000 {
