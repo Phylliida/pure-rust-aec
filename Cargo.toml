@@ -11,6 +11,7 @@ cpal-example = ["cpal"]
 
 cpal = { version = "0.15", optional = true }
 evmap = "11.0.0"
+fdaf-aec = "0.1.0"
 hound = "3.5"
 ringbuf = "0.4.8"
 rustfft = "6"

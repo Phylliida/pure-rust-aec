@@ -34,6 +34,8 @@ use std::{
     },
 };
 
+use fdaf_aec::FdafAec;
+
 use std::backtrace::Backtrace;
 
 use rustfft::{FftPlanner, num_complex::Complex};
@@ -795,12 +797,12 @@ impl StreamAlignerResampler {
         // and that simplifies logic/prevents accumulated error during calibration
         // not enough frames, we need to increase dynamic sample rate (to get more samples)
         if updated_total_frames_emitted < target_emitted_output_frames && calibrated {
-            self.increase_dynamic_sample_rate()?;
+            //self.increase_dynamic_sample_rate()?;
             // println!("Increase to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
         }
         // too many frames, we need to decrease dynamic sample rate (to get less samples)
         else if updated_total_frames_emitted > target_emitted_output_frames && calibrated {
-            self.decrease_dynamic_sample_rate()?;
+            // self.decrease_dynamic_sample_rate()?;
             // println!("Decrease to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
         }
 
@@ -1399,7 +1401,6 @@ impl OutputDeviceConfig {
         let default_config = output_device.default_output_config()?;
         let sample_rate = default_config.sample_rate().0;
         let frame_size = micros_to_frames((frame_size_millis as u128)*1000, sample_rate as u128);
-
         Ok(Self::new(
             host_id,
             output_device.name()?,
@@ -1592,7 +1593,8 @@ struct AecStream {
     input_audio_buffer: Vec<i16>,
     output_audio_buffer: Vec<i16>,
     aec_audio_buffer: Vec<i16>,
-    aec_out_audio_buffer: Vec<f32>
+    aec_out_audio_buffer: Vec<f32>,
+    aec2: Option<FdafAec>
 }
 
 impl AecStream {
@@ -1624,6 +1626,7 @@ impl AecStream {
            output_audio_buffer: Vec::new(),
            aec_audio_buffer: Vec::new(),
            aec_out_audio_buffer: Vec::new(),
+           aec2: None,
         })
     }
 
@@ -1652,12 +1655,19 @@ impl AecStream {
         self.sorted_output_aligners = self.output_aligners.keys().cloned().collect();
         self.sorted_output_aligners.sort();
 
+        //self.aec2 = Some(FdafAec::new(1024, 0.02));
+
         self.aec = if self.input_channels > 0 && self.output_channels > 0 {
-            EchoCanceller::new_multichannel(
+            /*EchoCanceller::new_multichannel(
                 self.aec_config.frame_size,
                 self.aec_config.filter_length,
                 self.input_channels,
                 self.output_channels,
+            )*/
+
+            EchoCanceller::new(
+                self.aec_config.frame_size,
+                self.aec_config.filter_length
             )
         } else {
             None
@@ -1717,10 +1727,11 @@ impl AecStream {
             }
             // take the min of the shift needed for each device (we don't ever want it to occur before the device)
             let shift_needed = if let Some(min_val) = shifts_needed.iter().min() {
-                (*min_val as i64-(self.aec_config.frame_size/2) as i64).max(0)
+                (*min_val as i64)
             } else {
                 0
             };
+            println!("Shifting {shift_needed}");
             if let Some(aligner) = self.input_aligners.get_mut(&self.sorted_input_aligners[input_index].clone()) {
                 // skip ahead that many samples (* num channels bc it is multi channel)
                 let (ok, chunk) = aligner.get_chunk_to_read((shift_needed as usize) * aligner.channels);
@@ -2044,6 +2055,8 @@ impl AecStream {
         // recieve audio data and interleave it into our buffers
         let mut input_channel = 0;
         self.input_audio_buffer.fill(0 as i16);
+        let mut input_audio_tmp = vec![0f32; chunk_size];
+
         for key in &self.sorted_input_aligners {
             if let Some(aligner) = self.input_aligners.get_mut(key) {
                 let channels = aligner.channels;
@@ -2055,8 +2068,9 @@ impl AecStream {
                     for c in 0..channels {
                         let mut src_idx = c;
                         let mut dst = input_channel + c;
-                        for _ in 0..frames {
+                        for i in 0..frames {
                             self.input_audio_buffer[dst] = Self::f32_to_i16(chunk[src_idx]);
+                            input_audio_tmp[i] += chunk[src_idx];
                             dst += self.input_channels;
                             src_idx += channels;
                         }
@@ -2076,6 +2090,7 @@ impl AecStream {
                 
             let mut output_channel = 0;
             self.output_audio_buffer.fill(0 as i16);
+            let mut output_audio_tmp = vec![0f32; chunk_size];
             for key in &self.sorted_output_aligners {
                 if let Some(aligner) = self.output_aligners.get_mut(key) {
                     let channels = aligner.channels;
@@ -2087,8 +2102,9 @@ impl AecStream {
                         for c in 0..channels {
                             let mut src_idx = c;
                             let mut dst = output_channel + c;
-                            for _ in 0..frames {
+                            for i in 0..frames {
                                 self.output_audio_buffer[dst] = Self::f32_to_i16(chunk[src_idx]);
+                                output_audio_tmp[i] += chunk[src_idx];
                                 dst += self.output_channels;
                                 src_idx += channels;
                             }
@@ -2110,6 +2126,18 @@ impl AecStream {
                     return Err("no aec".into());
                 };
 
+                //if let Some(aec2) = self.aec2 {
+                //    let output_frame = aec2.process(far_end_frame, mic_frame);
+                //}
+                for i in 0..chunk_size {
+                    self.input_audio_buffer[i] = Self::f32_to_i16(input_audio_tmp[i]);
+                    self.output_audio_buffer[i] = Self::f32_to_i16(output_audio_tmp[i]);
+                }
+                
+
+                aec.cancel_frame(&self.input_audio_buffer[..chunk_size], &self.output_audio_buffer[..chunk_size], &mut self.aec_audio_buffer[..chunk_size]);
+                
+                /*
                 unsafe {
                     speex_echo_cancellation(
                         aec.as_ptr(),
@@ -2118,6 +2146,7 @@ impl AecStream {
                         self.aec_audio_buffer.as_mut_ptr(),
                     );
                 }
+                */
                 &self.aec_audio_buffer
             }
         };
@@ -2466,8 +2495,8 @@ where
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let frame_size_ms = 10;
-    let filter_length_ms = 300;
+    let frame_size_ms = 20;
+    let filter_length_ms = 100;
     let aec_sample_rate = 16000;
     let aec_config = AecConfig::new(
         aec_sample_rate,
@@ -2497,6 +2526,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    let frame_size = stream.aec_config.frame_size;
+    println!("Frame size {frame_size}");
 
     let resampler_quality = 5;
 
@@ -2516,7 +2547,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let output_device_config = OutputDeviceConfig::from_default(
         host.id(),
-        "hdmi:CARD=NVidia,DEV=0".to_string(),
+        "default".to_string(),
         100, // history_len
         20, // calibration_packets
         20, // audio_buffer_seconds, just for resampling (actual audio buffer determined upon begin_audio_stream creation)
@@ -2529,7 +2560,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // output wav files for debugging
     let pcm_spec_input = WavSpec {
-        channels: input_device_config.channels as u16,
+        channels: 1, // input_device_config.channels as u16,
         sample_rate: aec_sample_rate, // 16_000 in your config
         bits_per_sample: 16,
         sample_format: HoundSampleFormat::Int,
@@ -2594,13 +2625,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     // enqueues audio samples to be played after each other
     stream_output.queue_audio(wav_samples.as_slice());
     stream_output.queue_audio(wav_samples.as_slice());
+    stream_output.queue_audio(wav_samples.as_slice());
+    stream_output.queue_audio(wav_samples.as_slice());
 
 
-    for _i in 0..1000 {
+    for _i in 0..1500 {
+        let num_input_channels = stream.num_input_channels();
         let (aligned_input, aligned_output, aec_applied, _start_time, _end_time) = stream.update_debug()?;
-        for &s in aligned_input { in_wav.write_sample(s)?; }
-        for &s in aligned_output { out_wav.write_sample(s)?; }
-        for &s in aec_applied { aec_wav.write_sample(s)?; }
+        let chunk_size = aligned_input.len() / num_input_channels;
+        for &s in aligned_input[..chunk_size].iter() { in_wav.write_sample(s)?; }
+        for &s in aligned_output[..chunk_size].iter() { out_wav.write_sample(s)?; }
+        for &s in aec_applied[..chunk_size].iter() { aec_wav.write_sample(s)?; }
         //println!("Got {} samples", aec_applied.len());
     }
     
