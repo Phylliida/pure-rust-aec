@@ -28,9 +28,12 @@ fn multichannel_cancels_basic_echo() {
         let t = ring_pos as f32 / 16_000.0;
         let spk0 = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 12_000.0;
         let spk1 = (2.0 * std::f32::consts::PI * 660.0 * t).sin() * 10_000.0;
-        far_end_ring[ring_pos % far_end_ring.len()] = spk0;
-        far_end_ring[(ring_pos + 1) % far_end_ring.len()] = spk1;
-        ring_pos = (ring_pos + spk_channels) % far_end_ring.len();
+        let len = far_end_ring.len();
+        let idx0 = ring_pos % len;
+        let idx1 = (ring_pos + 1) % len;
+        far_end_ring[idx0] = spk0;
+        far_end_ring[idx1] = spk1;
+        ring_pos = (ring_pos + spk_channels) % len;
     }
 
     let delay_ch0 = 32; // samples
@@ -55,17 +58,18 @@ fn multichannel_cancels_basic_echo() {
             spk_buf[base + 1] = i16_from_f32(spk1);
 
             // Push into ring buffer for delayed echo synthesis.
-            far_end_ring[ring_pos % far_end_ring.len()] = spk0;
-            far_end_ring[(ring_pos + 1) % far_end_ring.len()] = spk1;
-            ring_pos = (ring_pos + spk_channels) % far_end_ring.len();
+            let len = far_end_ring.len();
+            let idx0 = ring_pos % len;
+            let idx1 = (ring_pos + 1) % len;
+            far_end_ring[idx0] = spk0;
+            far_end_ring[idx1] = spk1;
+            ring_pos = (ring_pos + spk_channels) % len;
 
             // Read delayed samples to form mic echoes.
-            let read0 =
-                (ring_pos + far_end_ring.len() - delay_ch0 * spk_channels) % far_end_ring.len();
-            let read1 =
-                (ring_pos + far_end_ring.len() - delay_ch1 * spk_channels) % far_end_ring.len();
+            let read0 = (ring_pos + len - delay_ch0 * spk_channels) % len;
+            let read1 = (ring_pos + len - delay_ch1 * spk_channels) % len;
             let echo0 = far_end_ring[read0] * 0.6;
-            let echo1 = far_end_ring[(read1 + 1) % far_end_ring.len()] * 0.6;
+            let echo1 = far_end_ring[(read1 + 1) % len] * 0.6;
 
             // Add a little noise to avoid perfect correlation.
             let noise = ((i * 17 + frame_idx * 23) % 31) as f32 - 15.0;
