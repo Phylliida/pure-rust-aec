@@ -4,8 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+default = ["cpal-example"]
 cpal-example = ["cpal"]
+
+[lib]
+name = "melaec3"
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.maturin]
+name = "melaec3"
 
 [dependencies]
 
@@ -15,7 +22,9 @@ fdaf-aec = "0.1.0"
 hound = "3.5"
 ringbuf = "0.4.8"
 rustfft = "6"
+pyo3 = { version = "0.21", features = ["extension-module"] }
+futures = "0.3"
 
 [[example]]
-name = "cpal_aec"
+name = "cpal_example"
 required-features = ["cpal-example"]

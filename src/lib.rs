@@ -20,6 +20,8 @@
 )]
 
 pub mod c2rust;
+pub mod cpal_aec;
+pub mod pywrapper;
 
 use std::convert::TryFrom;
 use std::ffi::{c_int, CStr};

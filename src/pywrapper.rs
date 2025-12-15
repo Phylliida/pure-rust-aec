@@ -863,7 +863,7 @@ pub fn get_supported_output_configs(
 }
 
 #[pymodule]
-fn pywrapper(py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn melaec3(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyInputDeviceConfig>()?;
     m.add_class::<PyOutputDeviceConfig>()?;
     m.add_class::<PyAecConfig>()?;
