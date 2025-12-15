@@ -1,1 +1,4 @@
 /target
+python/melaec3/*.so
+python/melaec3/__pycache__/
+*.pyc

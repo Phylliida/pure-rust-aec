@@ -1,21 +1,23 @@
 #![cfg(feature = "cpal-example")]
+#![allow(dead_code)]
 
 use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     thread,
     time::Duration,
 };
 
-use cpal::{traits::HostTrait, SampleFormat};
+use cpal::SampleFormat;
 use futures::executor::block_on;
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
-    types::PyBytes,
+    types::{PyBytes, PyModule},
+    wrap_pyfunction,
 };
 
 use crate::cpal_aec::{
@@ -100,7 +102,7 @@ impl PyInputDeviceConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        host: Option<String>,
+        host_id: Option<String>,
         device_name: String,
         channels: usize,
         sample_rate: u32,
@@ -110,7 +112,7 @@ impl PyInputDeviceConfig {
         audio_buffer_seconds: u32,
         resampler_quality: i32,
     ) -> PyResult<Self> {
-        let host_id = resolve_host_id(host.as_deref())?;
+        let host_id = resolve_host_id(host_id.as_deref())?;
         let sample_format = parse_sample_format(sample_format.as_deref())?;
         Ok(Self {
             inner: InputDeviceConfig::new(
@@ -140,7 +142,7 @@ impl PyInputDeviceConfig {
     ) -> PyResult<Self> {
         let host_id = resolve_host_id(host.as_deref())?;
         let inner = py
-            .allow_threads(|| {
+            .allow_threads(move || {
                 block_on(InputDeviceConfig::from_default(
                     host_id,
                     device_name,
@@ -149,6 +151,7 @@ impl PyInputDeviceConfig {
                     audio_buffer_seconds,
                     resampler_quality,
                 ))
+                .map_err(|e| e.to_string())
             })
             .map_err(to_py_err)?;
         Ok(Self { inner })
@@ -313,7 +316,7 @@ impl PyOutputDeviceConfig {
     ) -> PyResult<Self> {
         let host_id = resolve_host_id(host.as_deref())?;
         let inner = py
-            .allow_threads(|| {
+            .allow_threads(move || {
                 block_on(OutputDeviceConfig::from_default(
                     host_id,
                     device_name,
@@ -323,6 +326,7 @@ impl PyOutputDeviceConfig {
                     resampler_quality,
                     frame_size_millis,
                 ))
+                .map_err(|e| e.to_string())
             })
             .map_err(to_py_err)?;
         Ok(Self { inner })
@@ -495,18 +499,18 @@ impl PyAecConfig {
 
 #[pyclass(name = "StreamProducer")]
 pub struct PyStreamProducer {
-    inner: InnerStreamProducer,
+    inner: Arc<Mutex<InnerStreamProducer>>,
 }
 
 #[pymethods]
 impl PyStreamProducer {
     pub fn queue_audio(&mut self, audio: Vec<f32>) {
-        self.inner.queue_audio(&audio);
+        self.inner.lock().unwrap().queue_audio(&audio);
     }
 
     #[getter]
     fn stream_id(&self) -> u64 {
-        self.inner.stream_id()
+        self.inner.lock().unwrap().stream_id()
     }
 
     /// Convenience helper to close the stream via its owning output producer.
@@ -574,11 +578,19 @@ impl PyOutputStreamAlignerProducer {
                 resampler_quality,
             )
             .map_err(to_py_err)?;
-        Ok(PyStreamProducer { inner: producer })
+        Ok(PyStreamProducer {
+            inner: Arc::new(Mutex::new(producer)),
+        })
     }
 
     pub fn end_audio_stream(&mut self, stream: &PyStreamProducer) -> PyResult<()> {
-        self.inner_mut()?.end_audio_stream(&stream.inner).map_err(to_py_err)
+        let guard = stream
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Stream producer lock poisoned"))?;
+        self.inner_mut()?
+            .end_audio_stream(&guard)
+            .map_err(to_py_err)
     }
 
     pub fn interrupt_all_streams(&mut self) -> PyResult<()> {
@@ -629,13 +641,11 @@ impl PyAecStream {
         py: Python<'_>,
         config: &PyInputDeviceConfig,
     ) -> PyResult<()> {
-        py.allow_threads({
-            let inner = self.inner.clone();
-            let cfg = config.inner.clone();
-            move || {
-                let mut guard = inner.lock().unwrap();
-                block_on(guard.add_input_device(&cfg))
-            }
+        let inner = &self.inner;
+        let cfg = config.inner.clone();
+        py.allow_threads(move || {
+            let mut guard = inner.lock().unwrap();
+            block_on(guard.add_input_device(&cfg)).map_err(|e| e.to_string())
         })
         .map_err(to_py_err)
     }
@@ -645,14 +655,12 @@ impl PyAecStream {
         py: Python<'_>,
         config: &PyOutputDeviceConfig,
     ) -> PyResult<PyOutputStreamAlignerProducer> {
+        let inner = &self.inner;
+        let cfg = config.inner.clone();
         let producer = py
-            .allow_threads({
-                let inner = self.inner.clone();
-                let cfg = config.inner.clone();
-                move || {
-                    let mut guard = inner.lock().unwrap();
-                    block_on(guard.add_output_device(&cfg))
-                }
+            .allow_threads(move || {
+                let mut guard = inner.lock().unwrap();
+                block_on(guard.add_output_device(&cfg)).map_err(|e| e.to_string())
             })
             .map_err(to_py_err)?;
         Ok(PyOutputStreamAlignerProducer {
@@ -691,10 +699,14 @@ impl PyAecStream {
             owned.push(inner);
         }
 
-        let inner = self.inner.clone();
-        let result = py.allow_threads(move || {
-            let mut guard = inner.lock().unwrap();
-            block_on(guard.calibrate(owned.as_mut_slice(), debug_wav))
+        let inner = &self.inner;
+        let (result, owned) = py.allow_threads(move || {
+            let mut owned = owned;
+            let res = {
+                let mut guard = inner.lock().unwrap();
+                block_on(guard.calibrate(owned.as_mut_slice(), debug_wav)).map_err(|e| e.to_string())
+            };
+            (res, owned)
         });
 
         for (mut wrapper, inner) in producers.into_iter().zip(owned.into_iter()) {
@@ -705,39 +717,43 @@ impl PyAecStream {
     }
 
     pub fn update<'py>(&'py mut self, py: Python<'py>) -> PyResult<(Py<PyBytes>, u128, u128)> {
-        let inner = self.inner.clone();
+        let inner = &self.inner;
         let (samples, start, end) = py
             .allow_threads(move || {
                 let mut guard = inner.lock().unwrap();
                 block_on(guard.update())
+                    .map(|(buf, s, e)| (buf.to_vec(), s, e))
+                    .map_err(|e| e.to_string())
             })
             .map_err(to_py_err)?;
-        Ok((slice_to_pybytes(py, samples), start, end))
+        Ok((slice_to_pybytes(py, samples.as_slice()), start, end))
     }
 
     pub fn update_debug<'py>(
         &'py mut self,
         py: Python<'py>,
     ) -> PyResult<(Py<PyBytes>, Py<PyBytes>, Py<PyBytes>, u128, u128)> {
-        let inner = self.inner.clone();
+        let inner = &self.inner;
         let (aligned_in, aligned_out, aec_applied, start, end) = py
             .allow_threads(move || {
                 let mut guard = inner.lock().unwrap();
                 block_on(guard.update_debug())
+                    .map(|(a, b, c, s, e)| (a.to_vec(), b.to_vec(), c.to_vec(), s, e))
+                    .map_err(|e| e.to_string())
             })
             .map_err(to_py_err)?;
 
         Ok((
-            slice_to_pybytes(py, aligned_in),
-            slice_to_pybytes(py, aligned_out),
-            slice_to_pybytes(py, aec_applied),
+            slice_to_pybytes(py, aligned_in.as_slice()),
+            slice_to_pybytes(py, aligned_out.as_slice()),
+            slice_to_pybytes(py, aec_applied.as_slice()),
             start,
             end,
         ))
     }
 
     /// Set a Python callback receiving `(bytes, start_micros, end_micros)`.
-    pub fn set_callback(&mut self, callback: PyObject) -> PyResult<()> {
+    pub fn set_callback(&mut self, callback: Py<PyAny>) -> PyResult<()> {
         *self.callback.lock().unwrap() = Some(callback);
         self.maybe_start_callback_thread();
         Ok(())
@@ -760,9 +776,9 @@ impl PyAecStream {
             return;
         }
 
-        let inner = self.inner.clone();
-        let cb_ref = self.callback.clone();
-        let shutdown = self.callback_shutdown.clone();
+        let inner = Arc::downgrade(&self.inner);
+        let cb_ref = Arc::clone(&self.callback);
+        let shutdown = Arc::clone(&self.callback_shutdown);
 
         self.callback_shutdown.store(false, Ordering::SeqCst);
         self.callback_thread = Some(thread::spawn(move || loop {
@@ -771,13 +787,15 @@ impl PyAecStream {
             }
 
             let (samples, start, end) = {
-                let mut guard = inner.lock().unwrap();
-                match block_on(guard.update()) {
-                    Ok(res) => {
-                        // Copy to own Vec so we can drop the lock before calling Python.
-                        let owned: Vec<f32> = res.0.to_vec();
-                        (owned, res.1, res.2)
-                    }
+                let Some(inner_arc) = inner.upgrade() else {
+                    break;
+                };
+                let mut guard = inner_arc.lock().unwrap();
+                match block_on(guard.update())
+                    .map(|(buf, s, e)| (buf.to_vec(), s, e))
+                    .map_err(|e| e.to_string())
+                {
+                    Ok(res) => res,
                     Err(err) => {
                         eprintln!("Aec callback update error: {err}");
                         (Vec::new(), 0, 0)
@@ -825,6 +843,7 @@ pub fn get_supported_input_configs(
                 audio_buffer_seconds,
                 resampler_quality,
             ))
+            .map_err(|e| e.to_string())
         })
         .map_err(to_py_err)?;
 
@@ -853,6 +872,7 @@ pub fn get_supported_output_configs(
                 resampler_quality,
                 frame_size,
             ))
+            .map_err(|e| e.to_string())
         })
         .map_err(to_py_err)?;
 
@@ -863,7 +883,7 @@ pub fn get_supported_output_configs(
 }
 
 #[pymodule]
-fn melaec3(py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn melaec3(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyInputDeviceConfig>()?;
     m.add_class::<PyOutputDeviceConfig>()?;
     m.add_class::<PyAecConfig>()?;

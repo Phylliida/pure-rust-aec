@@ -80,6 +80,7 @@ use cpal::InputCallbackInfo;
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread;
 
+#[cfg(target_arch = "wasm32")]
 use cpal::SupportedBufferSize;
 use std::collections::HashSet;
 
@@ -88,8 +89,7 @@ use ringbuf::{
     HeapCons, HeapProd, HeapRb, LocalRb,
 };
 use ringbuf::storage::Heap;
-use crate::speex::{Resampler};
-use crate::cpal_webaudio_inputs::WasmStream;
+use crate::Resampler;
 use std::f32::consts::PI;
 use rustfft::num_complex::Complex32;
 
@@ -100,10 +100,6 @@ use js_sys::{Date, Promise};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast, JsValue};
 use hound::{SampleFormat as HoundSampleFormat, WavSpec, WavWriter};
-
-use crate::cpal_webaudio_inputs::get_webaudio_input_devices;
-use crate::cpal_webaudio_inputs::InputDeviceInfo;
-use crate::cpal_webaudio_inputs::build_webaudio_input_stream;
 
 #[inline]
 fn aec_log(msg: impl AsRef<str>) {
@@ -1176,36 +1172,37 @@ fn create_stream_aligner(channels: usize, input_sample_rate: u32, output_sample_
     Ok((producer, resampler, consumer))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_resampler_loop(mut resampler: StreamAlignerResampler) {
-    cfg_if::cfg_if! {
-        if #[cfg(target_arch = "wasm32")] {
-            spawn_local(async move {
-                loop {
-                    match resampler.resample().await {
-                        Ok(true) => {}
-                        Ok(false) => break,
-                        Err(err) => {
-                            eprintln!("resampler error: {err}");
-                            break;
-                        }
-                    }
+    thread::spawn(async move || {
+        loop {
+            match resampler.resample().await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(err) => {
+                    eprintln!("resampler error: {err}");
+                    break;
                 }
-            });
-        } else {
-            thread::spawn(move || {
-                loop {
-                    match resampler.resample() {
-                        Ok(true) => continue,
-                        Ok(false) => break,
-                        Err(err) => {
-                            eprintln!("resampler error: {err}");
-                            break;
-                        }
-                    }
-                }
-            });
+            }
         }
-    }
+        eprintln!("Break resampler");
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_resampler_loop(mut resampler: StreamAlignerResampler) {
+    spawn_local(async move {
+        loop {
+            match resampler.resample().await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(err) => {
+                    eprintln!("resampler error: {err}");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 type StreamId = u64;
@@ -1621,7 +1618,6 @@ async fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config
     }
     aec_log("Input stream aligners 7");
 
-
     Ok((stream, consumer))
 }
 
@@ -1722,6 +1718,9 @@ pub struct AecStream {
     aec_out_audio_buffer: Vec<f32>,
     aec3: Option<VoipAec3>,
 }
+
+// AecStream is used behind a Mutex to serialize access; mark it Send so it can cross threads.
+unsafe impl Send for AecStream {}
 
 impl AecStream {
     pub fn new(
@@ -2382,12 +2381,13 @@ async fn select_input_device(
     device_name: &str
 ) -> Result<InputDevice, Box<dyn Error>>
 {
-    let host = cpal::host_from_id(host_id)?;
-    select_device(
+    let host = cpal::host_from_id(*host_id)?;
+    let device = select_device(
         host.input_devices(),
         device_name,
         "Input",
     )?;
+    Ok(device)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2567,9 +2567,11 @@ async fn get_supported_input_device_configs(
         resampler_quality // resampler_quality
     ).await?;
 
-    let result_configs = Vec::new();
-    result_configs.push(default_config);
+    let mut result_configs = Vec::new();
+    result_configs.push(default_config.clone());
 
+    let host = cpal::host_from_id(*host_id)?;
+    let device = select_device(host.output_devices(), &device_name, "Input")?;
     let configs : Vec<_> = device.supported_input_configs().map(|configs| configs.collect())
             .map_err(|err| format!("Unable to enumerate input configs for '{device_name}': {err}"))?;
 
@@ -2580,7 +2582,7 @@ async fn get_supported_input_device_configs(
             let device_config = InputDeviceConfig::new(
                 host_id.clone(),
                 device_name.clone(),
-                cfg.channels(),
+                cfg.channels() as usize,
                 *sample_rate,
                 cfg.sample_format(),
                 history_len,
@@ -2709,7 +2711,7 @@ async fn get_default_input_device_config(host_id: &cpal::HostId, device_name: &S
         &device_name
     ).await?;
 
-    device.default_input_config()?
+    Ok(device.default_input_config()?)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2749,7 +2751,7 @@ async fn find_matching_input_device_config(
     format: SampleFormat,
 ) -> Result<SupportedStreamConfig, Box<dyn Error>> {
     find_matching_device_config(
-        &(*device as Device),
+        device,
         device_name,
         channels,
         sample_rate,
@@ -2829,33 +2831,37 @@ async fn build_input_alignment_stream(
     supported_config: SupportedStreamConfig,
     channel_aligners: StreamAlignerProducer,
 ) -> Result<InputStream, Box<dyn Error>> {
-    match config.sample_format {
+    let stream_res = match config.sample_format {
         SampleFormat::I16 => build_input_alignment_stream_typed::<i16>(
             device,
             config,
             supported_config,
             channel_aligners,
-        ).await,
+        )
+        .await,
         SampleFormat::F32 => build_input_alignment_stream_typed::<f32>(
             device,
             config,
             supported_config,
             channel_aligners,
-        ).await,
+        )
+        .await,
         SampleFormat::U16 => build_input_alignment_stream_typed::<u16>(
             device,
             config,
             supported_config,
             channel_aligners,
-        ).await,
+        )
+        .await,
         other => {
             eprintln!(
                 "Input device '{0}' uses unsupported sample format {other:?}; cannot build StreamAligner.",
                 config.device_name
             );
-            Err(Box::new(cpal::BuildStreamError::StreamConfigNotSupported))
-        }
-    }
+            Err(cpal::BuildStreamError::StreamConfigNotSupported)
+        }?
+    };
+    Ok(stream_res?)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2877,25 +2883,27 @@ where
     
     let device_name = config.device_name.clone();
     let device_name_inner = config.device_name.clone();
-    device.build_input_stream(
-        &supported_config.config(),
-        move |data: &[T], _info: &InputCallbackInfo| {
-            if data.is_empty() {
-                return;
-            }
+    Ok(device
+        .build_input_stream(
+            &supported_config.config(),
+            move |data: &[T], _info: &InputCallbackInfo| {
+                if data.is_empty() {
+                    return;
+                }
 
-            interleaved_buffer.clear();
-            interleaved_buffer.reserve(data.len()); // usually already sized, but cheap
-            for &s in data {
-                interleaved_buffer.push(f32::from_sample(s));
-            }
-            if let Err(err) = channel_aligner.process_chunk(interleaved_buffer.as_slice()) {
-                eprintln!("Input stream '{device_name_inner}' error when process chunk {err}");
-            }
-        },
-        move |err| eprintln!("Input stream '{device_name}' error: {err}",),
-        None,
-    )
+                interleaved_buffer.clear();
+                interleaved_buffer.reserve(data.len()); // usually already sized, but cheap
+                for &s in data {
+                    interleaved_buffer.push(f32::from_sample(s));
+                }
+                if let Err(err) = channel_aligner.process_chunk(interleaved_buffer.as_slice()) {
+                    eprintln!("Input stream '{device_name_inner}' error when process chunk {err}");
+                }
+            },
+            move |err| eprintln!("Input stream '{device_name}' error: {err}",),
+            None,
+        )
+        .map_err(|e| -> Box<dyn Error> { Box::new(e) })?)
 }
 
 #[cfg(target_arch = "wasm32")]
