@@ -21,20 +21,48 @@
 //!
 //! The optional third argument selects the internal echo-canceller sample rate (Hz). When
 //! omitted, the demo defaults to 48 kHz and transparently resamples the devices if needed.
+#[cfg(target_arch = "wasm32")]
+extern crate js_sys;
+#[cfg(target_arch = "wasm32")]
+extern crate wasm_bindgen;
+#[cfg(target_arch = "wasm32")]
+extern crate web_sys;
+
+#[cfg(target_arch = "wasm32")]
+use js_sys::Array;
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::JsFuture;
+#[cfg(target_arch = "wasm32")]
+use web_sys::{AudioContext, MediaStream, MediaStreamTrack, MediaStreamConstraints, MediaDevices, Navigator, MediaStreamAudioSourceNode};
+#[cfg(target_arch = "wasm32")]
+use js_sys::{Float32Array};
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
+use std::collections::HashMap;
+#[cfg(target_arch = "wasm32")]
+use web_sys::AudioContextState;
+
+use futures::channel::mpsc;
+use futures::StreamExt;
 
 use std::{
-    thread,
     collections::{HashMap},
     error::Error,
     mem::{MaybeUninit},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, TryRecvError, RecvError},
         Arc,
     },
 };
-
-use fdaf_aec::FdafAec;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::{spawn_local, JsFuture};
+use aec3::voip::VoipAec3;
 
 use std::backtrace::Backtrace;
 
@@ -42,26 +70,77 @@ use rustfft::{FftPlanner, num_complex::Complex};
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, FromSample, Host, InputCallbackInfo, Sample, SampleFormat, SampleRate, SizedSample,
+    Device, FromSample, Host, Sample, SampleFormat, SampleRate, SizedSample,
     Stream, SupportedStreamConfig,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use cpal::InputCallbackInfo;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread;
+
+use cpal::SupportedBufferSize;
+use std::collections::HashSet;
+
 use ringbuf::{
     traits::{Consumer, Producer, RingBuffer, Split},
     HeapCons, HeapProd, HeapRb, LocalRb,
 };
 use ringbuf::storage::Heap;
-use speex_rust_aec::{
-    speex_echo_cancellation, EchoCanceller, Resampler,
-};
+use crate::speex::{Resampler};
+use crate::cpal_webaudio_inputs::WasmStream;
 use std::f32::consts::PI;
 use rustfft::num_complex::Complex32;
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{UNIX_EPOCH, SystemTime};
-use hound::{WavReader,SampleFormat as HoundSampleFormat, WavSpec, WavWriter};
+#[cfg(target_arch = "wasm32")]
+use js_sys::{Date, Promise};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::{JsCast, JsValue};
+use hound::{SampleFormat as HoundSampleFormat, WavSpec, WavWriter};
+
+use crate::cpal_webaudio_inputs::get_webaudio_input_devices;
+use crate::cpal_webaudio_inputs::InputDeviceInfo;
+use crate::cpal_webaudio_inputs::build_webaudio_input_stream;
+
+#[inline]
+fn aec_log(msg: impl AsRef<str>) {
+    let msg = msg.as_ref();
+    #[cfg(target_arch = "wasm32")]
+    {
+        use js_sys::{Function, Reflect};
+        let global = js_sys::global();
+        let key = JsValue::from_str("logMessage");
+        if let Ok(val) = Reflect::get(&global, &key) {
+            if let Some(func) = val.dyn_ref::<Function>() {
+                let _ = func.call1(&JsValue::NULL, &JsValue::from_str(msg));
+                return;
+            }
+        }
+        // Fallback if the JS helper isn't present.
+        web_sys::console::log_1(&JsValue::from_str(msg));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        println!("{msg}");
+    }
+}
+
+#[macro_export]
+macro_rules! aec_log {
+    ($($t:tt)*) => {
+        $crate::aec::aec_log(format!($($t)*))
+    };
+}
+
 
 #[inline]
 unsafe fn assume_init_slice_mut<T>(slice: &mut [MaybeUninit<T>]) -> &mut [T] {
-    &mut *(slice as *mut [MaybeUninit<T>] as *mut [T])
+    unsafe {
+        &mut *(slice as *mut [MaybeUninit<T>] as *mut [T])
+    }
 }
 
 fn input_to_output_frames(input_frames: u128, in_rate: u32, out_rate: u32) -> u128 {
@@ -81,6 +160,27 @@ fn frames_to_micros(frames: u128, sample_rate: u128) -> u128 {
     // frames = (microseconds * sample_rate / 1 000 000)
     // frames * 1_000_000 = microseconds * sample_rate
     frames * 1000000 / sample_rate // = microseconds
+}
+
+#[inline]
+fn now_micros() -> u128 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock went backwards")
+            .as_micros()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Date::now returns milliseconds since epoch as f64.
+        (Date::now() * 1000.0) as u128
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn yield_to_event_loop() {
+    let _ = JsFuture::from(Promise::resolve(&JsValue::NULL)).await;
 }
 
 /// Generate a short, Hann-windowed multi-tone probe at 16 kHz sample rate.
@@ -134,7 +234,7 @@ fn indexed_chirp(idx: u32, sr: u32, dur_s: f32) -> Vec<f32> {
         let t = i as f32 / sr;
         let phase = 2.0 * std::f32::consts::PI * f0 * ((k * t).exp() - 1.0) / k;
         let w = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos()); // Hann
-        (phase.sin() * w * 0.3) // adjust gain as needed
+        phase.sin() * w * 0.3 // adjust gain as needed
     }).collect()
 }
 
@@ -193,7 +293,7 @@ fn detect_probe_tones(input_mono: &[f32], num_devices: usize, duration_ms: f32, 
         // Pad probe to match captured length for GCC-PHAT.
         let mut probe_padded = vec![0.0f32; input_mono.len()];
         probe_padded[..probe.len()].copy_from_slice(&probe);
-        let margin = input_mono.len().saturating_sub(1);
+        let _margin = input_mono.len().saturating_sub(1);
         let lag = gcc_phat_delay(&input_mono, &probe_padded);
             // positive lag means probe leads capture; lag is the start index in the capture
         println!("Got lag {lag}");
@@ -276,17 +376,17 @@ fn gcc_phat_delay(x_in: &[f32], y_in: &[f32]) -> isize {
     let y = normalize(y_in);
     let n = x.len();
     // Prepare complex buffers
-    let mut X: Vec<Complex<f32>> = x.iter().map(|&v| Complex::new(v, 0.0)).collect();
-    let mut Y: Vec<Complex<f32>> = y.iter().map(|&v| Complex::new(v, 0.0)).collect();
+    let mut x_vec: Vec<Complex<f32>> = x.iter().map(|&v| Complex::new(v, 0.0)).collect();
+    let mut y_vec: Vec<Complex<f32>> = y.iter().map(|&v| Complex::new(v, 0.0)).collect();
 
     // Forward FFT
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(n);
-    fft.process(&mut X);
-    fft.process(&mut Y);
+    fft.process(&mut x_vec);
+    fft.process(&mut y_vec);
 
     // Cross-spectrum with PHAT weighting: G = X * conj(Y); Psi = G / |G|
-    let mut psi: Vec<Complex<f32>> = X.iter().zip(Y.iter()).map(|(&xk, &yk)| {
+    let mut psi: Vec<Complex<f32>> = x_vec.iter().zip(y_vec.iter()).map(|(&xk, &yk)| {
         let g = xk * yk.conj();
         let mag = (g.re * g.re + g.im * g.im).sqrt();
         if mag > 1e-12 { g / mag } else { Complex::new(0.0, 0.0) }
@@ -353,7 +453,7 @@ fn gcc_phat_delay_old(siga: &[f32], sigb: &[f32], margin: usize) -> Option<(i64,
     fft_inv.process(&mut a);
 
     let scale = 1.0 / (n_fft as f32);
-    let mut corr: Vec<f32> = a.iter().map(|c| c.re * scale).collect();
+    let corr: Vec<f32> = a.iter().map(|c| c.re * scale).collect();
 
     // fftshift so zero-lag is centered
     let mut shifted = vec![0.0f32; n_fft];
@@ -654,7 +754,7 @@ impl StreamAlignerProducer {
     }
 
     fn process_chunk(&mut self, chunk: &[f32]) -> Result<(), Box<dyn Error>> {
-        let micros_when_chunk_received = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock went backwards").as_micros();
+        let micros_when_chunk_received = now_micros();
 
        
         let appended_count = self.input_audio_buffer_producer.push_slice(chunk);
@@ -713,7 +813,7 @@ impl StreamAlignerProducer {
                 // calibrated
                 calibrated
             );
-            self.input_audio_buffer_metadata_producer.send(metadata)?;
+            self.input_audio_buffer_metadata_producer.try_send(metadata)?;
         }
         Ok(())
     }
@@ -782,7 +882,7 @@ impl StreamAlignerResampler {
             println!("Decrease dynamic sample");
         }
         //self.dynamic_output_sample_rate = (((self.output_sample_rate as f32) * 0.95) as i128).max((self.dynamic_output_sample_rate-1) as i128) as u32;
-        //self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
+        self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
         Ok(())
     }
 
@@ -792,7 +892,7 @@ impl StreamAlignerResampler {
             println!("Increase dynamic sample");
         }
         //self.dynamic_output_sample_rate = (((self.output_sample_rate as f32) * 1.05) as i128).min((self.dynamic_output_sample_rate+1) as i128) as u32;
-        //self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
+        self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
         Ok(())
     }
 
@@ -824,10 +924,10 @@ impl StreamAlignerResampler {
         Ok((consumed, produced))
     }
 
-    fn resample(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+    async fn resample(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
         // process all recieved audio chunks
-        match self.input_audio_buffer_metadata_consumer.recv() {
-            Ok(msg) => match msg {
+        match self.input_audio_buffer_metadata_consumer.next().await {
+            Some(msg) => match msg {
                 AudioBufferMetadata::Arrive(num_available_frames, system_micros_after_packet_finishes, target_emitted_frames, calibrated) => {
                     let num_leftovers_from_prev = self.total_received_frames - self.total_processed_input_frames;
                     self.total_received_frames += num_available_frames as u128;
@@ -854,14 +954,14 @@ impl StreamAlignerResampler {
                     // will always be positive because it's relative to 1970
                     let system_micros_after_resampled_packet_finishes = (system_micros_after_packet_finishes as i128) - micros_earlier;
                     let system_micros_at_start_of_packet = (system_micros_after_resampled_packet_finishes as u128) - frames_to_micros(consumed_frames as u128, self.input_sample_rate as u128);
-                    self.finished_resampling_producer.send(ResamplingMetadata::Arrive(produced / self.channels, system_micros_at_start_of_packet, system_micros_after_resampled_packet_finishes as u128, calibrated))?;
+                    self.finished_resampling_producer.try_send(ResamplingMetadata::Arrive(produced / self.channels, system_micros_at_start_of_packet, system_micros_after_resampled_packet_finishes as u128, calibrated))?;
                     Ok(true)
                 },
                 AudioBufferMetadata::Teardown() => {
                     Ok(false)
                 }
             },
-            Err(RecvError) => Err("input metadata channel disconnected".into())   // sender dropped; bail out or log
+            None => Err("resample metadata channel disconnected".into())   // sender dropped; bail out or log
         }
     }
 }
@@ -895,11 +995,11 @@ impl StreamAlignerConsumer {
     // we allow some initial calibration time to synchronize the clocks
     // (it needs some extra time because packets can be delayed sometimes 
     // so waiting and min over a history lets us get better estimate)
-    fn is_ready_to_read(&mut self, micros_packet_finished: u128, size_in_frames: usize) -> bool {
+    async fn is_ready_to_read(&mut self, micros_packet_finished: u128, size_in_frames: usize) -> bool {
         // non blocking cause maybe it's just not ready (initialized) yet
         loop {
-            match self.finished_message_reciever.try_recv() {
-                Ok(msg) => {
+            match self.finished_message_reciever.try_next() {
+                Ok(Some(msg)) => {
                     match msg {
                         ResamplingMetadata::Arrive(frames_recieved, _system_micros_at_start_of_packet, _system_micros_after_packet_finishes, calibrated) => {
                             self.calibrated = calibrated;
@@ -909,12 +1009,13 @@ impl StreamAlignerConsumer {
                         }
                     }
                 }
-                Err(TryRecvError::Empty) => {
-                    // no message available right now
+                // sender dropped; receiver will never get more messages
+                Ok(None) => {
+                    eprintln!("Error: Stream Aligner Consumer message send disconnected");
                     break;
                 }
-                Err(TryRecvError::Disconnected) => {
-                    // sender dropped; receiver will never get more messages
+                Err(_err) => {
+                    // no message available right now
                     break;
                 }
             }
@@ -931,7 +1032,7 @@ impl StreamAlignerConsumer {
                     self.final_audio_buffer_consumer.finish_read((num_frames_that_are_behind_current_packet * self.channels as u128) as usize);
                     let additional_frames_needed = (size_in_frames as i128) - available_frames;
                     // we will be able to get all samples for this packet, block until we get them
-                    let (_read_success, _samples) = self.get_chunk_to_read((additional_frames_needed * self.channels as i128) as usize);
+                    let (_read_success, _samples) = self.get_chunk_to_read((additional_frames_needed * self.channels as i128) as usize).await;
                     println!("Finished calibrate, ignoring {num_frames_that_are_behind_current_packet} frames");
                     // return _read_success and not true to avoid failed reads clogging up the data
                     _read_success // we will read them again later, at which point we will do finish_read (this is delibrate reading them twice)
@@ -981,15 +1082,18 @@ impl StreamAlignerConsumer {
     // waits until we have at least that much data
     // (or something errors)
     // returns (success, audio_buffer)
-    fn get_chunk_to_read(&mut self, size: usize) -> (bool, &[f32]) {
+    async fn get_chunk_to_read(&mut self, size: usize) -> (bool, &[f32]) {
         // drain anything in buffer (non blocking)
         loop {
-            match self.finished_message_reciever.try_recv() {
-                Ok(_msg) => {},
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    // sender dropped; receiver will never get more messages
-                    eprintln!("Error: StreamAlignerConsumer message send disconnected");
+            match self.finished_message_reciever.try_next() {
+                Ok(Some(_msg)) => {},
+                // sender dropped; receiver will never get more messages
+                Ok(None) => {
+                    eprintln!("Error: Stream Aligner Consumer message send disconnected");
+                    break;
+                }
+                Err(_err) => {
+                    // no message available right now
                     break;
                 }
             }
@@ -997,13 +1101,13 @@ impl StreamAlignerConsumer {
 
         while self.final_audio_buffer_consumer.available() < size {
             // wait for data to arrive
-            match self.finished_message_reciever.recv() {
-                Ok(_data) => {
+            match self.finished_message_reciever.next().await {
+                Some(_data) => {
                     // this is only called after is_ready_to_read returns true (and is no longer used),
                     // so it's fine to ignore this, we don't use samples_recieved anymore
                 }
-                Err(err) => {
-                    eprintln!("channel closed: {err}");
+                None => {
+                    eprintln!("Stream aligner consumer closed closed");
                     return (false, &[])
                 }
             }
@@ -1018,16 +1122,19 @@ impl StreamAlignerConsumer {
 
 impl Drop for StreamAlignerConsumer {
     fn drop(&mut self) {
-        if let Err(err) = self.thread_message_sender.send(AudioBufferMetadata::Teardown()) {
+        if let Err(err) = self.thread_message_sender.try_send(AudioBufferMetadata::Teardown()) {
             eprintln!("failed to send shutdown signal: {}", err);
         }
     }
 }
 
+// some large constant is fine
+static CHANNEL_SIZE : usize = 10000;
+
 // make (producer (recieves audio data from device), resampler (resamples input audio to target rate), consumer (contains resampled data)) for input audio alignment
 fn create_stream_aligner(channels: usize, input_sample_rate: u32, output_sample_rate: u32, history_len: usize, calibration_packets: u32, audio_buffer_seconds: u32, resampler_quality: i32) -> Result<(StreamAlignerProducer, StreamAlignerResampler, StreamAlignerConsumer), Box<dyn Error>> {
     let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate * (channels as u32)) as usize).split();
-    let (input_audio_buffer_metadata_producer, input_audio_buffer_metadata_consumer) = mpsc::channel::<AudioBufferMetadata>();
+    let (input_audio_buffer_metadata_producer, input_audio_buffer_metadata_consumer) = mpsc::channel::<AudioBufferMetadata>(CHANNEL_SIZE);
     let additional_input_audio_buffer_metadata_producer = input_audio_buffer_metadata_producer.clone(); // make another one, this is ok because it is multiple producer single consumer 
     // this recieves data from audio buffer
     let producer = StreamAlignerProducer::new(
@@ -1040,7 +1147,7 @@ fn create_stream_aligner(channels: usize, input_sample_rate: u32, output_sample_
         input_audio_buffer_metadata_producer
     )?;
 
-    let (finished_resampling_producer, finished_resampling_consumer) = mpsc::channel::<ResamplingMetadata>();
+    let (finished_resampling_producer, finished_resampling_consumer) = mpsc::channel::<ResamplingMetadata>(CHANNEL_SIZE);
 
     let (output_audio_buffer_producer, output_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * output_sample_rate * (channels as u32)) as usize).split();
     // resampled_consumer: BufferedCircularConsumer::<f32>::new(resampled_consumer))
@@ -1069,7 +1176,51 @@ fn create_stream_aligner(channels: usize, input_sample_rate: u32, output_sample_
     Ok((producer, resampler, consumer))
 }
 
+fn spawn_resampler_loop(mut resampler: StreamAlignerResampler) {
+    cfg_if::cfg_if! {
+        if #[cfg(target_arch = "wasm32")] {
+            spawn_local(async move {
+                loop {
+                    match resampler.resample().await {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(err) => {
+                            eprintln!("resampler error: {err}");
+                            break;
+                        }
+                    }
+                }
+            });
+        } else {
+            thread::spawn(move || {
+                loop {
+                    match resampler.resample() {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(err) => {
+                            eprintln!("resampler error: {err}");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
 type StreamId = u64;
+
+#[cfg(not(target_arch = "wasm32"))]
+type InputStream = Stream;
+
+#[cfg(target_arch = "wasm32")]
+type InputStream = WasmStream;
+
+#[cfg(not(target_arch = "wasm32"))]
+type InputDevice = Device;
+
+#[cfg(target_arch = "wasm32")]
+type InputDevice = InputDeviceInfo;
 
 enum OutputStreamMessage {
     Add(StreamId, u32, usize, HashMap<usize, Vec<usize>>, ResampledBufferedCircularProducer, ringbuf::HeapCons<f32>),
@@ -1077,17 +1228,24 @@ enum OutputStreamMessage {
     InterruptAll(),
 }
 
-struct StreamProducer {
+pub struct StreamProducer {
+    stream_id: StreamId,
     producer: HeapProd<f32>
 }
 
 impl StreamProducer {
-    fn new(producer: HeapProd<f32>) -> Self {
+    pub fn new(stream_id: StreamId, producer: HeapProd<f32>) -> Self {
         Self {
+            stream_id,
             producer: producer
         }
     }
-    fn queue_audio(&mut self, audio_data: &[f32]) {
+
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub fn queue_audio(&mut self, audio_data: &[f32]) {
         let num_pushed = self.producer.push_slice(audio_data);
         if num_pushed < audio_data.len() {
             eprintln!("Error: output audio buffer got behind, try increasing buffer size");
@@ -1098,13 +1256,13 @@ impl StreamProducer {
 // we only have one per device (instead of one per channel)
 // because that ensures that multi-channel audio is synchronized properly
 // when sent to output device
-struct OutputStreamAlignerProducer {
-    host_id: cpal::HostId,
-    device_name: String,
-    channels: usize,
-    device_sample_rate: u32,
-    output_stream_sender: mpsc::Sender<OutputStreamMessage>,
-    cur_stream_id: Arc<AtomicU64>,
+pub struct OutputStreamAlignerProducer {
+    pub host_id: cpal::HostId,
+    pub device_name: String,
+    pub channels: usize,
+    pub device_sample_rate: u32,
+    pub output_stream_sender: mpsc::Sender<OutputStreamMessage>,
+    pub cur_stream_id: Arc<AtomicU64>,
 }
 
 impl OutputStreamAlignerProducer {
@@ -1120,7 +1278,7 @@ impl OutputStreamAlignerProducer {
         }
     }
 
-    fn begin_audio_stream(&self, channels: usize, channel_map: HashMap<usize, Vec<usize>>, audio_buffer_seconds: u32, sample_rate: u32, resampler_quality: i32) -> Result<(StreamId, StreamProducer), Box<dyn Error>> {
+    pub fn begin_audio_stream(&mut self, channels: usize, channel_map: HashMap<usize, Vec<usize>>, audio_buffer_seconds: u32, sample_rate: u32, resampler_quality: i32) -> Result<StreamProducer, Box<dyn Error>> {
         // this assigns unique ids in a thread-safe way
         let stream_index = self.cur_stream_id.fetch_add(1, Ordering::Relaxed);
         let (producer, consumer) = HeapRb::<f32>::new((audio_buffer_seconds * sample_rate * (channels as u32)) as usize).split();
@@ -1136,25 +1294,17 @@ impl OutputStreamAlignerProducer {
             BufferedCircularProducer::<f32>::new(resampled_producer),
         )?;
 
-        self.output_stream_sender.send(OutputStreamMessage::Add(stream_index, sample_rate, channels, channel_map, resampled_producer, resampled_consumer))?;
-        Ok((stream_index, StreamProducer::new(producer)))
+        self.output_stream_sender.try_send(OutputStreamMessage::Add(stream_index, sample_rate, channels, channel_map, resampled_producer, resampled_consumer))?;
+        Ok(StreamProducer::new(stream_index, producer))
     }
 
-    fn queue_audio(&self, mut audio_producer: HeapProd<f32>, audio_data: &[f32]) -> HeapProd<f32> {
-        let num_pushed = audio_producer.push_slice(audio_data);
-        if num_pushed < audio_data.len() {
-            eprintln!("Error: output audio buffer got behind, try increasing buffer size");
-        }
-        audio_producer
-    }
-
-    fn end_audio_stream(&self, stream_index: StreamId) -> Result<(), Box<dyn Error>> {
-        self.output_stream_sender.send(OutputStreamMessage::Remove(stream_index))?;
+    pub fn end_audio_stream(&mut self, stream: &StreamProducer) -> Result<(), Box<dyn Error>> {
+        self.output_stream_sender.try_send(OutputStreamMessage::Remove(stream.stream_id()))?;
         Ok(())
     }
 
-    fn interrupt_all_streams(&self) -> Result<(), Box<dyn Error>> { 
-        self.output_stream_sender.send(OutputStreamMessage::InterruptAll())?;
+    pub fn interrupt_all_streams(&mut self) -> Result<(), Box<dyn Error>> { 
+        self.output_stream_sender.try_send(OutputStreamMessage::InterruptAll())?;
         Ok(())
     }
 }
@@ -1172,7 +1322,7 @@ struct OutputStreamAlignerMixer {
 
 // allows for playing audio on top of each other (mixing) or just appending to buffer
 impl OutputStreamAlignerMixer {
-    fn new(channels: usize, device_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, frame_size: u32, output_stream_receiver:  mpsc::Receiver<OutputStreamMessage>, device_audio_producer: HeapProd<f32>, resampled_audio_buffer_producer: StreamAlignerProducer) -> Result<Self, Box<dyn Error>>  {
+    fn new(channels: usize, device_sample_rate: u32, output_sample_rate: u32, frame_size: u32, output_stream_receiver:  mpsc::Receiver<OutputStreamMessage>, device_audio_producer: HeapProd<f32>, resampled_audio_buffer_producer: StreamAlignerProducer) -> Result<Self, Box<dyn Error>>  {
         // used to send across threads
         Ok(Self {
             channels: channels,
@@ -1186,11 +1336,11 @@ impl OutputStreamAlignerMixer {
         })
     }
 
-    fn mix_audio_streams(&mut self, input_chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
+    async fn mix_audio_streams(&mut self, input_chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
         // fetch new audio consumers, non-blocking
         loop {
-            match self.output_stream_receiver.try_recv() {
-                Ok(msg) => match msg {
+            match self.output_stream_receiver.try_next() {
+                Ok(Some(msg)) => match msg {
                     OutputStreamMessage::Add(id, input_sample_rate, channels, channel_map, resampled_producer, resampled_consumer) => {
                         println!("Got new output device {} with {} channels", id, channels);
                         self.stream_consumers.insert(id, (input_sample_rate, channels, channel_map, resampled_producer, BufferedCircularConsumer::new(resampled_consumer)));
@@ -1204,8 +1354,15 @@ impl OutputStreamAlignerMixer {
                         self.stream_consumers.clear();
                     }
                 },
-                Err(TryRecvError::Empty) => break,          // nothing waiting; continue processing
-                Err(TryRecvError::Disconnected) => break,   // sender dropped; bail out or log
+                // sender dropped; receiver will never get more messages
+                Ok(None) => {
+                    eprintln!("Error: Mix audio stream message disconnected");
+                    break;
+                }
+                Err(_err) => {
+                    // no message available right now
+                    break;
+                }
             }
         }
 
@@ -1218,7 +1375,7 @@ impl OutputStreamAlignerMixer {
             // this doesn't work because it'll stall for very large audio
             // resample_producer.resample_all()?; // do resampling of any available data
             // instead, do it streaming
-            resample_producer.resample((target_input_samples as u32) * 2); // do * 2 so we also grab some leftovers if there are some, this is an upper bound
+            resample_producer.resample((target_input_samples as u32) * 2)?; // do * 2 so we also grab some leftovers if there are some, this is an upper bound
             let buf_from_stream = resample_consumer.get_chunk_to_read(round_to_channels(actual_input_chunk_size as u32, *channels) as usize);
             let frames = (buf_from_stream.len() / *channels as usize).min(frames_cap);
             if frames == 0 {
@@ -1247,55 +1404,33 @@ impl OutputStreamAlignerMixer {
             resample_consumer.finish_read(num_read);
         }
         // send output downstream to the eac
-        self.resampled_audio_buffer_producer.process_chunk(device_buf_write);
+        self.resampled_audio_buffer_producer.process_chunk(device_buf_write)?;
         // finish writing to output device buffer
         self.device_audio_producer.finish_write(need_to_write_device_values, frames_cap * self.channels);
         Ok(())
     }
 }
 
-/*
-struct OutputStreamAlignerConsumer {
-    channels: usize,
-    resample_audio_buffer_consumer: BufferedCircularConsumer<f32>,
-}
-
-impl OutputStreamAlignerConsumer {
-    fn new(channels: usize, resample_audio_buffer_consumer: BufferedCircularConsumer<f32>) -> Self {
-        Self {
-            channels: channels,
-            resample_audio_buffer_consumer: resample_audio_buffer_consumer
-        }
-    }
-    fn get_chunk_to_read(&mut self, size: usize) -> Result<&[f32], Box<dyn std::error::Error>> {
-        Ok(self.resample_audio_buffer_consumer.get_chunk_to_read(size))
-    }
-
-    fn finish_read(&mut self, size: usize) -> usize {
-        self.resample_audio_buffer_consumer.finish_read(size)
-    }
-}
-*/
-
-struct InputDeviceConfig {
-    host_id: cpal::HostId,
-    device_name: String,
-    channels: usize,
-    sample_rate: u32,
-    sample_format: SampleFormat,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputDeviceConfig {
+    pub host_id: cpal::HostId,
+    pub device_name: String,
+    pub channels: usize,
+    pub sample_rate: u32,
+    pub sample_format: SampleFormat,
     
     // number of audio chunks to hold in memory, for aligning input devices's values when dropped frames/clock offsets. 100 or so is fine
-    history_len: usize,
+    pub history_len: usize,
     // number of packets recieved before we start getting audio data
     // a larger value here will take longer to connect, but result in more accurate timing alignments
-    calibration_packets: u32,
+    pub calibration_packets: u32,
     // how long buffer of input audio to store, should only really need a few seconds as things are mostly streamed
-    audio_buffer_seconds: u32,
-    resampler_quality: i32
+    pub audio_buffer_seconds: u32,
+    pub resampler_quality: i32
 }
 
 impl InputDeviceConfig {
-    fn new(
+    pub fn new(
         host_id: cpal::HostId,
         device_name: String,
         channels: usize,
@@ -1320,7 +1455,7 @@ impl InputDeviceConfig {
     }
 
     /// Build a config using the device's default input settings plus caller-provided buffer/resampler tuning.
-    fn from_default(
+    pub async fn from_default(
         host_id: cpal::HostId,
         device_name: String,
         history_len: usize,
@@ -1328,13 +1463,11 @@ impl InputDeviceConfig {
         audio_buffer_seconds: u32,
         resampler_quality: i32,
     ) -> Result<Self, Box<dyn Error>> {
-        let host = cpal::host_from_id(host_id)?;
-        let input_device = select_device(host.input_devices(), &device_name, "Input")?;
-        let default_config = input_device.default_input_config()?;
+        let default_config = get_default_input_device_config(&host_id, &device_name).await?;
 
         Ok(Self::new(
             host_id,
-            input_device.name()?,
+            device_name,
             default_config.channels() as usize,
             default_config.sample_rate().0,
             default_config.sample_format(),
@@ -1346,29 +1479,30 @@ impl InputDeviceConfig {
     }
 }
 
-struct OutputDeviceConfig {
-    host_id: cpal::HostId,
-    device_name: String,
-    channels: usize,
-    sample_rate: u32,
-    sample_format: SampleFormat,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputDeviceConfig {
+    pub host_id: cpal::HostId,
+    pub device_name: String,
+    pub channels: usize,
+    pub sample_rate: u32,
+    pub sample_format: SampleFormat,
     
     // number of audio chunks to hold in memory, for aligning input devices's values when dropped frames/clock offsets. 100 or so is fine
-    history_len: usize,
+    pub history_len: usize,
     // number of packets recieved before we start getting audio data
     // a larger value here will take longer to connect, but result in more accurate timing alignments
-    calibration_packets: u32,
+    pub calibration_packets: u32,
     // how long buffer of input audio to store, should only really need a few seconds as things are mostly streamed
-    audio_buffer_seconds: u32,
-    resampler_quality: i32,
+    pub audio_buffer_seconds: u32,
+    pub resampler_quality: i32,
     // frame size (in terms of samples) should be small, on the order of 1-2ms or less.
     // otherwise you may get skipping if you do not provide audio via enqueue_audio fast enough
     // larger frame sizes will also prevent immediate interruption, as interruption can only happen between each frame
-    frame_size: u32,
+    pub frame_size: u32,
 }
 
 impl OutputDeviceConfig {
-    fn new(
+    pub fn new(
         host_id: cpal::HostId,
         device_name: String,
         channels: usize,
@@ -1395,7 +1529,7 @@ impl OutputDeviceConfig {
     }
 
     /// Build a config using the device's default output settings plus caller-provided buffer/resampler tuning.
-    fn from_default(
+    pub async fn from_default(
         host_id: cpal::HostId,
         device_name: String,
         history_len: usize,
@@ -1424,38 +1558,39 @@ impl OutputDeviceConfig {
     }
 }
 
-struct AecConfig {
+pub struct AecConfig {
     target_sample_rate: u32,
     frame_size: usize,
     filter_length: usize
 }
 
 impl AecConfig {
-    fn new(target_sample_rate: u32, frame_size: usize, filter_length: usize) -> Self {
+    pub fn new(target_sample_rate: u32, frame_size: usize, filter_length: usize) -> Self {
         Self { target_sample_rate, frame_size, filter_length }
     }
 }
 
-fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, StreamAlignerConsumer), Box<dyn std::error::Error>>  {
+async fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(InputStream, StreamAlignerConsumer), Box<dyn std::error::Error>>  {
 
-    let host = cpal::host_from_id(device_config.host_id)?;
-    let device = select_device(
-        host.input_devices(),
-        &device_config.device_name,
-        "Input",
-    )?;
+    aec_log("Input stream aligners 1");
+    // we need to use these methods instead of the more generic select_device because of wasm wrapping to workaround cpal not having webaudio input device support
+    let device = select_input_device(
+        &device_config.host_id,
+        &device_config.device_name
+    ).await?;
 
-    let supported_config = find_matching_device_config(
+    aec_log("Input stream aligners 2");
+    let supported_config = find_matching_input_device_config(
         &device,
         &device_config.device_name,
         device_config.channels,
         device_config.sample_rate,
-        device_config.sample_format,
-        "Input",
-    )?;
+        device_config.sample_format
+    ).await?;
     
 
-    let (producer, mut resampler, consumer) = create_stream_aligner(
+    aec_log("Input stream aligners 3");
+    let (producer, resampler, consumer) = create_stream_aligner(
         device_config.channels,
         device_config.sample_rate,
         aec_config.target_sample_rate,
@@ -1464,30 +1599,28 @@ fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &Aec
         device_config.audio_buffer_seconds,
         device_config.resampler_quality)?;
 
-    // start the resampler thread
-    thread::spawn(move || {
-        // it returns true when signaled to stop (such as when consumer goes out of scope)
-        loop {
-            match resampler.resample() {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(err) => {
-                    eprintln!("resampler error: {err}");
-                    break;
-                }
-            }
-        }
-    });
+    aec_log("Input stream aligners 4");
+    spawn_resampler_loop(resampler);
+    aec_log("Input stream aligners 5");
 
     let stream = build_input_alignment_stream(
         &device,
         device_config,
         supported_config,
         producer,
-    )?;
+    ).await?;
+    aec_log("Input stream aligners 6");
 
     // start input stream
-    stream.play()?;
+    cfg_if::cfg_if! {
+        if #[cfg(all(target_arch = "wasm32"))] {
+            stream.play().await?; // wasm is async
+        } else {
+            stream.play()?;
+        }
+    }
+    aec_log("Input stream aligners 7");
+
 
     Ok((stream, consumer))
 }
@@ -1512,7 +1645,7 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
     )?;
 
     let (device_audio_producer, device_audio_consumer) = HeapRb::<f32>::new((device_config.audio_buffer_seconds * device_config.sample_rate * (device_config.channels as u32)) as usize).split();
-    let (output_stream_sender, output_stream_receiver) = mpsc::channel::<OutputStreamMessage>();
+    let (output_stream_sender, output_stream_receiver) = mpsc::channel::<OutputStreamMessage>(CHANNEL_SIZE);
 
     let output_producer = OutputStreamAlignerProducer::new(
         device_config.host_id,
@@ -1522,7 +1655,7 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
         output_stream_sender
     );
 
-    let (producer, mut resampler, consumer) = create_stream_aligner(
+    let (producer, resampler, consumer) = create_stream_aligner(
         device_config.channels,
         device_config.sample_rate,
         aec_config.target_sample_rate,
@@ -1535,8 +1668,6 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
         device_config.channels,
         device_config.sample_rate,
         aec_config.target_sample_rate,
-        device_config.audio_buffer_seconds,
-        device_config.resampler_quality,
         device_config.frame_size,
         output_stream_receiver,
         device_audio_producer,
@@ -1544,20 +1675,7 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
     )?;
     
 
-    // start the resampler thread
-    thread::spawn(move || {
-        // it returns true when signaled to stop (such as when consumer goes out of scope)
-        loop {
-            match resampler.resample() {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(err) => {
-                    eprintln!("resampler error: {err}");
-                    break;
-                }
-            }
-        }
-    });
+    spawn_resampler_loop(resampler);
 
     let stream = build_output_alignment_stream(
         &device,
@@ -1575,18 +1693,18 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
 
 
 enum DeviceUpdateMessage {
-    AddInputDevice(String, Stream, StreamAlignerConsumer),
+    AddInputDevice(String, InputStream, StreamAlignerConsumer),
     RemoveInputDevice(String),
     AddOutputDevice(String, Stream, StreamAlignerConsumer),
     RemoveOutputDevice(String)
 }
 
-struct AecStream {
-    aec: Option<EchoCanceller>,
+pub struct AecStream {
+    //aec: Option<EchoCanceller>,
     aec_config: AecConfig,
     device_update_sender: mpsc::Sender<DeviceUpdateMessage>,
     device_update_receiver: mpsc::Receiver<DeviceUpdateMessage>,
-    input_streams: HashMap<String, Stream>,
+    input_streams: HashMap<String, InputStream>,
     output_streams: HashMap<String, Stream>,
     input_aligners: HashMap<String, StreamAlignerConsumer>,
     input_aligners_in_progress: HashMap<String, StreamAlignerConsumer>,
@@ -1602,19 +1720,19 @@ struct AecStream {
     output_audio_buffer: Vec<i16>,
     aec_audio_buffer: Vec<i16>,
     aec_out_audio_buffer: Vec<f32>,
-    aec2: Option<FdafAec>
+    aec3: Option<VoipAec3>,
 }
 
 impl AecStream {
-    fn new(
+    pub fn new(
         aec_config: AecConfig
     ) -> Result<Self, Box<dyn Error>> {
         if aec_config.target_sample_rate == 0 {
             return Err(format!("Target sample rate is {}, it must be greater than zero.", aec_config.target_sample_rate).into());
         }
-        let (device_update_sender, device_update_receiver) = mpsc::channel::<DeviceUpdateMessage>();
+        let (device_update_sender, device_update_receiver) = mpsc::channel::<DeviceUpdateMessage>(CHANNEL_SIZE);
         Ok(Self {
-           aec: None,
+           //aec: None,
            aec_config: aec_config,
            device_update_sender: device_update_sender,
            device_update_receiver: device_update_receiver,
@@ -1634,18 +1752,18 @@ impl AecStream {
            output_audio_buffer: Vec::new(),
            aec_audio_buffer: Vec::new(),
            aec_out_audio_buffer: Vec::new(),
-           aec2: None,
+           aec3: None,
         })
     }
-
-    fn num_input_channels(&self) -> usize {
+    
+    pub fn num_input_channels(&self) -> usize {
         self.input_aligners
             .values()
             .map(|aligner| aligner.channels)
             .sum()
     }
 
-    fn num_output_channels(&self) -> usize {
+    pub fn num_output_channels(&self) -> usize {
         self.output_aligners
             .values()
             .map(|aligner| aligner.channels)
@@ -1665,26 +1783,40 @@ impl AecStream {
 
         //self.aec2 = Some(FdafAec::new(1024, 0.02));
 
-        self.aec = if self.input_channels > 0 && self.output_channels > 0 {
-            EchoCanceller::new_multichannel(
+        
+        /*(self.aec, self.aec3) = if self.input_channels > 0 && self.output_channels > 0 {
+            (EchoCanceller::new_multichannel(
                 self.aec_config.frame_size,
                 self.aec_config.filter_length,
                 self.input_channels,
                 self.output_channels,
-            )
+            ), Some(VoipAec3::builder(self.aec_config.target_sample_rate as i32, self.input_channels, self.output_channels)
+            .initial_delay_ms((self.aec_config.frame_size/3) as i32)
+            .enable_high_pass(true)
+            .build()
+            .expect("failed to create AEC pipeline")))
 
             //EchoCanceller::new(
             //    self.aec_config.frame_size,
             //    self.aec_config.filter_length
             //)
+
+        */
+        self.aec3 = if self.input_channels > 0 && self.output_channels > 0 {
+            Some(VoipAec3::builder(self.aec_config.target_sample_rate as i32, self.input_channels, self.output_channels)
+            .initial_delay_ms((self.aec_config.frame_size/3) as i32)
+            .enable_high_pass(true)
+            .build()
+            .expect("failed to create AEC pipeline"))
         } else {
             None
         };
-        if let Some(aec) = self.aec.as_mut() {
-            aec.set_sampling_rate(self.aec_config.target_sample_rate);
-            let sampling_rate = aec.sampling_rate();
-            println!("Set sampling rate to {sampling_rate}");
-        }
+
+        //if let Some(aec) = self.aec.as_mut() {
+        //    aec.set_sampling_rate(self.aec_config.target_sample_rate);
+        //    let sampling_rate = aec.sampling_rate();
+        //    println!("Set sampling rate to {sampling_rate}");
+        //}
 
         self.input_audio_buffer.clear();
         self.input_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as i16);
@@ -1697,30 +1829,35 @@ impl AecStream {
         Ok(())
     }
 
-    fn add_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        let (stream, aligners) = get_input_stream_aligners(config, &self.aec_config)?;
-        self.device_update_sender.send(DeviceUpdateMessage::AddInputDevice(config.device_name.clone(), stream, aligners))?;
+    pub async fn add_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
+        aec_log("Add input device");
+        let (stream, aligners) = get_input_stream_aligners(config, &self.aec_config).await?;
+        aec_log("Add input device 2");
+        self.device_update_sender.try_send(DeviceUpdateMessage::AddInputDevice(config.device_name.clone(), stream, aligners))?;
+        aec_log("Add input device done");
         Ok(())
     }
 
-    fn add_output_device(&mut self, config: &OutputDeviceConfig) -> Result<OutputStreamAlignerProducer, Box<dyn std::error::Error>> {
+    pub async fn add_output_device(&mut self, config: &OutputDeviceConfig) -> Result<OutputStreamAlignerProducer, Box<dyn std::error::Error>> {
+        aec_log("Add output device");
         let (stream, producer, consumer) = get_output_stream_aligners(config, &self.aec_config)?;
-        self.device_update_sender.send(DeviceUpdateMessage::AddOutputDevice(config.device_name.clone(), stream, consumer))?;
+        self.device_update_sender.try_send(DeviceUpdateMessage::AddOutputDevice(config.device_name.clone(), stream, consumer))?;
+        aec_log("Add output device done");
         Ok(producer)
     }
 
-    fn remove_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        self.device_update_sender.send(DeviceUpdateMessage::RemoveInputDevice(config.device_name.clone()))?;
+    pub fn remove_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
+        self.device_update_sender.try_send(DeviceUpdateMessage::RemoveInputDevice(config.device_name.clone()))?;
         Ok(())
     }
 
-    fn remove_output_device(&mut self, config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        self.device_update_sender.send(DeviceUpdateMessage::RemoveOutputDevice(config.device_name.clone()))?;
+    pub fn remove_output_device(&mut self, config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
+        self.device_update_sender.try_send(DeviceUpdateMessage::RemoveOutputDevice(config.device_name.clone()))?;
         Ok(())
     }
 
-    fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(), Box<dyn std::error::Error>> {
-        let (output_offsets, input_offsets) = self.get_calibration_offsets(output_producers, debug_wav)?;
+    pub async fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let (output_offsets, input_offsets) = self.get_calibration_offsets(output_producers, debug_wav).await?;
         // we need to throw away some samples for each device until we are calibrated
         // each device will have an offset (could be negative)
         for input_index in 0..input_offsets.len() {
@@ -1743,7 +1880,7 @@ impl AecStream {
             if let Some(aligner) = self.input_aligners.get_mut(&self.sorted_input_aligners[input_index].clone()) {
                 // skip ahead that many samples (* num channels bc it is multi channel)
                 if shift_needed > 0 {
-                    let (ok, chunk) = aligner.get_chunk_to_read((shift_needed as usize) * aligner.channels);
+                    let (_ok, chunk) = aligner.get_chunk_to_read((shift_needed as usize) * aligner.channels).await;
                     let chunk_len = chunk.len();
                     aligner.finish_read(chunk_len);
                 }
@@ -1752,16 +1889,15 @@ impl AecStream {
         Ok(())
     }
 
-    fn get_calibration_offsets(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(Vec<Option<i64>>, Vec<Vec<Option<i64>>>), Box<dyn std::error::Error>> {
+    async fn get_calibration_offsets(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(Vec<Option<i64>>, Vec<Vec<Option<i64>>>), Box<dyn std::error::Error>> {
         let sample_rate = self.aec_config.target_sample_rate as u32;
         // Probe length (~0.1s) to stay quick but audible.
         let tone_ms = 100.0;
         let capture_secs = 3.0;
 
         // 1) Emit a distinct probe on each output device (all channels), in sorted output order.
-        let mut active_streams: Vec<(usize, usize, StreamId)> = Vec::new();
+        let mut active_streams: Vec<(usize, StreamProducer)> = Vec::new();
         let mut tones = Vec::new();
-        let mut streams = Vec::new();
 
         for (idx, dev_name) in self.sorted_output_aligners.clone().iter().enumerate() {
             let Some(producer) = output_producers
@@ -1781,7 +1917,7 @@ impl AecStream {
                 out_channels.push(ch);
             }
             channel_map.insert(0, out_channels); // map first channel to play on all channels
-            let (stream_id, stream) = producer.begin_audio_stream(
+            let stream = producer.begin_audio_stream(
                 1, // 1 channel
                 channel_map,
                 2, // seconds of buffer for this probe
@@ -1789,11 +1925,10 @@ impl AecStream {
                 5, // resampler quality
             )?;
             tones.push(tone_mono);
-            active_streams.push((idx, channels, stream_id));
-            streams.push(stream);
+            active_streams.push((idx, stream));
         }
 
-        for (mut stream, tone) in streams.into_iter().zip(tones.into_iter()) {
+        for ((_, stream), tone) in active_streams.iter_mut().zip(tones.iter()) {
             stream.queue_audio(tone.as_slice());
         }
 
@@ -1823,7 +1958,7 @@ impl AecStream {
         let total_in_ch = self.input_channels.max(1);
         let total_out_ch = self.output_channels.max(1);
         while captured_micros < target_micros {
-            let (input_slices, output_slices, _aec_out, start_time, end_time) = self.update_debug()?;
+            let (input_slices, output_slices, _aec_out, start_time, end_time) = self.update_debug().await?;
             let chunk_micros = end_time.saturating_sub(start_time);
             if !input_slices.is_empty() && total_in_ch > 0 {
                 let frames = input_slices.len() / total_in_ch;
@@ -1857,9 +1992,9 @@ impl AecStream {
         }
 
         // 3) Stop probe streams now that capture is done.
-        for (idx, _channels, stream_id) in active_streams {
-            if let Some(producer) = output_producers.get(idx) {
-                producer.end_audio_stream(stream_id)?;
+        for (idx, stream) in active_streams.iter() {
+            if let Some(producer) = output_producers.get_mut(*idx) {
+                producer.end_audio_stream(stream)?;
             }
         }
 
@@ -1928,7 +2063,6 @@ impl AecStream {
             }
             for (input_idx, buf) in captured_inputs.iter().enumerate() {
                 let detections = detect_probe_tones(buf, output_producers.len(), tone_ms, sample_rate);
-                let mut start_for_dev: Option<(i64, f32)> = None;
                 for (output_idx, start, score) in detections {
                     let in_seconds = (start as f32) / (sample_rate as f32);
                     println!("Output {output_idx} -> Input {input_idx} has offset {start} {in_seconds} with score {score}");
@@ -1955,20 +2089,22 @@ impl AecStream {
 
     // calls update, but returns all involved audio buffers
     // (if needed for diagnostic reasons, usually .update() (which returns aec'd inputs) should be all you need)
-    fn update_debug(&mut self) -> Result<(&[i16], &[i16], &[f32], u128, u128), Box<dyn std::error::Error>> {
+    pub async fn update_debug(&mut self) -> Result<(&[i16], &[i16], &[f32], u128, u128), Box<dyn std::error::Error>> {
         let (start_time, end_time) = {
-            let (_, start_time, end_time) = self.update()?;
+            let (_, start_time, end_time) = self.update().await?;
             (start_time, end_time)
         };
         return Ok((self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), self.aec_out_audio_buffer.as_slice(), start_time, end_time));
     }
 
-    fn update(&mut self) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
+    pub async fn update(&mut self) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
+        aec_log("Called update");
         let chunk_size = self.aec_config.frame_size;
         let start_micros = if let Some(start_micros_value) = self.start_micros {
             start_micros_value
         } else {
-            let start_micros_value = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock went backwards").as_micros() - frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128);
+            let start_micros_value = now_micros()
+                .saturating_sub(frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128));
             self.start_micros = Some(start_micros_value);
             start_micros_value
         };
@@ -1978,8 +2114,8 @@ impl AecStream {
         // todo: move to crossbeam to avoid mpsc locks
         // todo: use actual timestamps on mac osx because they are system-wide (on linux they are device-wide so we have to do something else)
         loop {
-            match self.device_update_receiver.try_recv() {
-                Ok(msg) => match msg {
+            match self.device_update_receiver.try_next() {
+                Ok(Some(msg)) => match msg {
                     DeviceUpdateMessage::AddInputDevice(device_name, stream, aligner) => {
                         // old stream is stopped by default when it goes out of scope
                         self.input_streams.insert(device_name.clone(), stream);
@@ -2011,17 +2147,18 @@ impl AecStream {
                         self.reinitialize_aec()?;
                     }
                 }
-                Err(TryRecvError::Empty) => {
+                // sender dropped; receiver will never get more messages
+                Ok(None) => {
+                    eprintln!("Error: Aec stream update message send disconnected");
+                    break;
+                }
+                Err(_err) => {
                     // no message available right now
                     break;
                 }
-                Err(TryRecvError::Disconnected) => {
-                    // sender dropped; receiver will never get more messages
-                    eprintln!("Error: Stream message send disconnected");
-                    break;
-                }
-            } 
+            }
         }
+        aec_log("Done update recv try next");
         // similarly, if we initialize an output device here
         // we may not get any audio for a little bit
         if chunk_size == 0 {
@@ -2030,12 +2167,10 @@ impl AecStream {
          // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
         for key in self.input_aligners_in_progress.keys().cloned().collect::<Vec<String>>() {
-            let ready = self
-                .input_aligners_in_progress
-                .get_mut(&key)
-                .map(|a| a.is_ready_to_read(chunk_end_micros, chunk_size))
-                .unwrap_or(false);
-
+            let ready = match self.input_aligners_in_progress.get_mut(&key) {
+                Some(a) => a.is_ready_to_read(chunk_end_micros, chunk_size).await,
+                None => false,
+            };
             if ready {
                 if let Some(aligner) = self.input_aligners_in_progress.remove(&key) {
                     self.input_aligners.insert(key, aligner);
@@ -2044,12 +2179,10 @@ impl AecStream {
             }
         }
         for key in self.output_aligners_in_progress.keys().cloned().collect::<Vec<String>>() {
-            let ready = self
-                .output_aligners_in_progress
-                .get_mut(&key)
-                .map(|a| a.is_ready_to_read(chunk_end_micros, chunk_size))
-                .unwrap_or(false);
-
+            let ready = match self.output_aligners_in_progress.get_mut(&key) {
+                Some(a) => a.is_ready_to_read(chunk_end_micros, chunk_size).await,
+                None => false,
+            };
             if ready {
                 if let Some(aligner) = self.output_aligners_in_progress.remove(&key) {
                     self.output_aligners.insert(key, aligner);
@@ -2065,22 +2198,20 @@ impl AecStream {
         // recieve audio data and interleave it into our buffers
         let mut input_channel = 0;
         self.input_audio_buffer.fill(0 as i16);
-        let mut input_audio_tmp = vec![0f32; chunk_size];
 
         for key in &self.sorted_input_aligners {
             if let Some(aligner) = self.input_aligners.get_mut(key) {
                 let channels = aligner.channels;
                 let needed = chunk_size * channels;
-                let (ok, chunk) = aligner.get_chunk_to_read(needed);
+                let (ok, chunk) = aligner.get_chunk_to_read(needed).await;
                 let frames = chunk.len() / channels;
 
                 if ok && frames > 0 {
                     for c in 0..channels {
                         let mut src_idx = c;
                         let mut dst = input_channel + c;
-                        for i in 0..frames {
+                        for _ in 0..frames {
                             self.input_audio_buffer[dst] = Self::f32_to_i16(chunk[src_idx]);
-                            input_audio_tmp[i] += chunk[src_idx];
                             dst += self.input_channels;
                             src_idx += channels;
                         }
@@ -2092,6 +2223,7 @@ impl AecStream {
             }
         }
 
+        aec_log("Done update read aligners");
         let aec_output = if self.output_channels == 0 {
             // simply pass through input_channels, no need for aec
             &self.input_audio_buffer
@@ -2100,21 +2232,19 @@ impl AecStream {
                 
             let mut output_channel = 0;
             self.output_audio_buffer.fill(0 as i16);
-            let mut output_audio_tmp = vec![0f32; chunk_size];
             for key in &self.sorted_output_aligners {
                 if let Some(aligner) = self.output_aligners.get_mut(key) {
                     let channels = aligner.channels;
                     let needed = chunk_size * channels;
-                    let (ok, chunk) = aligner.get_chunk_to_read(needed);
+                    let (ok, chunk) = aligner.get_chunk_to_read(needed).await;
                     let frames = chunk.len() / channels;
 
                     if ok && frames > 0 {
                         for c in 0..channels {
                             let mut src_idx = c;
                             let mut dst = output_channel + c;
-                            for i in 0..frames {
+                            for _ in 0..frames {
                                 self.output_audio_buffer[dst] = Self::f32_to_i16(chunk[src_idx]);
-                                output_audio_tmp[i] += chunk[src_idx];
                                 dst += self.output_channels;
                                 src_idx += channels;
                             }
@@ -2132,54 +2262,47 @@ impl AecStream {
                 &self.aec_audio_buffer
             }
             else {
-                let Some(aec) = self.aec.as_mut() else { 
-                    return Err("no aec".into());
-                };
-
-                //if let Some(aec2) = self.aec2 {
-                //    let output_frame = aec2.process(far_end_frame, mic_frame);
-                //}
-                for i in 0..chunk_size {
-                    //self.input_audio_buffer[i] = Self::f32_to_i16(input_audio_tmp[i]);
-                    //self.output_audio_buffer[i] = Self::f32_to_i16(output_audio_tmp[i]);
-                }
+                //let Some(aec) = self.aec.as_mut() else { 
+                //    return Err("no aec".into());
+                //};
                 
                 // skip ahead if no output, as there's nothing to cancel
                 // this helps avoid needing to recalibrate every time we recieve audio
                 let output_energy = Self::energy(&self.output_audio_buffer);
-                let input_energy = Self::energy(&self.input_audio_buffer);
-                if energy < 0.003 {
-                    println!("skipping with energy {energy}");
+                let _input_energy = Self::energy(&self.input_audio_buffer);
+                if output_energy < 0.003 {
+                    println!("skipping with energy {output_energy}");
                     self.aec_audio_buffer.copy_from_slice(&self.input_audio_buffer);
                 }
                 else {
-                    //aec.cancel_frame(&self.input_audio_buffer[..chunk_size], &self.output_audio_buffer[..chunk_size], &mut self.aec_audio_buffer[..chunk_size]);
-                    aec.cancel_frame(self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), &mut self.aec_audio_buffer.as_mut_slice());
+                    ////// aec3
+                    let Some(aec3_value) = self.aec3.as_mut() else {
+                        return Err("No aec3".into());
+                    };
+                    let mut input_audio_tmp = vec![0f32; self.input_audio_buffer.len()];
+                    let mut output_audio_tmp = vec![0f32; self.output_audio_buffer.len()];
+                    let mut aec_audio_tmp =  vec![0f32; self.input_audio_buffer.len()];
+                    for i in 0..input_audio_tmp.len() {
+                        input_audio_tmp[i] = f32::from_sample(self.input_audio_buffer[i]);
+                    }
+                    for i in 0..output_audio_tmp.len() {
+                        output_audio_tmp[i] = f32::from_sample(self.output_audio_buffer[i]);
+                    }
+                    let _metrics = aec3_value.process(&input_audio_tmp, Some(&output_audio_tmp), false, &mut aec_audio_tmp)?;
+
+                    for i in 0..aec_audio_tmp.len() {
+                        self.aec_audio_buffer[i] = i16::from_sample(aec_audio_tmp[i]);
+                    }
                 }
                 
-                /*
-                unsafe {
-                    speex_echo_cancellation(
-                        aec.as_ptr(),
-                        self.input_audio_buffer.as_ptr(),
-                        self.output_audio_buffer.as_ptr(),
-                        self.aec_audio_buffer.as_mut_ptr(),
-                    );
-                }
-                */
                 &self.aec_audio_buffer
             }
         };
         
+        aec_log("Done aec");
         for (out, sample) in self.aec_out_audio_buffer.iter_mut().zip(aec_output) {
             *out = f32::from_sample(*sample);
         }
-
-        //let timestamp_value = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock went backwards").as_micros();
-        //let diff = (((chunk_end_micros as i128 - timestamp_value as i128) as f32) / 1000.0) / (self.aec_config.target_sample_rate as f32);
-        //let frame_size_seconds = (chunk_size as f32) / (self.aec_config.target_sample_rate as f32);
-        //println!("{diff} chunk_size {frame_size_seconds}");
-     
 
         Ok((self.aec_out_audio_buffer.as_slice(), chunk_start_micros, chunk_end_micros))
     }
@@ -2212,6 +2335,38 @@ impl AecStream {
 }
     
 
+
+pub async fn get_supported_output_configs(
+    history_len: usize,
+    num_calibration_packets: u32,
+    audio_buffer_seconds: u32,
+    resampler_quality: i32,
+    frame_size: u32) -> Result<Vec<Vec<OutputDeviceConfig>>, Box<dyn std::error::Error>>  {
+    let mut configs = Vec::new();
+    // need to use these wrappers to ensure wasm is treated properly
+    for host_id in cpal::available_hosts() {
+        for output_device_name in get_output_device_names(&host_id).await? {
+            configs.push(get_supported_output_device_configs(&host_id, &output_device_name, history_len, num_calibration_packets, audio_buffer_seconds, resampler_quality, frame_size).await?);
+        }
+    }
+    Ok(configs)
+}
+
+pub async fn get_supported_input_configs(
+    history_len: usize,
+    num_calibration_packets: u32,
+    audio_buffer_seconds: u32,
+    resampler_quality: i32) -> Result<Vec<Vec<InputDeviceConfig>>, Box<dyn std::error::Error>> {
+    let mut configs = Vec::new();
+    // need to use these wrappers to ensure wasm is treated properly
+    for host_id in cpal::available_hosts() {
+        for input_device_name in get_input_device_names(&host_id).await? {
+            configs.push(get_supported_input_device_configs(&host_id, &input_device_name, history_len, num_calibration_packets, audio_buffer_seconds, resampler_quality).await?);
+        }
+    }
+    Ok(configs)
+}
+
 fn get_host_by_name(target: &str) -> Option<Host> {
     for host_id in cpal::available_hosts() {
         if host_id.name().eq_ignore_ascii_case(target) {
@@ -2220,9 +2375,61 @@ fn get_host_by_name(target: &str) -> Option<Host> {
     }
     None
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn select_input_device(
+    host_id: &cpal::HostId,
+    device_name: &str
+) -> Result<InputDevice, Box<dyn Error>>
+{
+    let host = cpal::host_from_id(host_id)?;
+    select_device(
+        host.input_devices(),
+        device_name,
+        "Input",
+    )?;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn select_input_device(
+    _host_id: &cpal::HostId,
+    device_name: &str
+) -> Result<InputDevice, Box<dyn Error>>
+{
+    match get_webaudio_input_devices().await {
+        Ok(device_iter) => {
+            aec_log("Got webaudio input devices");
+            let mut available = Vec::new();
+
+            for device in device_iter {
+                let name = device.device_id.clone();
+                aec_log(format!("Device {name}"));
+                available.push(name.clone());
+
+                if &name == device_name {
+                    aec_log(format!("Device found {name}"));
+                    return Ok(device);
+                }
+            }
+            let quoted = available
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            aec_log(format!("Failed find device {device_name} available {quoted}"));
+            Err(format!(
+                "Input device matching '{device_name}' not found. Available: {quoted}"
+            )
+            .into())
+        }
+        Err(err) => Err(format!("Failed to enumerate input devices: {err}").into()),
+    }
+}
+
 fn select_device<I>(
     devices: Result<I, cpal::DevicesError>,
-    target: &str,
+    device_name: &str,
     kind: &str,
 ) -> Result<Device, Box<dyn Error>>
 where
@@ -2235,7 +2442,7 @@ where
                 let name = device.name().unwrap_or_else(|_| "<unknown device>".to_string());
                 available.push(name.clone());
 
-                if &name == target {
+                if &name == device_name {
                     return Ok(device);
                 }
             }
@@ -2246,12 +2453,202 @@ where
                 .collect::<Vec<_>>()
                 .join(", ");
             Err(format!(
-                "{kind} device matching '{target}' not found. Available: {quoted}"
+                "{kind} device matching '{device_name}' not found. Available: {quoted}"
             )
             .into())
         }
         Err(err) => Err(format!("Failed to enumerate {kind} devices: {err}").into()),
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_input_device_names(_host_id: &cpal::HostId) -> Result<Vec<String>, Box<dyn Error>> {
+    match get_webaudio_input_devices().await {
+        Ok(device_iter) => {
+            let mut available = Vec::new();
+
+            for device in device_iter {
+                let name = device.device_id;
+                available.push(name.clone());
+            }
+            // don't sort since the order matters, first is default
+            Ok(available)
+        }
+        Err(err) => Err(format!("Failed to enumerate input devices: {err}").into()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn get_input_device_names(host_id: &cpal::HostId) -> Result<Vec<String>, Box<dyn Error>> {
+    let host = cpal::host_from_id(*host_id)?;
+    let mut available = Vec::new();
+    for dev in host.input_devices()? {
+        available.push(dev.name()?.clone());
+    }
+    Ok(available)
+}
+
+async fn get_output_device_names(host_id: &cpal::HostId) -> Result<Vec<String>, Box<dyn Error>> {
+    let host = cpal::host_from_id(*host_id)?;
+    let mut available = Vec::new();
+    for dev in host.output_devices()? {
+        available.push(dev.name()?.clone());
+    }
+    Ok(available)
+}
+
+
+static COMMON_SAMPLE_RATES: [u32; 21] = [5512, 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000, 128000, 176400, 192000, 256000, 352800, 384000, 705600, 768000];
+
+fn get_sample_rates_in_range(min_rate: u32, max_rate: u32) -> Vec<u32> {
+    let mut rates = HashSet::new();
+    rates.insert(min_rate);
+    rates.insert(max_rate);
+
+    for rate in COMMON_SAMPLE_RATES {
+        if rate >= min_rate && rate <= max_rate {
+            rates.insert(rate);
+        }
+    }
+    
+    let mut list: Vec<u32> = rates.into_iter().collect();
+    list.sort_unstable();
+    list
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_supported_input_device_configs(
+    host_id: &cpal::HostId,
+    device_name: &String,
+    history_len: usize,
+    num_calibration_packets: u32,
+    audio_buffer_seconds: u32,
+    resampler_quality: i32) -> Result<Vec<InputDeviceConfig>, Box<dyn Error>> {
+
+    // wasm only has one
+    let default_config = InputDeviceConfig::from_default(
+        host_id.clone(),
+        device_name.clone(),
+        // number of audio chunks to hold in memory, for aligning input devices's values when dropped frames/clock offsets. 100 or so is fine
+        history_len, // history_len 
+        // number of packets recieved before we start getting audio data
+        // a larger value here will take longer to connect, but result in more accurate timing alignments
+        num_calibration_packets, // calibration_packets
+        // how long buffer of input audio to store, should only really need a few seconds as things are mostly streamed
+        audio_buffer_seconds, // audio_buffer_seconds
+        resampler_quality // resampler_quality
+    ).await?;
+
+    let mut result_configs = Vec::new();
+    result_configs.push(default_config);
+    Ok(result_configs)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn get_supported_input_device_configs(
+    host_id: &cpal::HostId,
+    device_name: &String,
+    history_len: usize,
+    num_calibration_packets: u32,
+    audio_buffer_seconds: u32,
+    resampler_quality: i32,
+) -> Result<Vec<InputDeviceConfig>, Box<dyn Error>> {
+    // put default as first item in list
+    let default_config = InputDeviceConfig::from_default(
+        host_id.clone(),
+        device_name.clone(),
+        // number of audio chunks to hold in memory, for aligning input devices's values when dropped frames/clock offsets. 100 or so is fine
+        history_len, // history_len 
+        // number of packets recieved before we start getting audio data
+        // a larger value here will take longer to connect, but result in more accurate timing alignments
+        num_calibration_packets, // calibration_packets
+        // how long buffer of input audio to store, should only really need a few seconds as things are mostly streamed
+        audio_buffer_seconds, // audio_buffer_seconds
+        resampler_quality // resampler_quality
+    ).await?;
+
+    let result_configs = Vec::new();
+    result_configs.push(default_config);
+
+    let configs : Vec<_> = device.supported_input_configs().map(|configs| configs.collect())
+            .map_err(|err| format!("Unable to enumerate input configs for '{device_name}': {err}"))?;
+
+    for cfg in configs {
+        let min_rate = cfg.min_sample_rate().0;
+        let max_rate = cfg.max_sample_rate().0;
+        for sample_rate in get_sample_rates_in_range(min_rate, max_rate).iter() {
+            let device_config = InputDeviceConfig::new(
+                host_id.clone(),
+                device_name.clone(),
+                cfg.channels(),
+                *sample_rate,
+                cfg.sample_format(),
+                history_len,
+                num_calibration_packets,
+                audio_buffer_seconds,
+                resampler_quality);
+            if device_config != default_config {
+                result_configs.push(device_config);
+            }
+        }
+    }
+    Ok(result_configs)
+}
+
+
+async fn get_supported_output_device_configs(
+    host_id: &cpal::HostId,
+    device_name: &String,
+    history_len: usize,
+    num_calibration_packets: u32,
+    audio_buffer_seconds: u32,
+    resampler_quality: i32,
+    frame_size: u32,
+) -> Result<Vec<OutputDeviceConfig>, Box<dyn Error>> {
+    // put default as first item in list
+    let default_config = OutputDeviceConfig::from_default(
+        host_id.clone(),
+        device_name.clone(),
+        // number of audio chunks to hold in memory, for aligning input devices's values when dropped frames/clock offsets. 100 or so is fine
+        history_len, // history_len 
+        // number of packets recieved before we start getting audio data
+        // a larger value here will take longer to connect, but result in more accurate timing alignments
+        num_calibration_packets, // calibration_packets
+        // how long buffer of input audio to store, should only really need a few seconds as things are mostly streamed
+        audio_buffer_seconds, // audio_buffer_seconds
+        resampler_quality, // resampler_quality
+        frame_size
+    ).await?;
+
+    let mut result_configs = Vec::new();
+    result_configs.push(default_config.clone());
+
+    let host = cpal::host_from_id(*host_id)?;
+    let device = select_device(host.output_devices(), &device_name, "Output")?;
+    let configs : Vec<_> = device.supported_output_configs().map(|configs| configs.collect())
+            .map_err(|err| format!("Unable to enumerate output configs for '{device_name}': {err}"))?;
+
+    for cfg in configs {
+        let min_rate = cfg.min_sample_rate().0;
+        let max_rate = cfg.max_sample_rate().0;
+        for sample_rate in get_sample_rates_in_range(min_rate, max_rate).iter()  {
+            let device_config = OutputDeviceConfig::new(
+                host_id.clone(),
+                device_name.clone(),
+                cfg.channels() as usize,
+                *sample_rate,
+                cfg.sample_format(),
+                history_len,
+                num_calibration_packets,
+                audio_buffer_seconds,
+                resampler_quality,
+                frame_size);
+            if device_config != default_config {
+                result_configs.push(device_config);
+            }
+        }
+    }
+    Ok(result_configs)
 }
 
 fn supported_device_configs_to_string(
@@ -2287,6 +2684,78 @@ fn supported_device_configs_to_string(
         })
         .collect::<Vec<_>>()
         .join("\n      "))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_default_input_device_config(host_id: &cpal::HostId, device_name: &String) -> Result<SupportedStreamConfig, Box<dyn Error>> {
+    let device = select_input_device(
+        &host_id,
+        &device_name
+    ).await?;
+
+    // it stores the defaults in the device itself, for wasm
+    Ok(SupportedStreamConfig::new(
+        device.channels as u16,
+        SampleRate(device.sample_rate),
+        SupportedBufferSize::Unknown,
+        device.sample_format,
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn get_default_input_device_config(host_id: &cpal::HostId, device_name: &String) -> Result<SupportedStreamConfig, Box<dyn Error>> {
+    let device = select_input_device(
+        &host_id,
+        &device_name
+    ).await?;
+
+    device.default_input_config()?
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn find_matching_input_device_config(
+    device: &InputDevice,
+    device_name: &String,
+    channels: usize,
+    sample_rate: u32,
+    format: SampleFormat,
+) -> Result<SupportedStreamConfig, Box<dyn Error>> {
+    // wasm only supports one format (for some browsers), just check against that
+    if channels != device.channels || 
+        sample_rate != device.sample_rate ||
+        format != SampleFormat::F32 {
+        let supported_str = format!("{} channel(s), {:?}, sample rate: {}",
+            device.channels, SampleFormat::F32, device.sample_rate);
+        Err(format!("Input device '{}' does not support {} channel(s), {:?} at {} Hz. Supported configs: {}",
+            device_name, channels, format, sample_rate, supported_str
+        ).into())
+    } else {
+        // construct it from the device data
+        Ok(SupportedStreamConfig::new(
+            device.channels as u16,
+            SampleRate(device.sample_rate),
+            SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        ))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn find_matching_input_device_config(
+    device: &InputDevice,
+    device_name: &String,
+    channels: usize,
+    sample_rate: u32,
+    format: SampleFormat,
+) -> Result<SupportedStreamConfig, Box<dyn Error>> {
+    find_matching_device_config(
+        &(*device as Device),
+        device_name,
+        channels,
+        sample_rate,
+        format,
+        "Input",
+    )
 }
 
 fn find_matching_device_config(
@@ -2354,47 +2823,48 @@ fn find_matching_device_config(
 
 
 
-fn build_input_alignment_stream(
-    device: &Device,
+async fn build_input_alignment_stream(
+    device: &InputDevice,
     config: &InputDeviceConfig,
     supported_config: SupportedStreamConfig,
     channel_aligners: StreamAlignerProducer,
-) -> Result<Stream, cpal::BuildStreamError> {
+) -> Result<InputStream, Box<dyn Error>> {
     match config.sample_format {
         SampleFormat::I16 => build_input_alignment_stream_typed::<i16>(
             device,
             config,
             supported_config,
             channel_aligners,
-        ),
+        ).await,
         SampleFormat::F32 => build_input_alignment_stream_typed::<f32>(
             device,
             config,
             supported_config,
             channel_aligners,
-        ),
+        ).await,
         SampleFormat::U16 => build_input_alignment_stream_typed::<u16>(
             device,
             config,
             supported_config,
             channel_aligners,
-        ),
+        ).await,
         other => {
             eprintln!(
                 "Input device '{0}' uses unsupported sample format {other:?}; cannot build StreamAligner.",
                 config.device_name
             );
-            Err(cpal::BuildStreamError::StreamConfigNotSupported)
+            Err(Box::new(cpal::BuildStreamError::StreamConfigNotSupported))
         }
     }
 }
 
-fn build_input_alignment_stream_typed<T>(
-    device: &Device,
+#[cfg(not(target_arch = "wasm32"))]
+async fn build_input_alignment_stream_typed<T>(
+    device: &InputDevice,
     config: &InputDeviceConfig,
     supported_config: SupportedStreamConfig,
     mut channel_aligner: StreamAlignerProducer,
-) -> Result<Stream, cpal::BuildStreamError>
+) -> Result<InputStream, Box<dyn Error>>
 where
     T: Sample + SizedSample,
     f32: FromSample<T>,
@@ -2426,6 +2896,25 @@ where
         move |err| eprintln!("Input stream '{device_name}' error: {err}",),
         None,
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn build_input_alignment_stream_typed<T>(
+    device: &InputDevice,
+    config: &InputDeviceConfig,
+    _supported_config: SupportedStreamConfig,
+    mut channel_aligner: StreamAlignerProducer,
+) -> Result<InputStream, Box<dyn Error>>
+where
+    T: Sample + SizedSample,
+    f32: FromSample<T>,
+{    
+    let device_name_inner = config.device_name.clone();
+    Ok(build_webaudio_input_stream(device as &InputDeviceInfo, move |data: &[f32]| {
+        if let Err(err) = channel_aligner.process_chunk(data) {
+                eprintln!("Input stream '{device_name_inner}' error when process chunk {err}");
+        }
+    }).await?)
 }
 
 fn build_output_alignment_stream(
@@ -2519,171 +3008,371 @@ where
     )
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let frame_size_ms = 20;
-    let filter_length_ms = 100;
-    let aec_sample_rate = 16000;
-    let multi_channel = false;
-    let aec_config = AecConfig::new(
-        aec_sample_rate,
-        (aec_sample_rate * frame_size_ms / 1000) as usize,
-        (aec_sample_rate * filter_length_ms / 1000) as usize,
-    );
-    let mut stream = AecStream::new(aec_config)?;
 
-    let host_ids = cpal::available_hosts();
-    for host_id in host_ids {
-        println!("Host: '{}'", host_id.name());
+#[cfg(target_arch = "wasm32")]
+/// Discovered details for a specific audio input device obtained via `getUserMedia` constraints.
+#[derive(Clone, Debug)]
+pub struct InputDeviceInfo {
+    pub device_id: String,
+    pub label: Option<String>,
+    pub sample_rate: u32,
+    pub channels: usize,
+    pub sample_format: cpal::SampleFormat,
+}
 
-        // If you want to inspect devices:
-        let host = cpal::host_from_id(host_id)?;
-        for dev in host.input_devices()? {
-            println!("  input: '{}'", dev.name()?);
-            match supported_device_configs_to_string(&dev, &dev.name()?, "Input") {
-                Ok(cfgs) => println!("      {cfgs}"),
-                Err(err) => println!("      {err}"),
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn helper_log(msg: impl AsRef<str>) {
+    let msg = msg.as_ref();
+    #[cfg(target_arch = "wasm32")]
+    {
+        use js_sys::{Function, Reflect};
+        let global = js_sys::global();
+        let key = JsValue::from_str("logMessage");
+        if let Ok(val) = Reflect::get(&global, &key) {
+            if let Some(func) = val.dyn_ref::<Function>() {
+                let _ = func.call1(&JsValue::NULL, &JsValue::from_str(msg));
+                return;
             }
         }
-        for dev in host.output_devices()? {
-            println!("  output: '{}'", dev.name()?);
-            match supported_device_configs_to_string(&dev, &dev.name()?, "Output") {
-                Ok(cfgs) => println!("      {cfgs}"),
-                Err(err) => println!("      {err}"),
-            }
+        // Fallback if the JS helper isn't present.
+        web_sys::console::log_1(&JsValue::from_str(msg));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        println!("{msg}");
+    }
+}
+#[cfg(target_arch = "wasm32")]
+#[macro_export]
+macro_rules! helper_log {
+    ($($t:tt)*) => {
+        $crate::aec::helper_log(format!($($t)*))
+    };
+}
+
+#[cfg(target_arch = "wasm32")]
+pub struct WasmStream {
+    device_id: String
+}
+#[cfg(target_arch = "wasm32")]
+impl WasmStream {
+    pub fn new(device_id: String) -> Self {
+        Self {
+            device_id: device_id
         }
     }
-    let frame_size = stream.aec_config.frame_size;
-    println!("Frame size {frame_size}");
 
-    let resampler_quality = 5;
-
-    let host = get_host_by_name("ALSA").unwrap_or_else(cpal::default_host);
-    let input_device_config = InputDeviceConfig::from_default(
-        host.id(),
-        "front:CARD=Beyond,DEV=0".to_string(),
-        // number of audio chunks to hold in memory, for aligning input devices's values when dropped frames/clock offsets. 100 or so is fine
-        100, // history_len 
-        // number of packets recieved before we start getting audio data
-        // a larger value here will take longer to connect, but result in more accurate timing alignments
-        20, // calibration_packets
-        // how long buffer of input audio to store, should only really need a few seconds as things are mostly streamed
-        20, // audio_buffer_seconds
-        resampler_quality // resampler_quality
-    )?;
-
-    let output_device_config = OutputDeviceConfig::from_default(
-        host.id(),
-        "default".to_string(),
-        100, // history_len
-        20, // calibration_packets
-        20, // audio_buffer_seconds, just for resampling (actual audio buffer determined upon begin_audio_stream creation)
-        resampler_quality, // resampler_quality
-        3, // frame_size_millis (3 millis of audio per frame)
-    )?;
-
-    stream.add_input_device(&input_device_config)?;
-    let mut stream_output_creator = stream.add_output_device(&output_device_config)?;
-
-    // output wav files for debugging
-    let pcm_spec_input = WavSpec {
-        channels: input_device_config.channels as u16,
-        sample_rate: aec_sample_rate, // 16_000 in your config
-        bits_per_sample: 16,
-        sample_format: HoundSampleFormat::Int,
-    };
-
-    let pcm_spec_output = WavSpec {
-        channels: output_device_config.channels as u16,
-        ..pcm_spec_input
-    };    
+    pub async fn play(&self) -> Result<(), JsErr> {
+        let window = web_sys::window().ok_or_else(|| JsValue::from_str("window not available"))?;
+        let navigator: Navigator = window.navigator();
+        let media_devices: MediaDevices = navigator.media_devices()?;
     
-    let aec_spec = WavSpec {
-        sample_format: HoundSampleFormat::Float,
-        bits_per_sample: 32,
-        ..pcm_spec_input
-    };
+        let (device_stream, audio_context, source) = take_cached_stream(&media_devices, &self.device_id).await?;
 
-    let mut in_wav = WavWriter::create("aligned_input.wav", pcm_spec_input)?;
-    let mut out_wav = WavWriter::create("aligned_output.wav", pcm_spec_output)?;
-    let mut aec_wav = WavWriter::create("aec_applied.wav", aec_spec)?;
-
-    // input wav file to output
-    let mut wav = WavReader::open("examples/example_talking.wav")?;
-    let spec = wav.spec();
-    let wav_channels = spec.channels as usize;
-    let wav_rate = spec.sample_rate;
-    let wav_samples: Vec<f32> = match spec.sample_format {
-        HoundSampleFormat::Int => wav
-            .samples::<i16>()
-            .map(|s| f32::from_sample(s.unwrap()))
-            .collect(),
-        HoundSampleFormat::Float => wav.samples::<f32>().map(|s| s.unwrap()).collect(),
-    };
-
-    let mut channel_map = HashMap::new();
-    for i in 0..wav_channels {
-        let mut mapped_to_channels = Vec::new();
-        mapped_to_channels.push(0);
-        channel_map.insert(i, mapped_to_channels); // map all wav channels to first output channel, for testing
+        JsFuture::from(audio_context.resume()?).await?;
+        put_cached_stream(&self.device_id, device_stream, audio_context, source);
+        Ok(())
     }
 
-    let (_stream_id, mut stream_output) = stream_output_creator.begin_audio_stream(
-        wav_channels as usize,
-        channel_map,
-        ((wav_samples.len()/(wav_rate as usize) + 1)*2000) as u32, // audio_buffer_seconds, needs to be long enough to hold all the audio
-        wav_rate,
-        resampler_quality
-    )?;
-
-
-    // waits for channels to calibrate
-    while stream.num_input_channels() == 0 || stream.num_output_channels() == 0 {
-        let (aligned_input, aligned_output, aec_applied, _start_time, _end_time) = stream.update_debug()?;
-        // don't write to wav files bc if one device is ready before another,
-        // that device will have more samples written
-        // which makes it annoying to check alignments in audacity
+    pub async fn pause(&self) -> Result<(), JsErr> {
+        let window = web_sys::window().ok_or_else(|| JsValue::from_str("window not available"))?;
+        let navigator: Navigator = window.navigator();
+        let media_devices: MediaDevices = navigator.media_devices()?;
+    
+        let (device_stream, audio_context, source) = take_cached_stream(&media_devices, &self.device_id).await?;
+        
+        JsFuture::from(audio_context.suspend()?).await?;
+        put_cached_stream(&self.device_id, device_stream, audio_context, source);
+        Ok(())
     }
-
-    println!("Computing calibration");
-    stream.calibrate(std::slice::from_mut(&mut stream_output_creator), true)?;
-    println!("calibrated");
-
-    let silence = vec![0.0f32; wav_samples.len()];
-    // enqueues audio samples to be played after each other
-    stream_output.queue_audio(wav_samples.as_slice());
-    stream_output.queue_audio(&silence);
-    stream_output.queue_audio(&silence);
-    stream_output.queue_audio(wav_samples.as_slice());
-    stream_output.queue_audio(&silence);
-    stream_output.queue_audio(&silence);
-    stream_output.queue_audio(wav_samples.as_slice());
-    stream_output.queue_audio(&silence);
-    stream_output.queue_audio(wav_samples.as_slice());
-
-
-    for _i in 0..3000 {
-        let num_input_channels = stream.num_input_channels();
-        let (aligned_input, aligned_output, aec_applied, _start_time, _end_time) = stream.update_debug()?;
-        let chunk_size = aligned_input.len() / num_input_channels;
-        //for &s in aligned_input[..chunk_size].iter() { in_wav.write_sample(s)?; }
-        //for &s in aligned_output[..chunk_size].iter() { out_wav.write_sample(s)?; }
-        //for &s in aec_applied[..chunk_size].iter() { aec_wav.write_sample(s)?; }
-        for &s in aligned_input.iter() { in_wav.write_sample(s)?; }
-        for &s in aligned_output.iter() { out_wav.write_sample(s)?; }
-        for &s in aec_applied.iter() { aec_wav.write_sample(s)?; }
-        //println!("Got {} samples", aec_applied.len());
+}
+#[cfg(target_arch = "wasm32")]
+// lets us auto convert JsValue to Error
+#[derive(Debug, thiserror::Error)]
+pub enum JsErr {
+    #[error("js error: {0}")]
+    Js(String),
+}
+#[cfg(target_arch = "wasm32")]
+impl From<JsValue> for JsErr {
+    fn from(v: JsValue) -> Self {
+        JsErr::Js(
+            v.as_string()
+            .or_else(|| js_sys::Error::from(v.clone()).message().as_string())
+            .unwrap_or_else(|| format!("{v:?}"))
+        )
     }
-    
-    stream_output_creator.end_audio_stream(_stream_id);
-    
-    stream_output_creator.interrupt_all_streams();
-    
-    stream.remove_input_device(&input_device_config)?;
-    stream.remove_output_device(&output_device_config)?;
+}
+#[cfg(target_arch = "wasm32")]
+async fn cleanup_audio_context(context: web_sys::AudioContext) {
+    match context.close() {
+        Ok(val) => {
+            match JsFuture::from(val).await {
+                Ok(_) => {
 
-    in_wav.finalize()?;
-    out_wav.finalize()?;
-    aec_wav.finalize()?;
+                }
+                Err(err) => {
+                    let error_error = JsErr::from(err);
+                    eprintln!("Cleanup wasm stream failed: {error_error}");
+                }
+            }
+        }
+        Err(err) => {
+            let error_error = JsErr::from(err);
+            eprintln!("Cleanup wasm stream failed: {error_error}");
+        }
+    }
+}
+#[cfg(target_arch = "wasm32")]
+fn buffer_time_step_secs(buffer_size_frames: usize, sample_rate: u32) -> f64 {
+    buffer_size_frames as f64 / (sample_rate as f64)
+}
 
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    // Cache the MediaDevices handle after permission is granted. Do not retain the stream; keeping
+    // it alive can hold the microphone and block future getUserMedia calls.
+    static INPUT_ACCESS_CACHE: RefCell<Option<MediaDevices>> = RefCell::new(None);
+    static INPUT_DEVICE_CACHE: RefCell<Option<Vec<InputDeviceInfo>>> = RefCell::new(None);
+    static DEVICE_PROBE_CACHE: RefCell<HashMap<String, (MediaStream, AudioContext, MediaStreamAudioSourceNode)>> = RefCell::new(HashMap::new());
+}
+#[cfg(target_arch = "wasm32")]
+fn cleanup_stream(stream: web_sys::MediaStream) {
+    let tracks = stream.get_tracks();
+    let length = tracks.length();
+    
+    for i in 0..length {
+        if let Some(track) = tracks.get(i).dyn_ref::<MediaStreamTrack>() {
+            track.stop();
+        }
+    }
+    // Note: remove_track might not be necessary after stop()
+}
+
+
+#[cfg(target_arch = "wasm32")]
+pub async fn request_input_access() -> Result<(), JsErr> {
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("window not available"))?;
+    let navigator: Navigator = window.navigator();
+    let media_devices: MediaDevices = navigator.media_devices()?;
+
+    let constraints = MediaStreamConstraints::new();
+    constraints.set_audio(&JsValue::from_bool(true));
+    constraints.set_video(&JsValue::from_bool(false));
+
+    let default_stream = media_devices.get_user_media_with_constraints(&constraints)?;
+    let default_stream = JsFuture::from(default_stream)
+        .await
+        .map_err(|e| {
+            helper_log(format!("getUserMedia rejected: {e:?}"));
+            e
+        })?;
+    let default_stream: MediaStream = default_stream.dyn_into()?;
+    cleanup_stream(default_stream);
     Ok(())
+}
+#[cfg(target_arch = "wasm32")]
+async fn take_cached_stream(media_devices: &MediaDevices, device_id: &String) -> Result<(MediaStream, AudioContext, MediaStreamAudioSourceNode), JsErr> {
+
+
+    let entry = DEVICE_PROBE_CACHE.with(|cache| cache.borrow_mut().remove(device_id));
+    let (device_stream, audio_context, source) = if let Some(probe) = entry {
+        probe
+    } else {
+
+        // Probe the specific device so we can grab its channel count and sample rate.
+        let constraints = MediaStreamConstraints::new();
+        constraints.set_video(&JsValue::from_bool(false));
+
+        let audio_obj = js_sys::Object::new();
+        let device_obj = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &device_obj,
+            &JsValue::from_str("exact"),
+            &JsValue::from_str(&device_id),
+        );
+        let _ = js_sys::Reflect::set(&audio_obj, &JsValue::from_str("deviceId"), &device_obj);
+        constraints.set_audio(&audio_obj.into());
+
+        let device_stream = media_devices.get_user_media_with_constraints(&constraints)?;
+        let device_stream = JsFuture::from(device_stream).await?;
+        let device_stream: MediaStream = device_stream.dyn_into()?;
+
+        let audio_context = AudioContext::new()?;
+        // Necessary to read sample rate in some browsers.
+        let source = audio_context.create_media_stream_source(&device_stream)?;
+
+        (device_stream, audio_context, source)
+    };
+
+    Ok((device_stream, audio_context, source))
+}
+#[cfg(target_arch = "wasm32")]
+fn put_cached_stream(device_name: &String, device_stream: MediaStream, audio_context: AudioContext, source: MediaStreamAudioSourceNode) {
+    DEVICE_PROBE_CACHE.with(|cache| {
+        cache.borrow_mut().insert(device_name.clone(), (device_stream, audio_context, source));
+    });
+}
+#[cfg(target_arch = "wasm32")]
+pub async fn get_webaudio_input_devices() -> Result<Vec<InputDeviceInfo>, JsErr> {
+    if let Some(cached_input_devices) = INPUT_DEVICE_CACHE.with(|cell| cell.borrow().clone()) {
+        return Ok(cached_input_devices);
+    }
+    request_input_access().await?;
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("window not available"))?;
+    let navigator: Navigator = window.navigator();
+    let media_devices: MediaDevices = navigator.media_devices()?;
+    // Now enumerate concrete audio input devices and probe each with its deviceId constraint.
+    let devices = JsFuture::from(media_devices.enumerate_devices()?).await?;
+    let devices: js_sys::Array = devices.dyn_into()?;
+    let mut infos = Vec::new();
+
+    for device in devices.iter() {
+        let kind = js_sys::Reflect::get(&device, &JsValue::from_str("kind"))
+            .ok()
+            .and_then(|k| k.as_string());
+        if kind.as_deref() != Some("audioinput") {
+            continue;
+        }
+
+        let device_id = js_sys::Reflect::get(&device, &JsValue::from_str("deviceId"))
+            .ok()
+            .and_then(|id| id.as_string())
+            .unwrap_or_default();
+        if device_id.is_empty() {
+            continue;
+        }
+
+        let label = js_sys::Reflect::get(&device, &JsValue::from_str("label"))
+            .ok()
+            .and_then(|l| l.as_string())
+            .filter(|l| !l.is_empty());
+
+        //let (device_stream, audio_context, source) = take_cached_stream(&media_devices, &device_id).await?;
+
+        //let sample_rate = audio_context.sample_rate() as u32;
+        //let channels = source.channel_count() as usize;
+
+        let sample_format = SampleFormat::F32;
+
+        infos.push(InputDeviceInfo {
+            device_id: device_id.clone(),
+            label,
+            sample_rate: 44000,// sample_rate,
+            channels: 2, //channels,
+            sample_format, // wasm is always f32 sample format
+        });
+
+        //put_cached_stream(&device_id, device_stream, audio_context, source);
+    }
+    INPUT_DEVICE_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some(infos.clone()); // clone if you still need `devices` locally
+    });
+    Ok(infos)
+}
+
+
+#[cfg(target_arch = "wasm32")]
+pub async fn build_webaudio_input_stream<D>(
+    device_info: &InputDeviceInfo,
+    mut data_callback: D,
+) -> Result<WasmStream, JsErr>
+    where
+        D: FnMut(&[f32]) + Send + 'static,
+{
+    
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("window not available"))?;
+    let navigator: Navigator = window.navigator();
+    let media_devices: MediaDevices = navigator.media_devices()?;
+
+    let constraints = MediaStreamConstraints::new();
+    constraints.set_audio(&JsValue::from_bool(true));
+    constraints.set_video(&JsValue::from_bool(false));
+
+    let default_stream = media_devices.get_user_media_with_constraints(&constraints)?;
+    let default_stream = JsFuture::from(default_stream)
+        .await
+        .map_err(|e| {
+            helper_log(format!("getUserMedia rejected: {e:?}"));
+            e
+        })?;
+    let default_stream: MediaStream = default_stream.dyn_into()?;
+    cleanup_stream(default_stream);
+    
+    let (device_stream, audio_context, source) = take_cached_stream(&media_devices, &device_info.device_id).await?;
+    
+    JsFuture::from(audio_context.resume().unwrap()).await.unwrap();
+
+    // must be fetched after call to create_media_stream_source (before that, it will not be populated)
+    let _sample_rate = audio_context.sample_rate() as u32;
+
+    // AudioWorklet module is served as a static file via webpack copy plugin.
+    let url = "cpal-input-processor.js";
+    // need to resume or adding worklet will hang
+    let audio_worklet = audio_context.audio_worklet().map_err(|err| {
+        err
+    })?;
+
+    let processor = audio_worklet.add_module(&url).map_err(|err| {
+        err
+    })?;
+    JsFuture::from(processor).await.map_err(|err| {
+        err
+    })?;
+
+    let worklet_node = web_sys::AudioWorkletNode::new(audio_context.as_ref(), "cpal-input-processor")
+        .expect("Failed to create audio worklet node");
+
+    source.connect_with_audio_node(&worklet_node).unwrap();
+
+    let mut output_buf: Vec<f32> = Vec::new();
+
+    // Float32Array
+    let js_closure = Closure::wrap(Box::new(move |msg: wasm_bindgen::JsValue| {
+        
+        let msg_event = msg.dyn_into::<web_sys::MessageEvent>().unwrap();
+
+        let data = msg_event.data();
+
+        let data : Vec<Vec<f32>> = Array::from(&data).iter()
+                    .map(|v| Float32Array::from(v).to_vec())
+                    .collect();
+
+        let channels = data.len();
+
+        if channels == 0 {
+            return;
+        }
+        
+        let frames = data[0].len();
+
+        if frames == 0 {
+            return;
+        }
+
+        output_buf.clear();
+        output_buf.resize(channels*frames, 0.0f32);
+
+        // interleave the data into output_buf
+        for ch in 0..channels {
+            for frame in 0..frames {
+                output_buf[frame * channels + ch] = data[ch][frame];
+            }
+        }
+        
+        (data_callback)(&mut output_buf.as_slice());
+    }) as Box<dyn FnMut(wasm_bindgen::JsValue)>);
+
+    let js_func = js_closure.as_ref().unchecked_ref();
+
+    worklet_node
+        .port()
+        .expect("Failed to get port")
+        .set_onmessage(Some(js_func));
+
+
+    put_cached_stream(&device_info.device_id, device_stream, audio_context, source);
+    
+    Ok(WasmStream::new(device_info.device_id.clone()))
 }
