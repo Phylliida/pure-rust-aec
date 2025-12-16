@@ -1028,7 +1028,7 @@ impl StreamAlignerConsumer {
                     let additional_frames_needed = (size_in_frames as i128) - available_frames;
                     // we will be able to get all samples for this packet, block until we get them
                     let (_read_success, _samples) = self.get_chunk_to_read((additional_frames_needed * self.channels as i128) as usize).await;
-                    println!("Finished calibrate, ignoring {num_frames_that_are_behind_current_packet} frames");
+                    //println!("Finished calibrate, ignoring {num_frames_that_are_behind_current_packet} frames");
                     // return _read_success and not true to avoid failed reads clogging up the data
                     _read_success // we will read them again later, at which point we will do finish_read (this is delibrate reading them twice)
                 }
@@ -1040,7 +1040,7 @@ impl StreamAlignerConsumer {
             else {
                 // enough samples! ignore the ones we need to ignore and then let the sampling happen elsewhere
                 self.final_audio_buffer_consumer.finish_read((num_frames_that_are_behind_current_packet * self.channels as u128) as usize);
-                println!("Finished calibrate (2), ignoring {num_frames_that_are_behind_current_packet} frames");
+                //println!("Finished calibrate (2), ignoring {num_frames_that_are_behind_current_packet} frames");
                 true
             }
         } else {
@@ -1339,7 +1339,6 @@ impl OutputStreamAlignerMixer {
             match self.output_stream_receiver.try_next() {
                 Ok(Some(msg)) => match msg {
                     OutputStreamMessage::Add(id, input_sample_rate, channels, channel_map, resampled_producer, resampled_consumer) => {
-                        println!("Got new output device {} with {} channels", id, channels);
                         self.stream_consumers.insert(id, (input_sample_rate, channels, channel_map, resampled_producer, BufferedCircularConsumer::new(resampled_consumer)));
                     }
                     OutputStreamMessage::Remove(id) => {
@@ -2554,7 +2553,7 @@ async fn get_supported_input_device_configs(
     result_configs.push(default_config.clone());
 
     let host = cpal::host_from_id(*host_id)?;
-    let device = select_device(host.output_devices(), &device_name, "Input")?;
+    let device = select_device(host.input_devices(), &device_name, "Input")?;
     let configs : Vec<_> = device.supported_input_configs().map(|configs| configs.collect())
             .map_err(|err| format!("Unable to enumerate input configs for '{device_name}': {err}"))?;
 
