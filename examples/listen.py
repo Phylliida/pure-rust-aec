@@ -1,6 +1,10 @@
 
-import melaec3
 import time
+import wave
+from pathlib import Path
+
+import numpy as np
+import melaec3
 
 MAX_DISPLAY = 10  # how many configs per host/device to show before eliding
 # Common tuning knobs for both input and output configs
@@ -10,9 +14,15 @@ AUDIO_BUFFER_SECONDS = 20    # seconds of audio to buffer (streamed; a few secon
 RESAMPLER_QUALITY = 5        # Speex resampler quality level
 FRAME_SIZE_MILLIS = 3        # target output frame duration in milliseconds (small to reduce latency)
 FRAME_SIZE_SAMPLES = 160     # target output frame size in samples (~10ms at 16 kHz)
+FILTER_LENGTH = FRAME_SIZE_SAMPLES * 10
+AEC_SAMPLE_RATE = 16000
 
 # Build configs (you can call get_supported_* to enumerate)
-aec = melaec3.AecConfig(target_sample_rate=16000, frame_size=160, filter_length=1600)
+aec = melaec3.AecConfig(
+    target_sample_rate=AEC_SAMPLE_RATE,
+    frame_size=FRAME_SIZE_SAMPLES,
+    filter_length=FILTER_LENGTH,
+)
 stream = melaec3.AecStream(aec)
 
 
@@ -75,10 +85,36 @@ out = melaec3.OutputDeviceConfig.from_default(
 stream.add_input_device(inp)
 prod = stream.add_output_device(out)
 
+
+
+WAV_PATH = Path(__file__).parent / "example_talking.wav"
+
+
+def load_wav_f32(path: Path):
+    """Load a 16-bit PCM WAV and return (samples_interleaved_f32, sample_rate, channels)."""
+    with wave.open(str(path), "rb") as wf:
+        channels = wf.getnchannels()
+        sample_rate = wf.getframerate()
+        sampwidth = wf.getsampwidth()
+        if sampwidth != 2:
+            raise ValueError(f"Only 16-bit PCM supported; got {8 * sampwidth}-bit")
+        frames = wf.getnframes()
+        raw = wf.readframes(frames)
+    pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    return pcm, sample_rate, channels
+
 # Create an output stream and queue audio
-ch_map = {0: [0]}  # map virtual channel 0 -> hardware channel 0
-out_stream = prod.begin_audio_stream(1, ch_map, 5, 16000, 5)
-out_stream.queue_audio([0.0] * 16000)  # send silence
+audio, file_sample_rate, file_channels = load_wav_f32(WAV_PATH)
+channel_map = {ch: [ch] for ch in range(file_channels)}  # map virtual channels -> hardware channels 1:1
+out_stream = prod.begin_audio_stream(
+    file_channels,
+    channel_map,
+    int((len(audio)*2)/file_sample_rate),
+    file_sample_rate,
+    RESAMPLER_QUALITY,
+)
+
+out_stream.queue_audio(audio.tolist())  # queue WAV audio
 
 # Optional: background callback receives (bytes, start_us, end_us)
 def on_chunk(buf, start_us, end_us):
@@ -86,9 +122,33 @@ def on_chunk(buf, start_us, end_us):
     pass
 stream.set_callback(on_chunk)
 
-time.sleep(1)
-
+time.sleep(4)
 prod.interrupt_all_streams()
+print("Interrupted")
+# stream not usable once interrupted, by design
+time.sleep(4)
+prod.end_audio_stream(out_stream)
+out_stream = prod.begin_audio_stream(
+    file_channels,
+    channel_map,
+    int((len(audio)*2)/file_sample_rate),
+    file_sample_rate,
+    RESAMPLER_QUALITY,
+)
+out_stream.queue_audio(audio.tolist())  # queue WAV audio
+time.sleep(4)
+prod.interrupt_all_streams()
+time.sleep(4)
+prod.end_audio_stream(out_stream)
+out_stream = prod.begin_audio_stream(
+    file_channels,
+    channel_map,
+    int((len(audio)*2)/file_sample_rate),
+    file_sample_rate,
+    RESAMPLER_QUALITY,
+)
+out_stream.queue_audio(audio.tolist())  # queue WAV audio
+
 
 time.sleep(1000000)
 
