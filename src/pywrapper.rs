@@ -503,6 +503,11 @@ impl PyStreamProducer {
     }
 
     #[getter]
+    pub fn num_queued_samples(&self) -> usize {
+        return self.inner.lock().unwrap().num_queued_samples();
+    }
+
+    #[getter]
     fn stream_id(&self) -> u64 {
         self.inner.lock().unwrap().stream_id()
     }

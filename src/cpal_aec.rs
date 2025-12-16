@@ -86,7 +86,7 @@ use cpal::SupportedBufferSize;
 use std::collections::HashSet;
 
 use ringbuf::{
-    traits::{Consumer, Producer, RingBuffer, Split},
+    traits::{Consumer, Producer, RingBuffer, Split, Observer},
     HeapCons, HeapProd, HeapRb, LocalRb,
 };
 use ringbuf::storage::Heap;
@@ -1247,6 +1247,9 @@ impl StreamProducer {
         if num_pushed < audio_data.len() {
             eprintln!("Error: output audio buffer got behind, try increasing buffer size");
         }
+    }
+    pub fn num_queued_samples(&self) -> usize {
+        return self.producer.occupied_len();
     }
 }
 
