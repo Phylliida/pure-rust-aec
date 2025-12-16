@@ -768,6 +768,12 @@ impl PyAecStream {
         self.maybe_start_callback_thread();
         Ok(())
     }
+
+    pub fn clear_callback(&mut self) -> PyResult<()> {
+        *self.callback.lock().unwrap() = None;
+        self.stop_thread_if_running();
+        Ok(())
+    }
 }
 
 impl PyAecStream {
@@ -827,7 +833,7 @@ impl PyAecStream {
                         let _ = callback.call1(py, (py_bytes, start, end));
                     });
                 } else {
-                    thread::sleep(Duration::from_millis(5));
+                    break; // no more callback
                 }
             }
         }));
