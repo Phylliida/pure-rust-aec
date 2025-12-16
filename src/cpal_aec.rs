@@ -1258,8 +1258,8 @@ pub struct OutputStreamAlignerProducer {
     pub device_name: String,
     pub channels: usize,
     pub device_sample_rate: u32,
-    pub output_stream_sender: mpsc::Sender<OutputStreamMessage>,
-    pub cur_stream_id: Arc<AtomicU64>,
+    output_stream_sender: mpsc::Sender<OutputStreamMessage>,
+    cur_stream_id: Arc<AtomicU64>,
 }
 
 impl OutputStreamAlignerProducer {

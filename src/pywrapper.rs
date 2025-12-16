@@ -5,14 +5,16 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
+        Mutex as StdMutex,
     },
     thread,
     time::Duration,
 };
 
 use cpal::SampleFormat;
-use futures::executor::block_on;
+use futures::executor::LocalPool;
+use futures::lock::Mutex as AsyncMutex;
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
@@ -131,8 +133,7 @@ impl PyInputDeviceConfig {
 
     #[staticmethod]
     #[allow(clippy::too_many_arguments)]
-    pub fn from_default(
-        py: Python<'_>,
+    pub async fn from_default(
         host: Option<String>,
         device_name: String,
         history_len: usize,
@@ -141,19 +142,16 @@ impl PyInputDeviceConfig {
         resampler_quality: i32,
     ) -> PyResult<Self> {
         let host_id = resolve_host_id(host.as_deref())?;
-        let inner = py
-            .allow_threads(move || {
-                block_on(InputDeviceConfig::from_default(
-                    host_id,
-                    device_name,
-                    history_len,
-                    calibration_packets,
-                    audio_buffer_seconds,
-                    resampler_quality,
-                ))
-                .map_err(|e| e.to_string())
-            })
-            .map_err(to_py_err)?;
+        let inner = InputDeviceConfig::from_default(
+            host_id,
+            device_name,
+            history_len,
+            calibration_packets,
+            audio_buffer_seconds,
+            resampler_quality,
+        )
+        .await
+        .map_err(to_py_err)?;
         Ok(Self { inner })
     }
 
@@ -304,8 +302,7 @@ impl PyOutputDeviceConfig {
 
     #[staticmethod]
     #[allow(clippy::too_many_arguments)]
-    pub fn from_default(
-        py: Python<'_>,
+    pub async fn from_default(
         host: Option<String>,
         device_name: String,
         history_len: usize,
@@ -315,20 +312,17 @@ impl PyOutputDeviceConfig {
         frame_size_millis: u32,
     ) -> PyResult<Self> {
         let host_id = resolve_host_id(host.as_deref())?;
-        let inner = py
-            .allow_threads(move || {
-                block_on(OutputDeviceConfig::from_default(
-                    host_id,
-                    device_name,
-                    history_len,
-                    calibration_packets,
-                    audio_buffer_seconds,
-                    resampler_quality,
-                    frame_size_millis,
-                ))
-                .map_err(|e| e.to_string())
-            })
-            .map_err(to_py_err)?;
+        let inner = OutputDeviceConfig::from_default(
+            host_id,
+            device_name,
+            history_len,
+            calibration_packets,
+            audio_buffer_seconds,
+            resampler_quality,
+            frame_size_millis,
+        )
+        .await
+        .map_err(to_py_err)?;
         Ok(Self { inner })
     }
 
@@ -499,7 +493,7 @@ impl PyAecConfig {
 
 #[pyclass(name = "StreamProducer")]
 pub struct PyStreamProducer {
-    inner: Arc<Mutex<InnerStreamProducer>>,
+    inner: Arc<StdMutex<InnerStreamProducer>>,
 }
 
 #[pymethods]
@@ -579,7 +573,7 @@ impl PyOutputStreamAlignerProducer {
             )
             .map_err(to_py_err)?;
         Ok(PyStreamProducer {
-            inner: Arc::new(Mutex::new(producer)),
+            inner: Arc::new(StdMutex::new(producer)),
         })
     }
 
@@ -600,9 +594,9 @@ impl PyOutputStreamAlignerProducer {
 
 #[pyclass(name = "AecStream")]
 pub struct PyAecStream {
-    inner: Arc<Mutex<InnerAecStream>>,
+    inner: Arc<AsyncMutex<InnerAecStream>>,
     config: PyAecConfig,
-    callback: Arc<Mutex<Option<Py<PyAny>>>>,
+    callback: Arc<StdMutex<Option<Py<PyAny>>>>,
     callback_thread: Option<thread::JoinHandle<()>>,
     callback_shutdown: Arc<AtomicBool>,
 }
@@ -613,9 +607,9 @@ impl PyAecStream {
     pub fn new(config: PyAecConfig) -> PyResult<Self> {
         let inner = InnerAecStream::new(config.to_inner()).map_err(to_py_err)?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(inner)),
+            inner: Arc::new(AsyncMutex::new(inner)),
             config,
-            callback: Arc::new(Mutex::new(None)),
+            callback: Arc::new(StdMutex::new(None)),
             callback_thread: None,
             callback_shutdown: Arc::new(AtomicBool::new(false)),
         })
@@ -627,131 +621,145 @@ impl PyAecStream {
     }
 
     #[getter]
-    fn num_input_channels(&self) -> usize {
-        self.inner.lock().unwrap().num_input_channels()
+    fn num_input_channels(&self) -> PyResult<usize> {
+        self.inner
+            .try_lock()
+            .map(|guard| guard.num_input_channels())
+            .ok_or_else(|| PyRuntimeError::new_err("AecStream is busy"))
     }
 
     #[getter]
-    fn num_output_channels(&self) -> usize {
-        self.inner.lock().unwrap().num_output_channels()
+    fn num_output_channels(&self) -> PyResult<usize> {
+        self.inner
+            .try_lock()
+            .map(|guard| guard.num_output_channels())
+            .ok_or_else(|| PyRuntimeError::new_err("AecStream is busy"))
     }
 
-    pub fn add_input_device(
-        &mut self,
-        py: Python<'_>,
-        config: &PyInputDeviceConfig,
-    ) -> PyResult<()> {
-        self.maybe_start_callback_thread();
-        let inner = &self.inner;
-        let cfg = config.inner.clone();
-        py.allow_threads(move || {
-            let mut guard = inner.lock().unwrap();
-            block_on(guard.add_input_device(&cfg)).map_err(|e| e.to_string())
-        })
-        .map_err(to_py_err)
+    pub async fn add_input_device(&mut self, config: Py<PyInputDeviceConfig>) -> PyResult<()> {
+        let cfg = Python::attach(|py| {
+            config
+                .try_borrow(py)
+                .map(|c| c.inner.clone())
+                .map_err(|_| PyRuntimeError::new_err("Input device config already borrowed"))
+        })?;
+        let mut guard = self.inner.lock().await;
+        guard.add_input_device(&cfg).await.map_err(to_py_err)
     }
 
-    pub fn add_output_device(
+    pub async fn add_output_device(
         &mut self,
-        py: Python<'_>,
-        config: &PyOutputDeviceConfig,
+        config: Py<PyOutputDeviceConfig>,
     ) -> PyResult<PyOutputStreamAlignerProducer> {
-        self.maybe_start_callback_thread();
-        let inner = &self.inner;
-        let cfg = config.inner.clone();
-        let producer = py
-            .allow_threads(move || {
-                let mut guard = inner.lock().unwrap();
-                block_on(guard.add_output_device(&cfg)).map_err(|e| e.to_string())
-            })
-            .map_err(to_py_err)?;
+        let cfg = Python::attach(|py| {
+            config
+                .try_borrow(py)
+                .map(|c| c.inner.clone())
+                .map_err(|_| PyRuntimeError::new_err("Output device config already borrowed"))
+        })?;
+        let mut guard = self.inner.lock().await;
+        let producer = guard.add_output_device(&cfg).await.map_err(to_py_err)?;
         Ok(PyOutputStreamAlignerProducer {
             inner: Some(producer),
         })
     }
 
-    pub fn remove_input_device(&mut self, config: &PyInputDeviceConfig) -> PyResult<()> {
+    pub async fn remove_input_device(&mut self, config: Py<PyInputDeviceConfig>) -> PyResult<()> {
+        let cfg = Python::attach(|py| {
+            config
+                .try_borrow(py)
+                .map(|c| c.inner.clone())
+                .map_err(|_| PyRuntimeError::new_err("Input device config already borrowed"))
+        })?;
+        self.inner.lock().await.remove_input_device(&cfg).map_err(to_py_err)
+    }
+
+    pub async fn remove_output_device(&mut self, config: Py<PyOutputDeviceConfig>) -> PyResult<()> {
+        let cfg = Python::attach(|py| {
+            config
+                .try_borrow(py)
+                .map(|c| c.inner.clone())
+                .map_err(|_| PyRuntimeError::new_err("Output device config already borrowed"))
+        })?;
         self.inner
             .lock()
-            .unwrap()
-            .remove_input_device(&config.inner)
+            .await
+            .remove_output_device(&cfg)
             .map_err(to_py_err)
     }
 
-    pub fn remove_output_device(&mut self, config: &PyOutputDeviceConfig) -> PyResult<()> {
-        self.inner
-            .lock()
-            .unwrap()
-            .remove_output_device(&config.inner)
-            .map_err(to_py_err)
-    }
-
-    pub fn calibrate(
+    pub async fn calibrate(
         &mut self,
-        py: Python<'_>,
-        mut producers: Vec<PyRefMut<PyOutputStreamAlignerProducer>>,
+        producers: Vec<Py<PyOutputStreamAlignerProducer>>,
         debug_wav: bool,
     ) -> PyResult<()> {
         let mut owned: Vec<InnerOutputStreamAlignerProducer> = Vec::with_capacity(producers.len());
-        for producer in producers.iter_mut() {
-            let inner = producer
-                .inner
-                .take()
-                .ok_or_else(|| PyRuntimeError::new_err("Output stream producer no longer available"))?;
-            owned.push(inner);
-        }
 
-        let inner = &self.inner;
-        let (result, owned) = py.allow_threads(move || {
-            let mut owned = owned;
-            let res = {
-                let mut guard = inner.lock().unwrap();
-                block_on(guard.calibrate(owned.as_mut_slice(), debug_wav)).map_err(|e| e.to_string())
-            };
-            (res, owned)
+        Python::attach(|py| -> PyResult<()> {
+            for producer in &producers {
+                let mut producer_ref = producer
+                    .try_borrow_mut(py)
+                    .map_err(|_| PyRuntimeError::new_err("Output stream producer already borrowed"))?;
+                let inner = producer_ref
+                    .inner
+                    .take()
+                    .ok_or_else(|| PyRuntimeError::new_err("Output stream producer no longer available"))?;
+                owned.push(inner);
+            }
+            Ok(())
+        })?;
+
+        let result = {
+            let mut guard = self.inner.lock().await;
+            guard.calibrate(owned.as_mut_slice(), debug_wav).await
+        };
+
+        Python::attach(|py| {
+            for (producer, inner) in producers.into_iter().zip(owned.into_iter()) {
+                if let Ok(mut producer_ref) = producer.try_borrow_mut(py) {
+                    producer_ref.inner = Some(inner);
+                }
+            }
         });
-
-        for (mut wrapper, inner) in producers.into_iter().zip(owned.into_iter()) {
-            wrapper.inner = Some(inner);
-        }
 
         result.map_err(to_py_err)
     }
 
-    pub fn update<'py>(&'py mut self, py: Python<'py>) -> PyResult<(Py<PyBytes>, u128, u128)> {
-        let inner = &self.inner;
-        let (samples, start, end) = py
-            .allow_threads(move || {
-                let mut guard = inner.lock().unwrap();
-                block_on(guard.update())
-                    .map(|(buf, s, e)| (buf.to_vec(), s, e))
-                    .map_err(|e| e.to_string())
-            })
-            .map_err(to_py_err)?;
-        Ok((slice_to_pybytes(py, samples.as_slice()), start, end))
+    pub async fn update(&mut self) -> PyResult<(Py<PyBytes>, u128, u128)> {
+        let (samples, start, end) = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .update()
+                .await
+                .map(|(buf, s, e)| (buf.to_vec(), s, e))
+        }
+        .map_err(to_py_err)?;
+
+        let py_buf = Python::attach(|py| slice_to_pybytes(py, samples.as_slice()));
+        Ok((py_buf, start, end))
     }
 
-    pub fn update_debug<'py>(
-        &'py mut self,
-        py: Python<'py>,
+    pub async fn update_debug(
+        &mut self,
     ) -> PyResult<(Py<PyBytes>, Py<PyBytes>, Py<PyBytes>, u128, u128)> {
-        let inner = &self.inner;
-        let (aligned_in, aligned_out, aec_applied, start, end) = py
-            .allow_threads(move || {
-                let mut guard = inner.lock().unwrap();
-                block_on(guard.update_debug())
-                    .map(|(a, b, c, s, e)| (a.to_vec(), b.to_vec(), c.to_vec(), s, e))
-                    .map_err(|e| e.to_string())
-            })
-            .map_err(to_py_err)?;
+        let (aligned_in, aligned_out, aec_applied, start, end) = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .update_debug()
+                .await
+                .map(|(a, b, c, s, e)| (a.to_vec(), b.to_vec(), c.to_vec(), s, e))
+        }
+        .map_err(to_py_err)?;
 
-        Ok((
-            slice_to_pybytes(py, aligned_in.as_slice()),
-            slice_to_pybytes(py, aligned_out.as_slice()),
-            slice_to_pybytes(py, aec_applied.as_slice()),
-            start,
-            end,
-        ))
+        let (aligned_in, aligned_out, aec_applied) = Python::attach(|py| {
+            (
+                slice_to_pybytes(py, aligned_in.as_slice()),
+                slice_to_pybytes(py, aligned_out.as_slice()),
+                slice_to_pybytes(py, aec_applied.as_slice()),
+            )
+        });
+
+        Ok((aligned_in, aligned_out, aec_applied, start, end))
     }
 
     /// Set a Python callback receiving `(bytes, start_micros, end_micros)`.
@@ -780,40 +788,47 @@ impl PyAecStream {
         let shutdown = Arc::clone(&self.callback_shutdown);
 
         self.callback_shutdown.store(false, Ordering::SeqCst);
-        self.callback_thread = Some(thread::spawn(move || loop {
-            if shutdown.load(Ordering::SeqCst) {
-                break;
-            }
-
-            let (samples, start, end) = {
-                let Some(inner_arc) = inner.upgrade() else {
+        self.callback_thread = Some(thread::spawn(move || {
+            let mut pool = LocalPool::new();
+            loop {
+                if shutdown.load(Ordering::SeqCst) {
                     break;
-                };
-                let mut guard = inner_arc.lock().unwrap();
-                match block_on(guard.update())
-                    .map(|(buf, s, e)| (buf.to_vec(), s, e))
-                    .map_err(|e| e.to_string())
-                {
-                    Ok(res) => res,
-                    Err(err) => {
-                        eprintln!("Aec callback update error: {err}");
-                        (Vec::new(), 0, 0)
-                    }
                 }
-            };
 
-            if samples.is_empty() {
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            }
+                let (samples, start, end) = {
+                    let Some(inner_arc) = inner.upgrade() else {
+                        break;
+                    };
+                    let fut = async {
+                        let mut guard = inner_arc.lock().await;
+                        guard
+                            .update()
+                            .await
+                            .map(|(buf, s, e)| (buf.to_vec(), s, e))
+                            .map_err(|e| e.to_string())
+                    };
+                    match pool.run_until(fut) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            eprintln!("Aec callback update error: {err}");
+                            (Vec::new(), 0, 0)
+                        }
+                    }
+                };
 
-            if let Some(callback) = cb_ref.lock().unwrap().as_ref() {
-                Python::with_gil(|py| {
-                    let py_bytes = slice_to_pybytes(py, samples.as_slice());
-                    let _ = callback.call1(py, (py_bytes, start, end));
-                });
-            } else {
-                thread::sleep(Duration::from_millis(5));
+                if samples.is_empty() {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+
+                if let Some(callback) = cb_ref.lock().unwrap().as_ref() {
+                    Python::attach(|py| {
+                        let py_bytes = slice_to_pybytes(py, samples.as_slice());
+                        let _ = callback.call1(py, (py_bytes, start, end));
+                    });
+                } else {
+                    thread::sleep(Duration::from_millis(5));
+                }
             }
         }));
     }
@@ -828,22 +843,19 @@ impl Drop for PyAecStream {
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn get_supported_input_configs(
-    py: Python<'_>,
     history_len: usize,
     num_calibration_packets: u32,
     audio_buffer_seconds: u32,
     resampler_quality: i32,
 ) -> PyResult<Vec<Vec<PyInputDeviceConfig>>> {
-    let configs = py
-        .allow_threads(|| {
-            block_on(inner_get_supported_input_configs(
-                history_len,
-                num_calibration_packets,
-                audio_buffer_seconds,
-                resampler_quality,
-            ))
-            .map_err(|e| e.to_string())
-        })
+    let mut pool = LocalPool::new();
+    let configs = pool
+        .run_until(inner_get_supported_input_configs(
+            history_len,
+            num_calibration_packets,
+            audio_buffer_seconds,
+            resampler_quality,
+        ))
         .map_err(to_py_err)?;
 
     Ok(configs
@@ -855,24 +867,21 @@ pub fn get_supported_input_configs(
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn get_supported_output_configs(
-    py: Python<'_>,
     history_len: usize,
     num_calibration_packets: u32,
     audio_buffer_seconds: u32,
     resampler_quality: i32,
     frame_size: u32,
 ) -> PyResult<Vec<Vec<PyOutputDeviceConfig>>> {
-    let configs = py
-        .allow_threads(|| {
-            block_on(inner_get_supported_output_configs(
-                history_len,
-                num_calibration_packets,
-                audio_buffer_seconds,
-                resampler_quality,
-                frame_size,
-            ))
-            .map_err(|e| e.to_string())
-        })
+    let mut pool = LocalPool::new();
+    let configs = pool
+        .run_until(inner_get_supported_output_configs(
+            history_len,
+            num_calibration_packets,
+            audio_buffer_seconds,
+            resampler_quality,
+            frame_size,
+        ))
         .map_err(to_py_err)?;
 
     Ok(configs
