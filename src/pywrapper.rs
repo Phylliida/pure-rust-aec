@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -641,6 +641,7 @@ impl PyAecStream {
         py: Python<'_>,
         config: &PyInputDeviceConfig,
     ) -> PyResult<()> {
+        self.maybe_start_callback_thread();
         let inner = &self.inner;
         let cfg = config.inner.clone();
         py.allow_threads(move || {
@@ -655,6 +656,7 @@ impl PyAecStream {
         py: Python<'_>,
         config: &PyOutputDeviceConfig,
     ) -> PyResult<PyOutputStreamAlignerProducer> {
+        self.maybe_start_callback_thread();
         let inner = &self.inner;
         let cfg = config.inner.clone();
         let producer = py
@@ -770,9 +772,6 @@ impl PyAecStream {
 
     fn maybe_start_callback_thread(&mut self) {
         if self.callback_thread.is_some() {
-            return;
-        }
-        if self.callback.lock().unwrap().is_none() {
             return;
         }
 

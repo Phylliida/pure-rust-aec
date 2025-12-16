@@ -50,6 +50,7 @@ use web_sys::AudioContextState;
 
 use futures::channel::mpsc;
 use futures::StreamExt;
+use futures::executor::block_on;
 
 use std::{
     collections::{HashMap},
@@ -875,7 +876,6 @@ impl StreamAlignerResampler {
     fn decrease_dynamic_sample_rate(&mut self)  -> Result<(), Box<dyn std::error::Error>>  {
         if self.dynamic_output_sample_rate >= self.output_sample_rate {
             self.dynamic_output_sample_rate -= 1;
-            println!("Decrease dynamic sample");
         }
         //self.dynamic_output_sample_rate = (((self.output_sample_rate as f32) * 0.95) as i128).max((self.dynamic_output_sample_rate-1) as i128) as u32;
         self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
@@ -885,7 +885,6 @@ impl StreamAlignerResampler {
     fn increase_dynamic_sample_rate(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.dynamic_output_sample_rate <= self.output_sample_rate {
             self.dynamic_output_sample_rate += 1;
-            println!("Increase dynamic sample");
         }
         //self.dynamic_output_sample_rate = (((self.output_sample_rate as f32) * 1.05) as i128).min((self.dynamic_output_sample_rate+1) as i128) as u32;
         self.input_audio_buffer_consumer.set_sample_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
@@ -1174,18 +1173,19 @@ fn create_stream_aligner(channels: usize, input_sample_rate: u32, output_sample_
 
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_resampler_loop(mut resampler: StreamAlignerResampler) {
-    thread::spawn(async move || {
-        loop {
-            match resampler.resample().await {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(err) => {
-                    eprintln!("resampler error: {err}");
-                    break;
+    thread::spawn(move || {
+        block_on(async move {
+            loop {
+                match resampler.resample().await {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(err) => {
+                        eprintln!("resampler error: {err}");
+                        break;
+                    }
                 }
             }
-        }
-        eprintln!("Break resampler");
+        });
     });
 }
 
@@ -1333,7 +1333,7 @@ impl OutputStreamAlignerMixer {
         })
     }
 
-    async fn mix_audio_streams(&mut self, input_chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
+    fn mix_audio_streams(&mut self, input_chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
         // fetch new audio consumers, non-blocking
         loop {
             match self.output_stream_receiver.try_next() {
@@ -1569,14 +1569,12 @@ impl AecConfig {
 
 async fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(InputStream, StreamAlignerConsumer), Box<dyn std::error::Error>>  {
 
-    aec_log("Input stream aligners 1");
     // we need to use these methods instead of the more generic select_device because of wasm wrapping to workaround cpal not having webaudio input device support
     let device = select_input_device(
         &device_config.host_id,
         &device_config.device_name
     ).await?;
 
-    aec_log("Input stream aligners 2");
     let supported_config = find_matching_input_device_config(
         &device,
         &device_config.device_name,
@@ -1586,7 +1584,6 @@ async fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config
     ).await?;
     
 
-    aec_log("Input stream aligners 3");
     let (producer, resampler, consumer) = create_stream_aligner(
         device_config.channels,
         device_config.sample_rate,
@@ -1596,9 +1593,7 @@ async fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config
         device_config.audio_buffer_seconds,
         device_config.resampler_quality)?;
 
-    aec_log("Input stream aligners 4");
     spawn_resampler_loop(resampler);
-    aec_log("Input stream aligners 5");
 
     let stream = build_input_alignment_stream(
         &device,
@@ -1606,7 +1601,6 @@ async fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config
         supported_config,
         producer,
     ).await?;
-    aec_log("Input stream aligners 6");
 
     // start input stream
     cfg_if::cfg_if! {
@@ -1616,7 +1610,6 @@ async fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config
             stream.play()?;
         }
     }
-    aec_log("Input stream aligners 7");
 
     Ok((stream, consumer))
 }
@@ -1829,19 +1822,14 @@ impl AecStream {
     }
 
     pub async fn add_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        aec_log("Add input device");
         let (stream, aligners) = get_input_stream_aligners(config, &self.aec_config).await?;
-        aec_log("Add input device 2");
         self.device_update_sender.try_send(DeviceUpdateMessage::AddInputDevice(config.device_name.clone(), stream, aligners))?;
-        aec_log("Add input device done");
         Ok(())
     }
 
     pub async fn add_output_device(&mut self, config: &OutputDeviceConfig) -> Result<OutputStreamAlignerProducer, Box<dyn std::error::Error>> {
-        aec_log("Add output device");
         let (stream, producer, consumer) = get_output_stream_aligners(config, &self.aec_config)?;
         self.device_update_sender.try_send(DeviceUpdateMessage::AddOutputDevice(config.device_name.clone(), stream, consumer))?;
-        aec_log("Add output device done");
         Ok(producer)
     }
 
@@ -2097,7 +2085,6 @@ impl AecStream {
     }
 
     pub async fn update(&mut self) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
-        aec_log("Called update");
         let chunk_size = self.aec_config.frame_size;
         let start_micros = if let Some(start_micros_value) = self.start_micros {
             start_micros_value
@@ -2157,7 +2144,6 @@ impl AecStream {
                 }
             }
         }
-        aec_log("Done update recv try next");
         // similarly, if we initialize an output device here
         // we may not get any audio for a little bit
         if chunk_size == 0 {
@@ -2222,7 +2208,6 @@ impl AecStream {
             }
         }
 
-        aec_log("Done update read aligners");
         let aec_output = if self.output_channels == 0 {
             // simply pass through input_channels, no need for aec
             &self.input_audio_buffer
@@ -2270,7 +2255,6 @@ impl AecStream {
                 let output_energy = Self::energy(&self.output_audio_buffer);
                 let _input_energy = Self::energy(&self.input_audio_buffer);
                 if output_energy < 0.003 {
-                    println!("skipping with energy {output_energy}");
                     self.aec_audio_buffer.copy_from_slice(&self.input_audio_buffer);
                 }
                 else {
@@ -2298,7 +2282,6 @@ impl AecStream {
             }
         };
         
-        aec_log("Done aec");
         for (out, sample) in self.aec_out_audio_buffer.iter_mut().zip(aec_output) {
             *out = f32::from_sample(*sample);
         }
@@ -2987,7 +2970,8 @@ where
             //data.fill(T::from_sample(0.0f32));
             let mut frames_needed = frames as i64 - (device_audio_channel_consumer.available() / mixer.channels) as i64;
             while frames_needed > 0 {
-                mixer.mix_audio_streams(frames_needed as usize + 1000); // a few extra in case of resampling
+                // todo: print mix errors
+                let _ = mixer.mix_audio_streams(frames_needed as usize + 1000); // a few extra in case of resampling
                 frames_needed = frames as i64 - (device_audio_channel_consumer.available() / mixer.channels) as i64;
             }
             let chunk = device_audio_channel_consumer.get_chunk_to_read(frames * mixer.channels);
