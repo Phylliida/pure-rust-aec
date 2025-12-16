@@ -135,7 +135,7 @@ out_stream = prod.begin_audio_stream(
     file_sample_rate,
     RESAMPLER_QUALITY,
 )
-out_stream.queue_audio(audio.tolist())  # queue WAV audio
+out_stream.queue_audio(audio.tolist()) # queue WAV audio
 time.sleep(4)
 prod.interrupt_all_streams()
 time.sleep(4)
@@ -147,7 +147,7 @@ out_stream = prod.begin_audio_stream(
     file_sample_rate,
     RESAMPLER_QUALITY,
 )
-out_stream.queue_audio(audio.tolist())  # queue WAV audio
+out_stream.queue_audio(audio.tolist()) # queue WAV audio
 
 
 time.sleep(1000000)
