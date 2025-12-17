@@ -1707,10 +1707,9 @@ pub struct AecStream {
     output_channels: usize,
     start_micros: Option<u128>,
     total_frames_emitted: u128,
-    input_audio_buffer: Vec<i16>,
-    output_audio_buffer: Vec<i16>,
-    aec_audio_buffer: Vec<i16>,
-    aec_out_audio_buffer: Vec<f32>,
+    input_audio_buffer: Vec<f32>,
+    output_audio_buffer: Vec<f32>,
+    aec_audio_buffer: Vec<f32>,
     aec3: Option<VoipAec3>,
 }
 
@@ -1745,7 +1744,6 @@ impl AecStream {
            input_audio_buffer: Vec::new(),
            output_audio_buffer: Vec::new(),
            aec_audio_buffer: Vec::new(),
-           aec_out_audio_buffer: Vec::new(),
            aec3: None,
         })
     }
@@ -1797,6 +1795,7 @@ impl AecStream {
 
         */
         self.aec3 = if self.input_channels > 0 && self.output_channels > 0 {
+            println!("Making aec with {} inputs and {} outputs", self.input_channels, self.output_channels);
             Some(VoipAec3::builder(self.aec_config.target_sample_rate as i32, self.input_channels, self.output_channels)
             .initial_delay_ms((self.aec_config.frame_size/3) as i32)
             .enable_high_pass(true)
@@ -1813,13 +1812,11 @@ impl AecStream {
         //}
 
         self.input_audio_buffer.clear();
-        self.input_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as i16);
+        self.input_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as f32);
         self.output_audio_buffer.clear();
-        self.output_audio_buffer.resize(self.aec_config.frame_size * self.output_channels, 0 as i16);
+        self.output_audio_buffer.resize(self.aec_config.frame_size * self.output_channels, 0 as f32);
         self.aec_audio_buffer.clear();
-        self.aec_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as i16);
-        self.aec_out_audio_buffer.clear();
-        self.aec_out_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as f32);
+        self.aec_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as f32);
         Ok(())
     }
 
@@ -2078,12 +2075,12 @@ impl AecStream {
 
     // calls update, but returns all involved audio buffers
     // (if needed for diagnostic reasons, usually .update() (which returns aec'd inputs) should be all you need)
-    pub async fn update_debug(&mut self) -> Result<(&[i16], &[i16], &[f32], u128, u128), Box<dyn std::error::Error>> {
+    pub async fn update_debug(&mut self) -> Result<(&[f32], &[f32], &[f32], u128, u128), Box<dyn std::error::Error>> {
         let (start_time, end_time) = {
             let (_, start_time, end_time) = self.update().await?;
             (start_time, end_time)
         };
-        return Ok((self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), self.aec_out_audio_buffer.as_slice(), start_time, end_time));
+        return Ok((self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), self.aec_audio_buffer.as_slice(), start_time, end_time));
     }
 
     pub async fn update(&mut self) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
@@ -2184,7 +2181,7 @@ impl AecStream {
 
         // recieve audio data and interleave it into our buffers
         let mut input_channel = 0;
-        self.input_audio_buffer.fill(0 as i16);
+        self.input_audio_buffer.fill(0 as f32);
 
         for key in &self.sorted_input_aligners {
             if let Some(aligner) = self.input_aligners.get_mut(key) {
@@ -2198,7 +2195,7 @@ impl AecStream {
                         let mut src_idx = c;
                         let mut dst = input_channel + c;
                         for _ in 0..frames {
-                            self.input_audio_buffer[dst] = Self::f32_to_i16(chunk[src_idx]);
+                            self.input_audio_buffer[dst] = chunk[src_idx];
                             dst += self.input_channels;
                             src_idx += channels;
                         }
@@ -2217,7 +2214,7 @@ impl AecStream {
         else {
                 
             let mut output_channel = 0;
-            self.output_audio_buffer.fill(0 as i16);
+            self.output_audio_buffer.fill(0 as f32);
             for key in &self.sorted_output_aligners {
                 if let Some(aligner) = self.output_aligners.get_mut(key) {
                     let channels = aligner.channels;
@@ -2230,7 +2227,7 @@ impl AecStream {
                             let mut src_idx = c;
                             let mut dst = output_channel + c;
                             for _ in 0..frames {
-                                self.output_audio_buffer[dst] = Self::f32_to_i16(chunk[src_idx]);
+                                self.output_audio_buffer[dst] = chunk[src_idx];
                                 dst += self.output_channels;
                                 src_idx += channels;
                             }
@@ -2242,7 +2239,7 @@ impl AecStream {
                 }
             }
 
-            self.aec_audio_buffer.fill(0 as i16);
+            self.aec_audio_buffer.fill(0 as f32);
 
             if self.input_channels == 0 {
                 &self.aec_audio_buffer
@@ -2264,35 +2261,18 @@ impl AecStream {
                     let Some(aec3_value) = self.aec3.as_mut() else {
                         return Err("No aec3".into());
                     };
-                    let mut input_audio_tmp = vec![0f32; self.input_audio_buffer.len()];
-                    let mut output_audio_tmp = vec![0f32; self.output_audio_buffer.len()];
-                    let mut aec_audio_tmp =  vec![0f32; self.input_audio_buffer.len()];
-                    for i in 0..input_audio_tmp.len() {
-                        input_audio_tmp[i] = f32::from_sample(self.input_audio_buffer[i]);
-                    }
-                    for i in 0..output_audio_tmp.len() {
-                        output_audio_tmp[i] = f32::from_sample(self.output_audio_buffer[i]);
-                    }
-                    let _metrics = aec3_value.process(&input_audio_tmp, Some(&output_audio_tmp), false, &mut aec_audio_tmp)?;
-
-                    for i in 0..aec_audio_tmp.len() {
-                        self.aec_audio_buffer[i] = i16::from_sample(aec_audio_tmp[i]);
-                    }
+                    let _metrics = aec3_value.process(&self.input_audio_buffer, Some(&self.output_audio_buffer), false, &mut self.aec_audio_buffer)?;
                 }
                 
                 &self.aec_audio_buffer
             }
         };
-        
-        for (out, sample) in self.aec_out_audio_buffer.iter_mut().zip(aec_output) {
-            *out = f32::from_sample(*sample);
-        }
 
-        Ok((self.aec_out_audio_buffer.as_slice(), chunk_start_micros, chunk_end_micros))
+        Ok((aec_output.as_slice(), chunk_start_micros, chunk_end_micros))
     }
     
-    fn energy(buf: &[i16]) -> f64 {
-        buf.iter().map(|s| (f32::from_sample(*s)*f32::from_sample(*s)) as f64).sum::<f64>() / buf.len() as f64
+    fn energy(buf: &[f32]) -> f64 {
+        buf.iter().map(|s| ((*s)*(*s)) as f64).sum::<f64>() / buf.len() as f64
     }
 
     fn write_channel_from_f32(
