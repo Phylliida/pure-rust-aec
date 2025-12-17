@@ -1796,7 +1796,7 @@ impl AecStream {
         */
         self.aec3 = if self.input_channels > 0 && self.output_channels > 0 {
             println!("Making aec with {} inputs and {} outputs", self.input_channels, self.output_channels);
-            Some(VoipAec3::builder(self.aec_config.target_sample_rate as i32, self.input_channels, self.output_channels)
+            Some(VoipAec3::builder(self.aec_config.target_sample_rate as i32, self.output_channels, self.input_channels)
             .initial_delay_ms((self.aec_config.frame_size/3) as i32)
             .enable_high_pass(true)
             .build()
