@@ -293,7 +293,6 @@ fn detect_probe_tones(input_mono: &[f32], num_devices: usize, duration_ms: f32, 
         let _margin = input_mono.len().saturating_sub(1);
         let lag = gcc_phat_delay(&input_mono, &probe_padded);
             // positive lag means probe leads capture; lag is the start index in the capture
-        println!("Got lag {lag}");
         results.push((device, lag as i64, 0.0));
     }
     results
@@ -1889,6 +1888,7 @@ impl AecStream {
                 for s in &mut input_shifts_needed {
                     *s += min_input_shift_needed.unsigned_abs() as i64;  // min_shift is negative, so this adds abs(min_shift)
                 }
+                println!("Shifting outputs ahead by {}", min_input_shift_needed);
                 for output_index in 0..output_offsets.len() {
                     if let Some(aligner) = self.output_aligners.get_mut(&self.sorted_output_aligners[output_index].clone()) {
                         // skip ahead that many samples (* num channels bc it is multi channel)
@@ -1903,6 +1903,7 @@ impl AecStream {
 
         for input_index in 0..input_offsets.len() {
             let shift_needed = input_shifts_needed[input_index];
+            println!("Shifting input channel {} by {}",input_index, shift_needed);
             if let Some(aligner) = self.input_aligners.get_mut(&self.sorted_input_aligners[input_index].clone()) {
                 // skip ahead that many samples (* num channels bc it is multi channel)
                 if shift_needed > 0 {
