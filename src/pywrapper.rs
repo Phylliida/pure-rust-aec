@@ -767,6 +767,22 @@ impl PyAecStream {
         Ok((aligned_in, aligned_out, aec_applied, start, end))
     }
 
+    #[getter]
+    fn input_gain(&self) -> PyResult<f32> {
+        self.inner
+            .try_lock()
+            .map(|guard| guard.input_gain())
+            .ok_or_else(|| PyRuntimeError::new_err("AecStream is busy"))
+    }
+
+    #[setter]
+    fn set_input_gain(&mut self, gain: f32) -> PyResult<()> {
+        self.inner
+            .try_lock()
+            .map(|mut guard| guard.set_input_gain(gain))
+            .ok_or_else(|| PyRuntimeError::new_err("AecStream is busy"))
+    }
+
     /// Set a Python callback receiving `(bytes, start_micros, end_micros)`.
     pub fn set_callback(&mut self, callback: Py<PyAny>) -> PyResult<()> {
         *self.callback.lock().unwrap() = Some(callback);

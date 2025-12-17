@@ -1705,6 +1705,7 @@ pub struct AecStream {
     sorted_output_aligners: Vec<String>,
     input_channels: usize,
     output_channels: usize,
+    input_gain: f32,
     start_micros: Option<u128>,
     total_frames_emitted: u128,
     input_audio_buffer: Vec<f32>,
@@ -1737,6 +1738,7 @@ impl AecStream {
            output_aligners_in_progress: HashMap::new(),
            sorted_input_aligners: Vec::new(),
            sorted_output_aligners: Vec::new(),
+           input_gain: 1f32,
            input_channels: 0,
            output_channels: 0,
            start_micros: None,
@@ -1760,6 +1762,14 @@ impl AecStream {
             .values()
             .map(|aligner| aligner.channels)
             .sum()
+    }
+
+    pub fn input_gain(&self) -> f32 {
+        self.input_gain
+    }
+
+    pub fn set_input_gain(&mut self, gain: f32) {
+        self.input_gain = gain;
     }
 
     fn reinitialize_aec(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1846,6 +1856,13 @@ impl AecStream {
         let (output_offsets, input_offsets) = self.get_calibration_offsets(output_producers, debug_wav).await?;
         // we need to throw away some samples for each device until we are calibrated
         // each device will have an offset (could be negative)
+        
+        // we don't ever want input devices to occur before output devices
+        // however if an input device *is already* occuring before output devices
+        // then calling get_chunk_to_read on it will simply move it even more forward
+        // thus, any negative shift needed
+        
+        let mut input_shifts_needed = Vec::new();
         for input_index in 0..input_offsets.len() {
             let mut shifts_needed = Vec::new();
             for output_index in 0..output_offsets.len() {
@@ -1858,11 +1875,32 @@ impl AecStream {
             }
             // take the min of the shift needed for each device (we don't ever want it to occur before the device)
             let shift_needed = if let Some(min_val) = shifts_needed.iter().min() {
-                (*min_val as i64) - ((self.aec_config.frame_size/3) as i64)
+                (*min_val as i64) - ((self.aec_config.frame_size/3) as i64) // ime this offset is better than perfectly aligned, and better than /2
             } else {
                 0
             };
-            println!("Shifting {shift_needed}");
+            input_shifts_needed.push(shift_needed);
+        }
+        let min_input_shift_needed = input_shifts_needed.iter().min();
+        // if it is less than zero, it needs to be shifted forwards not backwards (it's currently playing before an output audio device)
+        // to do this, we'll need to move all the output devices forward by that much
+        // and then since we did that, we'll subtract that amount from our shifts needed
+        if min_input_shift_needed < 0 {
+            // if we needed to move the input to the left A amount
+            // now, outputs will be moved to the left min_input_shift_needed
+            // so we need to move the input a total of A-min_input_shift_needed amount (because min_input_shift_needed is negative)
+            // this will also ensure that all input_shifts_needed are positive now
+            input_shifts_needed = input_shifts_needed.iter().map(|&o| o-min_input_shift_needed).copied();
+            if let Some(aligner) = self.output_aligners.get_mut(&self.sorted_output_aligners[input_index].clone()) {
+                // skip ahead that many samples (* num channels bc it is multi channel)
+                let (_ok, chunk) = aligner.get_chunk_to_read((min_input_shift_needed as usize) * aligner.channels).await;
+                let chunk_len = chunk.len();
+                aligner.finish_read(chunk_len);
+            }
+        }
+
+        for input_index in 0..input_offsets.len() {
+            let shift_needed = input_shifts_needed[input_index];
             if let Some(aligner) = self.input_aligners.get_mut(&self.sorted_input_aligners[input_index].clone()) {
                 // skip ahead that many samples (* num channels bc it is multi channel)
                 if shift_needed > 0 {
@@ -2184,6 +2222,7 @@ impl AecStream {
         self.input_audio_buffer.fill(0 as f32);
 
         for key in &self.sorted_input_aligners {
+            let input_gain = self.input_gain;
             if let Some(aligner) = self.input_aligners.get_mut(key) {
                 let channels = aligner.channels;
                 let needed = chunk_size * channels;
@@ -2195,7 +2234,7 @@ impl AecStream {
                         let mut src_idx = c;
                         let mut dst = input_channel + c;
                         for _ in 0..frames {
-                            self.input_audio_buffer[dst] = chunk[src_idx];
+                            self.input_audio_buffer[dst] = chunk[src_idx]*input_gain;
                             dst += self.input_channels;
                             src_idx += channels;
                         }
