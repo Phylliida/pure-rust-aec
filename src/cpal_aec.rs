@@ -1857,11 +1857,6 @@ impl AecStream {
         // we need to throw away some samples for each device until we are calibrated
         // each device will have an offset (could be negative)
         
-        // we don't ever want input devices to occur before output devices
-        // however if an input device *is already* occuring before output devices
-        // then calling get_chunk_to_read on it will simply move it even more forward
-        // thus, any negative shift needed
-        
         let mut input_shifts_needed = Vec::new();
         for input_index in 0..input_offsets.len() {
             let mut shifts_needed = Vec::new();
@@ -1881,23 +1876,30 @@ impl AecStream {
             };
             input_shifts_needed.push(shift_needed);
         }
-        let min_input_shift_needed = input_shifts_needed.iter().min();
+        let min_input_shift_needed = input_shifts_needed.iter().copied().min();
         // if it is less than zero, it needs to be shifted forwards not backwards (it's currently playing before an output audio device)
         // to do this, we'll need to move all the output devices forward by that much
         // and then since we did that, we'll subtract that amount from our shifts needed
-        if min_input_shift_needed < 0 {
-            // if we needed to move the input to the left A amount
-            // now, outputs will be moved to the left min_input_shift_needed
-            // so we need to move the input a total of A-min_input_shift_needed amount (because min_input_shift_needed is negative)
-            // this will also ensure that all input_shifts_needed are positive now
-            input_shifts_needed = input_shifts_needed.iter().map(|&o| o-min_input_shift_needed).copied();
-            if let Some(aligner) = self.output_aligners.get_mut(&self.sorted_output_aligners[input_index].clone()) {
-                // skip ahead that many samples (* num channels bc it is multi channel)
-                let (_ok, chunk) = aligner.get_chunk_to_read((min_input_shift_needed as usize) * aligner.channels).await;
-                let chunk_len = chunk.len();
-                aligner.finish_read(chunk_len);
+        if let Some(min_input_shift_needed) = min_input_shift_needed {
+            if min_input_shift_needed < 0 {
+                // if we needed to move the input to the left A amount
+                // now, outputs will be moved to the left min_input_shift_needed
+                // so we need to move the input a total of A-min_input_shift_needed amount (because min_input_shift_needed is negative)
+                // this will also ensure that all input_shifts_needed are positive now
+                for s in &mut input_shifts_needed {
+                    *s -= -(min_input_shift_needed);  // min_shift is negative, so this adds abs(min_shift)
+                }
+                for output_index in 0..output_offsets.len() {
+                    if let Some(aligner) = self.output_aligners.get_mut(&self.sorted_output_aligners[output_index].clone()) {
+                        // skip ahead that many samples (* num channels bc it is multi channel)
+                        let (_ok, chunk) = aligner.get_chunk_to_read(((-min_input_shift_needed) as usize) * aligner.channels).await;
+                        let chunk_len = chunk.len();
+                        aligner.finish_read(chunk_len);
+                    }
+                }
             }
         }
+        
 
         for input_index in 0..input_offsets.len() {
             let shift_needed = input_shifts_needed[input_index];
