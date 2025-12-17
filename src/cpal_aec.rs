@@ -1887,7 +1887,7 @@ impl AecStream {
                 // so we need to move the input a total of A-min_input_shift_needed amount (because min_input_shift_needed is negative)
                 // this will also ensure that all input_shifts_needed are positive now
                 for s in &mut input_shifts_needed {
-                    *s -= -(min_input_shift_needed);  // min_shift is negative, so this adds abs(min_shift)
+                    *s += min_input_shift_needed.unsigned_abs as i64;  // min_shift is negative, so this adds abs(min_shift)
                 }
                 for output_index in 0..output_offsets.len() {
                     if let Some(aligner) = self.output_aligners.get_mut(&self.sorted_output_aligners[output_index].clone()) {
