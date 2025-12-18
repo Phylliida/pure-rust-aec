@@ -108,6 +108,7 @@ pub mod fftwrap_h {
 pub mod stdio_h {
     use super::FILE_h::FILE;
     extern "C" {
+        #[cfg_attr(target_os = "macos", link_name = "__stderrp")]
         pub static mut stderr: *mut FILE;
         pub fn fprintf(
             __stream: *mut FILE,

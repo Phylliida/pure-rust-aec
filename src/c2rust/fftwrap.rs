@@ -16,6 +16,7 @@ pub struct _IO_marker {
 }
 
 extern "C" {
+    #[cfg_attr(target_os = "macos", link_name = "__stderrp")]
     static mut stderr: *mut FILE;
     fn fprintf(
         __stream: *mut FILE,

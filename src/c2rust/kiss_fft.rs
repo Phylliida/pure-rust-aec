@@ -22,6 +22,7 @@ extern "C" {
     fn exit(__status: std::ffi::c_int) -> !;
     fn cos(__x: std::ffi::c_double) -> std::ffi::c_double;
     fn sin(__x: std::ffi::c_double) -> std::ffi::c_double;
+    #[cfg_attr(target_os = "macos", link_name = "__stderrp")]
     static mut stderr: *mut FILE;
     fn fprintf(
         __stream: *mut FILE,
