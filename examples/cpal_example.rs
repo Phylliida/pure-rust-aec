@@ -118,7 +118,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // waits for channels to calibrate
     while stream.num_input_channels() == 0 || stream.num_output_channels() == 0 {
-        let (aligned_input, aligned_output, aec_applied, _start_time, _end_time) = stream.update_debug()?;
+        let (aligned_input, aligned_output, aec_applied, _start_time, _end_time, _vad_scores) =
+            stream.update_debug(false)?;
         // don't write to wav files bc if one device is ready before another,
         // that device will have more samples written
         // which makes it annoying to check alignments in audacity
@@ -143,7 +144,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     for _i in 0..6000 {
         let num_input_channels = stream.num_input_channels();
-        let (aligned_input, aligned_output, aec_applied, _start_time, _end_time) = stream.update_debug()?;
+        let (aligned_input, aligned_output, aec_applied, _start_time, _end_time, _vad_scores) =
+            stream.update_debug(false)?;
         let chunk_size = aligned_input.len() / num_input_channels;
         //for &s in aligned_input[..chunk_size].iter() { in_wav.write_sample(s)?; }
         //for &s in aligned_output[..chunk_size].iter() { out_wav.write_sample(s)?; }

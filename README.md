@@ -74,8 +74,8 @@ def on_chunk(buf, start_us, end_us):
     pass
 stream.set_callback(on_chunk)
 
-# Manual polling is also possible:
-pcm, start, end = stream.update()
+# Manual polling is also possible (optionally request per-channel VAD scores):
+pcm, start, end, vad_scores = stream.update(use_vad=True)
 
 # You can run the built-in VAD on raw f32 samples:
 score = stream.vad([0.0] * 160)

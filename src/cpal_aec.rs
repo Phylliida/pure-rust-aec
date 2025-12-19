@@ -1707,7 +1707,7 @@ pub struct AecStream {
     input_channels: usize,
     output_channels: usize,
     input_gain: f32,
-    vad: Option<VoiceActivityDetector>,
+    vads: Vec<VoiceActivityDetector>,
     start_micros: Option<u128>,
     total_frames_emitted: u128,
     input_audio_buffer: Vec<f32>,
@@ -1750,8 +1750,8 @@ impl AecStream {
            output_audio_buffer: Vec::new(),
            aec_audio_buffer: Vec::new(),
            vad_buffer: Vec::new(),
-           aec3: None,
-           vad: None,
+            aec3: None,
+           vads: Vec::new(),
         })
     }
     
@@ -1834,6 +1834,9 @@ impl AecStream {
         self.aec_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as f32);
         self.vad_buffer.clear();
         self.vad_buffer.resize(self.aec_config.frame_size, 0 as i16);
+        self.vads = (0..self.input_channels)
+            .map(|_| VoiceActivityDetector::new(VoiceActivityProfile::AGGRESSIVE))
+            .collect();
         Ok(())
     }
 
@@ -1993,7 +1996,8 @@ impl AecStream {
         let total_in_ch = self.input_channels.max(1);
         let total_out_ch = self.output_channels.max(1);
         while captured_micros < target_micros {
-            let (input_slices, output_slices, _aec_out, start_time, end_time) = self.update_debug().await?;
+            let (input_slices, output_slices, _aec_out, start_time, end_time, _vad_scores) =
+                self.update_debug(false).await?;
             let chunk_micros = end_time.saturating_sub(start_time);
             if !input_slices.is_empty() && total_in_ch > 0 {
                 let frames = input_slices.len() / total_in_ch;
@@ -2122,17 +2126,31 @@ impl AecStream {
             .collect()
     }
 
-    // calls update, but returns all involved audio buffers
-    // (if needed for diagnostic reasons, usually .update() (which returns aec'd inputs) should be all you need)
-    pub async fn update_debug(&mut self, use_vad: bool) -> Result<(&[f32], &[f32], &[f32], u128, u128, bool), Box<dyn std::error::Error>> {
-        let (start_time, end_time, vad_prediction) = {
-            let (_, start_time, end_time, vad_prediction) = self.update().await?;
-            (start_time, end_time, vad_prediction)
-        };
-        return Ok((self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), self.aec_audio_buffer.as_slice(), start_time, end_time, vad_prediction));
+    pub async fn update_debug_vad(&mut self) -> {
+        let VAD_FRAME_SIZE = 512;
+        // this has 3 circular buffers of size min(self.aec_config.frame_size*4, VAD_FRAME_SIZE*2) that hold the input_audio_buffer, output_audio_buffer, and aec_outputs from update_debug
+        // update_debug is called multiple times until we have at least VAD_FRAME_SIZE samples, at which point the vad is called (one for each channel) and then we send the results
+        
     }
 
-    pub async fn update(&mut self, use_vad: bool) -> Result<(&[f32], u128, u128, bool), Box<dyn std::error::Error>> {
+    // calls update, but returns all involved audio buffers
+    // (if needed for diagnostic reasons, usually .update() (which returns aec'd inputs) should be all you need)
+    pub async fn update_debug(&mut self) -> Result<(&[f32], &[f32], &[f32], u128, u128, Vec<f32>), Box<dyn std::error::Error>> {
+        let (start_time, end_time, vad_scores) = {
+            let (_, start_time, end_time, vad_scores) = self.update(use_vad).await?;
+            (start_time, end_time, vad_scores)
+        };
+        Ok((
+            self.input_audio_buffer.as_slice(),
+            self.output_audio_buffer.as_slice(),
+            self.aec_audio_buffer.as_slice(),
+            start_time,
+            end_time,
+            vad_scores,
+        ))
+    }
+
+    pub async fn update(&mut self, use_vad: bool) -> Result<(&[f32], u128, u128, Vec<f32>), Box<dyn std::error::Error>> {
         let chunk_size = self.aec_config.frame_size;
         let start_micros = if let Some(start_micros_value) = self.start_micros {
             start_micros_value
@@ -2195,7 +2213,7 @@ impl AecStream {
         // similarly, if we initialize an output device here
         // we may not get any audio for a little bit
         if chunk_size == 0 {
-            return Ok((&[], chunk_start_micros, chunk_end_micros));
+            return Ok((&[], chunk_start_micros, chunk_end_micros, Vec::new()));
         }
          // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
@@ -2318,17 +2336,30 @@ impl AecStream {
             }
         };
 
-        let speech_detected = if (vad) {
-            let vad = self
-                .vad
-                .get_or_insert_with(|| VoiceActivityDetector::new(VoiceActivityProfile::AGGRESSIVE));
-            for channel in ..self.input_channels {
-                for i in ..:
-                    self.vad_buffer[i] = i16.from_sample(aec_output[i])
+        let mut vad_scores = Vec::new();
+        if use_vad && self.input_channels > 0 {
+            let frames = aec_output.len() / self.input_channels;
+            if frames > 0 {
+                self.vad_buffer.clear();
+                self.vad_buffer.resize(frames, 0);
+                for channel in 0..self.input_channels {
+                    for frame_idx in 0..frames {
+                        let sample = aec_output[frame_idx * self.input_channels + channel];
+                        self.vad_buffer[frame_idx] = Self::f32_to_i16(sample);
+                    }
+                    if let Some(detector) = self.vads.get_mut(channel) {
+                        let score = match detector.predict_16khz(&self.vad_buffer) {
+                            Ok(true) => 1.0,
+                            Ok(false) => 0.0,
+                            Err(_) => 0.0,
+                        };
+                        vad_scores.push(score);
+                    }
+                }
             }
         }
 
-        Ok((aec_output.as_slice(), chunk_start_micros, chunk_end_micros, vad_prediction))
+        Ok((aec_output.as_slice(), chunk_start_micros, chunk_end_micros, vad_scores))
     }
 
     pub fn vad(&mut self, buf: &[f32]) -> f32 {
@@ -2338,7 +2369,8 @@ impl AecStream {
             frame.push((s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16);
         }
 
-        match vad.predict_16khz(&frame) {
+        let mut detector = VoiceActivityDetector::new(VoiceActivityProfile::AGGRESSIVE);
+        match detector.predict_16khz(&frame) {
             Ok(true) => 1.0,
             Ok(false) => 0.0,
             Err(_) => 0.0,
