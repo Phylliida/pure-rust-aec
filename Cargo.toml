@@ -23,6 +23,7 @@ pyo3 = { version = "0.27", features = ["extension-module", "macros", "abi3-py38"
 futures = "0.3"
 aec3 = "0.1.2"
 cfg-if = "1.0.4"
+earshot = "0.1.0"
 
 [[example]]
 name = "cpal_example"

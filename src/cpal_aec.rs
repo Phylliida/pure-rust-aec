@@ -1705,6 +1705,7 @@ pub struct AecStream {
     input_channels: usize,
     output_channels: usize,
     input_gain: f32,
+    vad: Option<Detector<QuantizedPredictor>>,
     start_micros: Option<u128>,
     total_frames_emitted: u128,
     input_audio_buffer: Vec<f32>,
@@ -1738,6 +1739,7 @@ impl AecStream {
            sorted_input_aligners: Vec::new(),
            sorted_output_aligners: Vec::new(),
            input_gain: 1f32,
+           vad_enabled: false,
            input_channels: 0,
            output_channels: 0,
            start_micros: None,
@@ -1746,6 +1748,7 @@ impl AecStream {
            output_audio_buffer: Vec::new(),
            aec_audio_buffer: Vec::new(),
            aec3: None,
+           vad: None,
         })
     }
     
@@ -2311,6 +2314,11 @@ impl AecStream {
         };
 
         Ok((aec_output.as_slice(), chunk_start_micros, chunk_end_micros))
+    }
+
+    pub fn vad(&mut self, buf: &[f32]) -> f32 {
+        let vad = self.vad.get_or_insert_with(Detector::<QuantizedPredictor>::default);
+        vad.predict_f32(buf)
     }
     
     fn energy(buf: &[f32]) -> f64 {
