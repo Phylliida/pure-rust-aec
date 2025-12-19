@@ -2147,14 +2147,14 @@ impl AecStream {
         // this has 3 circular buffers of size min(self.aec_config.frame_size*4, VAD_FRAME_SIZE*2) that hold the input_audio_buffer, output_audio_buffer, and aec_outputs from update_debug
         // update_debug is called multiple times until we have at least VAD_FRAME_SIZE samples, at which point the vad is called (one for each channel) and then we send the results
         let max_frames = (self.aec_config.frame_size * 4).min(VAD_FRAME_SIZE * 2);
-        let mut lastest_end_time: u128 = 0;
+        let mut latest_end_time: u128 = 0;
 
         while self.input_channels > 0 && (self.vad_input_buffer_cons.available() / self.input_channels) < VAD_FRAME_SIZE {
             let (_start, end) = {
-                let (input, output, aec, start, end) = self.update().await?;
+                let (input, start, end) = self.update().await?;
                 (start, end)
             }
-            lastest_end_time = end;
+            latest_end_time = end;
             if input.is_empty() {
                 break;
             }
@@ -2171,18 +2171,19 @@ impl AecStream {
         }
 
         // failed, maybe we removed all input devices, return nothing
-        if (self.vad_input_buffer_cons.available() / self.input_channels) < VAD_FRAME_SIZE {
+        if self.input_channels == 0 || (self.vad_input_buffer_cons.available() / self.input_channels) < VAD_FRAME_SIZE {
             return (&[], &[], &[], 0, 0, Vec::new())
         }
 
-        let input_buf = self.vad_input_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE);
-        let output_buf = self.vad_output_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE);
-        let aec_buf = self.vad_aec_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE);
+        let input_buf = self.vad_input_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE*self.input_channels);
+        let output_buf = self.vad_output_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE*self.output_channels);
+        let aec_buf = self.vad_aec_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE*self.input_channels);
         self.vad_input_buffer_cons.finish_read(VAD_FRAME_SIZE*self.input_channels);
         self.vad_output_buffer_cons.finish_read(VAD_FRAME_SIZE*self.output_channels);
         self.vad_aec_buffer_cons.finish_read(VAD_FRAME_SIZE*self.input_channels);
         let remaining_frames = self.vad_input_buffer_cons.available() / self.input_channels;
         let end_time = last_end_time - frames_to_micros(remaining_frames, self.aec_config.sample_rate);
+        let start_time = end_time - frames_to_micros(VAD_FRAME_SIZE, self.aec_config.sample_rate);
 
         let frames_available = aec_buf.len() / self.input_channels;
         let vad_scores = Vec::new();
@@ -2190,7 +2191,7 @@ impl AecStream {
             self.vad_buffer.clear();
             self.vad_buffer.resize(VAD_FRAME_SIZE, 0);
             for frame_idx in 0..VAD_FRAME_SIZE {
-                let sample = aec_buf[start_idx + frame_idx * self.input_channels + channel];
+                let sample = aec_buf[frame_idx * self.input_channels + channel];
                 self.vad_buffer[frame_idx] = Self::f32_to_i16(sample);
             }
             if let Some(detector) = self.vads.get_mut(channel) {
@@ -2211,7 +2212,7 @@ impl AecStream {
 
     // calls update, but returns all involved audio buffers
     // (if needed for diagnostic reasons, usually .update() (which returns aec'd inputs) should be all you need)
-    pub async fn update_debug(&mut self) -> Result<(&[f32], &[f32], &[f32], u128, u128, Vec<f32>), Box<dyn std::error::Error>> {
+    pub async fn update_debug(&mut self) -> Result<(&[f32], &[f32], &[f32], u128, u128), Box<dyn std::error::Error>> {
         let (start_time, end_time) = {
             let (_, start_time, end_time) = self.update().await?;
             (start_time, end_time)
