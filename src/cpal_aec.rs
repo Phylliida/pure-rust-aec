@@ -102,6 +102,8 @@ use js_sys::{Date, Promise};
 use wasm_bindgen::{JsCast, JsValue};
 use hound::{SampleFormat as HoundSampleFormat, WavSpec, WavWriter};
 
+use earshot::{VoiceActivityDetector, VoiceActivityProfile};
+
 #[inline]
 fn aec_log(msg: impl AsRef<str>) {
     let msg = msg.as_ref();
@@ -1705,12 +1707,13 @@ pub struct AecStream {
     input_channels: usize,
     output_channels: usize,
     input_gain: f32,
-    vad: Option<Detector<QuantizedPredictor>>,
+    vad: Option<VoiceActivityDetector>,
     start_micros: Option<u128>,
     total_frames_emitted: u128,
     input_audio_buffer: Vec<f32>,
     output_audio_buffer: Vec<f32>,
     aec_audio_buffer: Vec<f32>,
+    vad_buffer: Vec<i16>,
     aec3: Option<VoipAec3>,
 }
 
@@ -1739,7 +1742,6 @@ impl AecStream {
            sorted_input_aligners: Vec::new(),
            sorted_output_aligners: Vec::new(),
            input_gain: 1f32,
-           vad_enabled: false,
            input_channels: 0,
            output_channels: 0,
            start_micros: None,
@@ -1747,6 +1749,7 @@ impl AecStream {
            input_audio_buffer: Vec::new(),
            output_audio_buffer: Vec::new(),
            aec_audio_buffer: Vec::new(),
+           vad_buffer: Vec::new(),
            aec3: None,
            vad: None,
         })
@@ -1829,6 +1832,8 @@ impl AecStream {
         self.output_audio_buffer.resize(self.aec_config.frame_size * self.output_channels, 0 as f32);
         self.aec_audio_buffer.clear();
         self.aec_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as f32);
+        self.vad_buffer.clear();
+        self.vad_buffer.resize(self.aec_config.frame_size, 0 as i16);
         Ok(())
     }
 
@@ -2119,15 +2124,15 @@ impl AecStream {
 
     // calls update, but returns all involved audio buffers
     // (if needed for diagnostic reasons, usually .update() (which returns aec'd inputs) should be all you need)
-    pub async fn update_debug(&mut self) -> Result<(&[f32], &[f32], &[f32], u128, u128), Box<dyn std::error::Error>> {
-        let (start_time, end_time) = {
-            let (_, start_time, end_time) = self.update().await?;
-            (start_time, end_time)
+    pub async fn update_debug(&mut self, use_vad: bool) -> Result<(&[f32], &[f32], &[f32], u128, u128, bool), Box<dyn std::error::Error>> {
+        let (start_time, end_time, vad_prediction) = {
+            let (_, start_time, end_time, vad_prediction) = self.update().await?;
+            (start_time, end_time, vad_prediction)
         };
-        return Ok((self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), self.aec_audio_buffer.as_slice(), start_time, end_time));
+        return Ok((self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), self.aec_audio_buffer.as_slice(), start_time, end_time, vad_prediction));
     }
 
-    pub async fn update(&mut self) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
+    pub async fn update(&mut self, use_vad: bool) -> Result<(&[f32], u128, u128, bool), Box<dyn std::error::Error>> {
         let chunk_size = self.aec_config.frame_size;
         let start_micros = if let Some(start_micros_value) = self.start_micros {
             start_micros_value
@@ -2313,12 +2318,31 @@ impl AecStream {
             }
         };
 
-        Ok((aec_output.as_slice(), chunk_start_micros, chunk_end_micros))
+        let speech_detected = if (vad) {
+            let vad = self
+                .vad
+                .get_or_insert_with(|| VoiceActivityDetector::new(VoiceActivityProfile::AGGRESSIVE));
+            for channel in ..self.input_channels {
+                for i in ..:
+                    self.vad_buffer[i] = i16.from_sample(aec_output[i])
+            }
+        }
+
+        Ok((aec_output.as_slice(), chunk_start_micros, chunk_end_micros, vad_prediction))
     }
 
     pub fn vad(&mut self, buf: &[f32]) -> f32 {
-        let vad = self.vad.get_or_insert_with(Detector::<QuantizedPredictor>::default);
-        vad.predict_f32(buf)
+        // Earshot expects i16 samples; clamp/scale the incoming f32 frame.
+        let mut frame = Vec::with_capacity(buf.len());
+        for &s in buf {
+            frame.push((s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16);
+        }
+
+        match vad.predict_16khz(&frame) {
+            Ok(true) => 1.0,
+            Ok(false) => 0.0,
+            Err(_) => 0.0,
+        }
     }
     
     fn energy(buf: &[f32]) -> f64 {

@@ -767,6 +767,14 @@ impl PyAecStream {
         Ok((aligned_in, aligned_out, aec_applied, start, end))
     }
 
+    /// Run the VAD on a buffer of f32 samples (interleaved if multi-channel).
+    pub fn vad(&mut self, audio: Vec<f32>) -> PyResult<f32> {
+        self.inner
+            .try_lock()
+            .map(|mut guard| guard.vad(&audio))
+            .ok_or_else(|| PyRuntimeError::new_err("AecStream is busy"))
+    }
+
     #[getter]
     fn input_gain(&self) -> PyResult<f32> {
         self.inner

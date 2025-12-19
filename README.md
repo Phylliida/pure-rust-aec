@@ -77,6 +77,9 @@ stream.set_callback(on_chunk)
 # Manual polling is also possible:
 pcm, start, end = stream.update()
 
+# You can run the built-in VAD on raw f32 samples:
+score = stream.vad([0.0] * 160)
+
 # Cleanup
 prod.end_audio_stream(out_stream)
 stream.clear_callback()
