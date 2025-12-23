@@ -769,6 +769,30 @@ impl PyAecStream {
         Ok((aligned_in, aligned_out, aec_applied, start, end))
     }
 
+    #[pyo3(signature = ())]
+    pub async fn update_debug_vad(
+        &mut self,
+    ) -> PyResult<(Py<PyBytes>, Py<PyBytes>, Py<PyBytes>, u128, u128, Vec<bool>)> {
+        let (aligned_in, aligned_out, aec_applied, start, end, vad_scores) = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .update_debug_vad()
+                .await
+                .map(|(a, b, c, s, e, v)| (a.to_vec(), b.to_vec(), c.to_vec(), s, e, v))
+        }
+        .map_err(to_py_err)?;
+
+        let (aligned_in, aligned_out, aec_applied) = Python::attach(|py| {
+            (
+                slice_to_pybytes(py, aligned_in.as_slice()),
+                slice_to_pybytes(py, aligned_out.as_slice()),
+                slice_to_pybytes(py, aec_applied.as_slice()),
+            )
+        });
+
+        Ok((aligned_in, aligned_out, aec_applied, start, end, vad_scores))
+    }
+
     #[getter]
     fn input_gain(&self) -> PyResult<f32> {
         self.inner
