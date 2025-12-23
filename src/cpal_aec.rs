@@ -1691,7 +1691,7 @@ enum DeviceUpdateMessage {
     RemoveOutputDevice(String)
 }
 
-const VAD_FRAME_SIZE : usize = 512;
+const VAD_FRAME_SIZE : usize = 256;
 
 pub struct AecStream {
     //aec: Option<EchoCanceller>,
