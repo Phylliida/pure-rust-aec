@@ -730,32 +730,31 @@ impl PyAecStream {
         result.map_err(to_py_err)
     }
 
-    #[pyo3(signature = (use_vad=false))]
-    pub async fn update(&mut self, use_vad: bool) -> PyResult<(Py<PyBytes>, u128, u128, Vec<f32>)> {
-        let (samples, start, end, vad_scores) = {
+    #[pyo3(signature = ())]
+    pub async fn update(&mut self) -> PyResult<(Py<PyBytes>, u128, u128)> {
+        let (samples, start, end) = {
             let mut guard = self.inner.lock().await;
             guard
-                .update(use_vad)
+                .update()
                 .await
-                .map(|(buf, s, e, vad)| (buf.to_vec(), s, e, vad))
+                .map(|(buf, s, e)| (buf.to_vec(), s, e))
         }
         .map_err(to_py_err)?;
 
         let py_buf = Python::attach(|py| slice_to_pybytes(py, samples.as_slice()));
-        Ok((py_buf, start, end, vad_scores))
+        Ok((py_buf, start, end))
     }
 
-    #[pyo3(signature = (use_vad=false))]
+    #[pyo3(signature = ())]
     pub async fn update_debug(
         &mut self,
-        use_vad: bool,
-    ) -> PyResult<(Py<PyBytes>, Py<PyBytes>, Py<PyBytes>, u128, u128, Vec<f32>)> {
-        let (aligned_in, aligned_out, aec_applied, start, end, vad_scores) = {
+    ) -> PyResult<(Py<PyBytes>, Py<PyBytes>, Py<PyBytes>, u128, u128)> {
+        let (aligned_in, aligned_out, aec_applied, start, end) = {
             let mut guard = self.inner.lock().await;
             guard
-                .update_debug(use_vad)
+                .update_debug()
                 .await
-                .map(|(a, b, c, s, e, v)| (a.to_vec(), b.to_vec(), c.to_vec(), s, e, v))
+                .map(|(a, b, c, s, e)| (a.to_vec(), b.to_vec(), c.to_vec(), s, e))
         }
         .map_err(to_py_err)?;
 
@@ -767,15 +766,7 @@ impl PyAecStream {
             )
         });
 
-        Ok((aligned_in, aligned_out, aec_applied, start, end, vad_scores))
-    }
-
-    /// Run the VAD on a buffer of f32 samples (interleaved if multi-channel).
-    pub fn vad(&mut self, audio: Vec<f32>) -> PyResult<f32> {
-        self.inner
-            .try_lock()
-            .map(|mut guard| guard.vad(&audio))
-            .ok_or_else(|| PyRuntimeError::new_err("AecStream is busy"))
+        Ok((aligned_in, aligned_out, aec_applied, start, end))
     }
 
     #[getter]
@@ -833,23 +824,23 @@ impl PyAecStream {
                     break;
                 }
 
-                let (samples, start, end, _vad_scores) = {
+                let (samples, start, end) = {
                     let Some(inner_arc) = inner.upgrade() else {
                         break;
                     };
                     let fut = async {
                         let mut guard = inner_arc.lock().await;
                         guard
-                            .update(false)
+                            .update()
                             .await
-                            .map(|(buf, s, e, v)| (buf.to_vec(), s, e, v))
+                            .map(|(buf, s, e)| (buf.to_vec(), s, e))
                             .map_err(|e| e.to_string())
                     };
                     match pool.run_until(fut) {
                         Ok(res) => res,
                         Err(err) => {
                             eprintln!("Aec callback update error: {err}");
-                            (Vec::new(), 0, 0, Vec::new())
+                            (Vec::new(), 0, 0)
                         }
                     }
                 };

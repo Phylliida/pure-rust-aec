@@ -53,7 +53,7 @@ use futures::StreamExt;
 use futures::executor::block_on;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap},
     error::Error,
     mem::{MaybeUninit},
     sync::{
@@ -1691,6 +1691,8 @@ enum DeviceUpdateMessage {
     RemoveOutputDevice(String)
 }
 
+const VAD_FRAME_SIZE : usize = 512;
+
 pub struct AecStream {
     //aec: Option<EchoCanceller>,
     aec_config: AecConfig,
@@ -1720,7 +1722,10 @@ pub struct AecStream {
     vad_output_buffer_cons: BufferedCircularConsumer::<f32>,
     vad_aec_buffer_prod: BufferedCircularProducer::<f32>,
     vad_aec_buffer_cons: BufferedCircularConsumer::<f32>,
-    start_times_buffer: VecDequeue<f32>,
+    vad_input_buffer: Vec<f32>,
+    vad_output_buffer: Vec<f32>,
+    vad_aec_buffer: Vec<f32>,
+
     aec3: Option<VoipAec3>,
 }
 
@@ -1761,6 +1766,9 @@ impl AecStream {
            output_audio_buffer: Vec::new(),
            aec_audio_buffer: Vec::new(),
            vad_buffer: Vec::new(),
+           vad_input_buffer: Vec::new(),
+           vad_output_buffer: Vec::new(),
+           vad_aec_buffer: Vec::new(),
            vad_input_buffer_prod: BufferedCircularProducer::<f32>::new(vad_input_prod),
            vad_input_buffer_cons: BufferedCircularConsumer::<f32>::new(vad_input_cons),
            vad_output_buffer_prod: BufferedCircularProducer::<f32>::new(vad_output_prod),
@@ -2011,8 +2019,8 @@ impl AecStream {
         let total_in_ch = self.input_channels.max(1);
         let total_out_ch = self.output_channels.max(1);
         while captured_micros < target_micros {
-            let (input_slices, output_slices, _aec_out, start_time, end_time, _vad_scores) =
-                self.update_debug(false).await?;
+            let (input_slices, output_slices, _aec_out, start_time, end_time) =
+                self.update_debug().await?;
             let chunk_micros = end_time.saturating_sub(start_time);
             if !input_slices.is_empty() && total_in_ch > 0 {
                 let frames = input_slices.len() / total_in_ch;
@@ -2141,23 +2149,24 @@ impl AecStream {
             .collect()
     }
 
-    pub async fn update_debug_vad(&mut self) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, u128, u128, Vec<f32>), Box<dyn std::error::Error>> {
+    pub async fn update_debug_vad(&mut self) -> Result<(&[f32], &[f32], &[f32], u128, u128, Vec<bool>), Box<dyn std::error::Error>> {
         self.update_devices().await?; // needs to be done before everything, so num channels doen't change between update_helper calls
-        let VAD_FRAME_SIZE = 512;
+
         // this has 3 circular buffers of size min(self.aec_config.frame_size*4, VAD_FRAME_SIZE*2) that hold the input_audio_buffer, output_audio_buffer, and aec_outputs from update_debug
         // update_debug is called multiple times until we have at least VAD_FRAME_SIZE samples, at which point the vad is called (one for each channel) and then we send the results
-        let max_frames = (self.aec_config.frame_size * 4).min(VAD_FRAME_SIZE * 2);
         let mut latest_end_time: u128 = 0;
 
         while self.input_channels > 0 && (self.vad_input_buffer_cons.available() / self.input_channels) < VAD_FRAME_SIZE {
             let (_start, end) = {
                 let (input, start, end) = self.update().await?;
-                (start, end)
-            }
+                if input.is_empty() {
+                    break;
+                }
+                else {
+                    (start, end)
+                }
+            };
             latest_end_time = end;
-            if input.is_empty() {
-                break;
-            }
             let (input, output, aec) = (self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), self.aec_audio_buffer.as_slice());
             let (input_write, input_buf) = self.vad_input_buffer_prod.get_chunk_to_write(input.len());
             let (output_write, output_buf) = self.vad_output_buffer_prod.get_chunk_to_write(output.len());
@@ -2170,40 +2179,48 @@ impl AecStream {
             self.vad_aec_buffer_prod.finish_write(aec_write, aec.len());
         }
 
-        // failed, maybe we removed all input devices, return nothing
+        // failed, maybe we removed all input devices or something else happened, return nothing
         if self.input_channels == 0 || (self.vad_input_buffer_cons.available() / self.input_channels) < VAD_FRAME_SIZE {
-            return (&[], &[], &[], 0, 0, Vec::new())
+            return Ok((&[], &[], &[], 0, 0, Vec::new()));
         }
-
+        let remaining_frames = self.vad_input_buffer_cons.available() / self.input_channels;
+        
         let input_buf = self.vad_input_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE*self.input_channels);
         let output_buf = self.vad_output_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE*self.output_channels);
         let aec_buf = self.vad_aec_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE*self.input_channels);
-        self.vad_input_buffer_cons.finish_read(VAD_FRAME_SIZE*self.input_channels);
-        self.vad_output_buffer_cons.finish_read(VAD_FRAME_SIZE*self.output_channels);
-        self.vad_aec_buffer_cons.finish_read(VAD_FRAME_SIZE*self.input_channels);
-        let remaining_frames = self.vad_input_buffer_cons.available() / self.input_channels;
-        let end_time = last_end_time - frames_to_micros(remaining_frames, self.aec_config.sample_rate);
-        let start_time = end_time - frames_to_micros(VAD_FRAME_SIZE, self.aec_config.sample_rate);
+        let end_time = latest_end_time - frames_to_micros(remaining_frames as u128, self.aec_config.target_sample_rate as u128);
+        let start_time = end_time - frames_to_micros(VAD_FRAME_SIZE as u128, self.aec_config.target_sample_rate as u128);
 
-        let frames_available = aec_buf.len() / self.input_channels;
-        let vad_scores = Vec::new();
+        let mut vad_scores = Vec::new();
+        self.vad_buffer.clear();
+        self.vad_buffer.resize(VAD_FRAME_SIZE, 0);
         for channel in 0..self.input_channels {
-            self.vad_buffer.clear();
-            self.vad_buffer.resize(VAD_FRAME_SIZE, 0);
             for frame_idx in 0..VAD_FRAME_SIZE {
                 let sample = aec_buf[frame_idx * self.input_channels + channel];
                 self.vad_buffer[frame_idx] = Self::f32_to_i16(sample);
             }
             if let Some(detector) = self.vads.get_mut(channel) {
-                let score = detector.predict_i16(&self.vad_buffer);
-                vad_scores.push(score);
+                let is_speech = detector.predict_16khz(&self.vad_buffer)?;
+                vad_scores.push(is_speech);
             }
         }
 
+        self.vad_input_buffer.clear();
+        self.vad_input_buffer.extend_from_slice(input_buf);
+        self.vad_output_buffer.clear();
+        self.vad_output_buffer.extend_from_slice(output_buf);
+        self.vad_aec_buffer.clear();
+        self.vad_aec_buffer.extend_from_slice(aec_buf);
+        
+        self.vad_input_buffer_cons.finish_read(VAD_FRAME_SIZE*self.input_channels);
+        self.vad_output_buffer_cons.finish_read(VAD_FRAME_SIZE*self.output_channels);
+        self.vad_aec_buffer_cons.finish_read(VAD_FRAME_SIZE*self.input_channels);
+        
+
         Ok((
-            input_buf,
-            output_buf,
-            aec_buf,
+            &self.vad_input_buffer.as_slice(),
+            &self.vad_output_buffer.as_slice(),
+            &self.vad_aec_buffer.as_slice(),
             start_time,
             end_time,
             vad_scores,
@@ -2277,7 +2294,7 @@ impl AecStream {
 
     pub async fn update(&mut self)-> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
         self.update_devices().await?;
-        self.update_helper().await?
+        self.update_helper().await
     }
 
     async fn update_helper(&mut self) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
@@ -2297,7 +2314,7 @@ impl AecStream {
         // similarly, if we initialize an output device here
         // we may not get any audio for a little bit
         if chunk_size == 0 {
-            return Ok((&[], chunk_start_micros, chunk_end_micros, Vec::new()));
+            return Ok((&[], chunk_start_micros, chunk_end_micros));
         }
          // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
@@ -2393,10 +2410,7 @@ impl AecStream {
 
             self.aec_audio_buffer.fill(0 as f32);
 
-            if self.input_channels == 0 {
-                &self.aec_audio_buffer
-            }
-            else {
+            if self.input_channels != 0 {
                 //let Some(aec) = self.aec.as_mut() else { 
                 //    return Err("no aec".into());
                 //};
@@ -2415,8 +2429,6 @@ impl AecStream {
                     };
                     let _metrics = aec3_value.process(&self.input_audio_buffer, Some(&self.output_audio_buffer), false, &mut self.aec_audio_buffer)?;
                 }
-                
-                &self.aec_audio_buffer
             }
         };
 
