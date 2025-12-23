@@ -2150,15 +2150,21 @@ impl AecStream {
     }
 
     pub async fn update_debug_vad(&mut self) -> Result<(&[f32], &[f32], &[f32], u128, u128, Vec<bool>), Box<dyn std::error::Error>> {
-        self.update_devices().await?; // needs to be done before everything, so num channels doen't change between update_helper calls
+        let (chunk_start_micros, chunk_end_micros) = self.update_devices().await?; // needs to be done before everything, so num channels doen't change between update_helper calls
 
         // this has 3 circular buffers of size min(self.aec_config.frame_size*4, VAD_FRAME_SIZE*2) that hold the input_audio_buffer, output_audio_buffer, and aec_outputs from update_debug
         // update_debug is called multiple times until we have at least VAD_FRAME_SIZE samples, at which point the vad is called (one for each channel) and then we send the results
         let mut latest_end_time: u128 = 0;
 
+        let first = true;
         while self.input_channels > 0 && (self.vad_input_buffer_cons.available() / self.input_channels) < VAD_FRAME_SIZE {
+            let (chunk_start_micros, chunk_end_micros) = if first {
+                (chunk_start_micros, chunk_end_micros)
+            } else {
+                self.get_next_frame()
+            };
             let (_start, end) = {
-                let (input, start, end) = self.update().await?;
+                let (input, start, end) = self.update_helper(chunk_start_micros, chunk_end_micros).await?;
                 if input.is_empty() {
                     break;
                 }
@@ -2243,7 +2249,7 @@ impl AecStream {
         ))
     }
 
-    async fn update_devices(&mut self) -> Result<(), Box<dyn std::error::Error>>{
+    async fn update_devices(&mut self) -> Result<(u128, u128), Box<dyn std::error::Error>>{
         loop {
             match self.device_update_receiver.try_next() {
                 Ok(Some(msg)) => match msg {
@@ -2289,25 +2295,14 @@ impl AecStream {
                 }
             }
         }
-        Ok(())
 
+        let (chunk_start_micros, chunk_end_micros) = self.get_next_frame();
         let chunk_size = self.aec_config.frame_size;
-        let start_micros = if let Some(start_micros_value) = self.start_micros {
-            start_micros_value
-        } else {
-            let start_micros_value = now_micros()
-                .saturating_sub(frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128));
-            self.start_micros = Some(start_micros_value);
-            start_micros_value
-        };
-        let chunk_start_micros = frames_to_micros(self.total_frames_emitted, self.aec_config.target_sample_rate as u128) + start_micros;
-        let chunk_end_micros = chunk_start_micros + frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128);
-        self.total_frames_emitted += chunk_size as u128;
         
         // similarly, if we initialize an output device here
         // we may not get any audio for a little bit
         if chunk_size == 0 {
-            return Ok((&[], chunk_start_micros, chunk_end_micros));
+            return Ok((chunk_start_micros, chunk_end_micros));
         }
          // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
@@ -2339,14 +2334,33 @@ impl AecStream {
         if modified_aligners {
             self.reinitialize_aec()?;
         }
+
+        Ok((chunk_start_micros, chunk_end_micros))
+    }
+
+    fn get_next_frame(&mut self) -> (u128, u128) {
+        let chunk_size = self.aec_config.frame_size;
+        let start_micros = if let Some(start_micros_value) = self.start_micros {
+            start_micros_value
+        } else {
+            let start_micros_value = now_micros()
+                .saturating_sub(frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128));
+            self.start_micros = Some(start_micros_value);
+            start_micros_value
+        };
+        let chunk_start_micros = frames_to_micros(self.total_frames_emitted, self.aec_config.target_sample_rate as u128) + start_micros;
+        let chunk_end_micros = chunk_start_micros + frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128);
+        self.total_frames_emitted += chunk_size as u128;
+        (chunk_start_micros, chunk_end_micros)
     }
 
     pub async fn update(&mut self)-> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
-        self.update_devices().await?;
-        self.update_helper().await
+        let (chunk_start_micros, chunk_end_micros) = self.update_devices().await?;
+        self.update_helper(chunk_start_micros, chunk_end_micros).await
     }
 
-    async fn update_helper(&mut self) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
+    async fn update_helper(&mut self, chunk_start_micros: u128, chunk_end_micros: u128) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
+        let chunk_size = self.aec_config.frame_size;
         
         // recieve audio data and interleave it into our buffers
         let mut input_channel = 0;
