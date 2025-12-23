@@ -2290,14 +2290,7 @@ impl AecStream {
             }
         }
         Ok(())
-    }
 
-    pub async fn update(&mut self)-> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
-        self.update_devices().await?;
-        self.update_helper().await
-    }
-
-    async fn update_helper(&mut self) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
         let chunk_size = self.aec_config.frame_size;
         let start_micros = if let Some(start_micros_value) = self.start_micros {
             start_micros_value
@@ -2346,7 +2339,15 @@ impl AecStream {
         if modified_aligners {
             self.reinitialize_aec()?;
         }
+    }
 
+    pub async fn update(&mut self)-> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
+        self.update_devices().await?;
+        self.update_helper().await
+    }
+
+    async fn update_helper(&mut self) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
+        
         // recieve audio data and interleave it into our buffers
         let mut input_channel = 0;
         self.input_audio_buffer.fill(0 as f32);
