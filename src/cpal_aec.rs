@@ -1739,7 +1739,7 @@ impl AecStream {
         if aec_config.target_sample_rate == 0 {
             return Err(format!("Target sample rate is {}, it must be greater than zero.", aec_config.target_sample_rate).into());
         }
-        let vad_buf_size = (VAD_FRAME_SIZE*2).max(aec_config.frame_size * 4);
+        let vad_buf_size = (VAD_FRAME_SIZE*128).max(aec_config.frame_size * 128);
         let (vad_input_prod, vad_input_cons) = HeapRb::<f32>::new(vad_buf_size).split();
         let (vad_output_prod, vad_output_cons) = HeapRb::<f32>::new(vad_buf_size).split();
         let (vad_aec_prod, vad_aec_cons) = HeapRb::<f32>::new(vad_buf_size).split();
