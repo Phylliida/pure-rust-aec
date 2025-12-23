@@ -896,18 +896,19 @@ impl StreamAlignerResampler {
         let estimated_emitted_frames = input_to_output_frames(num_available_frames as u128, self.input_sample_rate, self.dynamic_output_sample_rate);
         let updated_total_frames_emitted = self.total_emitted_frames + estimated_emitted_frames;
         let target_emitted_output_frames = input_to_output_frames(target_emitted_input_frames, self.input_sample_rate, self.output_sample_rate);
+        let margin = 5;
         // dynamic adjustment to synchronize input devices to global clock:
         // don't do dynamic adjustment until after calibration, bc it's not gonna drift too much over the course of just a few seconds of calibration data
         // and that simplifies logic/prevents accumulated error during calibration
         // not enough frames, we need to increase dynamic sample rate (to get more samples)
-        if updated_total_frames_emitted < target_emitted_output_frames && calibrated {
+        if updated_total_frames_emitted < target_emitted_output_frames - margin && calibrated {
             self.increase_dynamic_sample_rate()?;
-            // println!("Increase to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
+            println!("Increase to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
         }
         // too many frames, we need to decrease dynamic sample rate (to get less samples)
-        else if updated_total_frames_emitted > target_emitted_output_frames && calibrated {
+        else if updated_total_frames_emitted > target_emitted_output_frames + margin && calibrated {
             self.decrease_dynamic_sample_rate()?;
-            // println!("Decrease to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
+            println!("Decrease to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
         }
 
         //// do resampling ////
@@ -1366,6 +1367,20 @@ impl OutputStreamAlignerMixer {
             }
         }
 
+        // sources of latency
+        // physical output device latency
+        //   - chunk size 512
+        //   - say, we send x data at position 490
+        //   - we have frame size of 16
+        //   - so we don't add to chunk until 496
+        //   - then we don't actually play for 496ms
+        //   -   + physical device latency
+        //   - wheres if we send x data at position 20
+        //   - then we don't play for 32
+        //   -   + physical device latency
+        // device buffer latency
+        // 
+
         let (need_to_write_device_values, device_buf_write) = self.device_audio_producer.get_chunk_to_write(input_chunk_size * self.channels);
         let actual_input_chunk_size = device_buf_write.len();
         let frames_cap = device_buf_write.len() / (self.channels);
@@ -1375,6 +1390,7 @@ impl OutputStreamAlignerMixer {
             // this doesn't work because it'll stall for very large audio
             // resample_producer.resample_all()?; // do resampling of any available data
             // instead, do it streaming
+            // todo: there's a bug where the final 5-10ms of audio is cutoff because doesn't have any empty end data for the chunk
             resample_producer.resample((target_input_samples as u32) * 2)?; // do * 2 so we also grab some leftovers if there are some, this is an upper bound
             let buf_from_stream = resample_consumer.get_chunk_to_read(round_to_channels(actual_input_chunk_size as u32, *channels) as usize);
             let frames = (buf_from_stream.len() / *channels as usize).min(frames_cap);
@@ -1536,13 +1552,11 @@ impl OutputDeviceConfig {
         calibration_packets: u32,
         audio_buffer_seconds: u32,
         resampler_quality: i32,
-        frame_size_millis: u32,
+        frame_size: u32,
     ) -> Result<Self, Box<dyn Error>> {
         let host = cpal::host_from_id(host_id)?;
         let output_device = select_device(host.output_devices(), &device_name, "Output")?;
         let default_config = output_device.default_output_config()?;
-        let sample_rate = default_config.sample_rate().0;
-        let frame_size = micros_to_frames((frame_size_millis as u128)*1000, sample_rate as u128);
         Ok(Self::new(
             host_id,
             output_device.name()?,
@@ -1886,6 +1900,12 @@ impl AecStream {
     }
 
     pub async fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(), Box<dyn std::error::Error>> {
+        self.calibrate_inner(output_producers, debug_wav).await?;
+        self.calibrate_inner(output_producers, debug_wav).await?;
+        self.calibrate_inner(output_producers, debug_wav).await
+    }
+
+    pub async fn calibrate_inner(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(), Box<dyn std::error::Error>> {
         let (output_offsets, input_offsets) = self.get_calibration_offsets(output_producers, debug_wav).await?;
         // we need to throw away some samples for each device until we are calibrated
         // each device will have an offset (could be negative)
@@ -2157,7 +2177,7 @@ impl AecStream {
         let mut latest_end_time: u128 = 0;
 
         let first = true;
-        while self.input_channels > 0 && (self.vad_input_buffer_cons.available() / self.input_channels) < VAD_FRAME_SIZE {
+        while self.input_channels > 0 && self.output_channels > 0 && (self.vad_input_buffer_cons.available() / self.input_channels) < VAD_FRAME_SIZE {
             let (chunk_start_micros, chunk_end_micros) = if first {
                 (chunk_start_micros, chunk_end_micros)
             } else {
@@ -2434,7 +2454,7 @@ impl AecStream {
                 // this helps avoid needing to recalibrate every time we recieve audio
                 let output_energy = Self::energy(&self.output_audio_buffer);
                 let _input_energy = Self::energy(&self.input_audio_buffer);
-                if output_energy < 0.003 {
+                if output_energy < -3.0 {
                     self.aec_audio_buffer.copy_from_slice(&self.input_audio_buffer);
                 }
                 else {
@@ -3119,6 +3139,7 @@ where
     T: FromSample<f32>,
 {
     let device_name = config.device_name.clone();
+    let frame_size = config.frame_size;
     device.build_output_stream(
         &supported_config.config(),
         move |data: &mut [T], _| {
@@ -3131,7 +3152,7 @@ where
             let mut frames_needed = frames as i64 - (device_audio_channel_consumer.available() / mixer.channels) as i64;
             while frames_needed > 0 {
                 // todo: print mix errors
-                let _ = mixer.mix_audio_streams(frames_needed as usize + 1000); // a few extra in case of resampling
+                let _ = mixer.mix_audio_streams(((frames as usize)) as usize); // a few extra in case of resampling
                 frames_needed = frames as i64 - (device_audio_channel_consumer.available() / mixer.channels) as i64;
             }
             let chunk = device_audio_channel_consumer.get_chunk_to_read(frames * mixer.channels);
