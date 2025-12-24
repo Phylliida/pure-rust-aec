@@ -206,35 +206,58 @@ fn generate_probe_tone_16k_with_freqs(duration_ms: f32, freqs: &[f32]) -> Vec<f3
 
 /// Convenience: derive a distinct probe for each device index by nudging the frequencies.
 /// Keeps tones in the 1–3.5 kHz band (works at typical 16–48 kHz sample rates).
-fn generate_probe_tone_for_device(device_index: usize, duration_ms: f32, sample_rate: u32) -> Vec<f32> {
+fn generate_probe_tone_for_device(device_index: usize, empty_seconds: f32, duration_ms: f32, sample_rate: u32) -> Vec<f32> {
     //let base = [1_000.0f32, 1_800.0f32, 2_600.0f32];
     // Small offset per device to make correlation peaks separable.
     //let offset = (device_index as f32 % 5.0) * 120.0;
     //let freqs: Vec<f32> = base.iter().map(|f| f + offset).collect();
     //generate_probe_tone_with_freqs(duration_ms, sample_rate, &freqs);
     //let tone = chirp(1_200.0, 6_500.0, sample_rate, duration_ms);
-    indexed_chirp(device_index as u32, sample_rate, duration_ms / 1000.0)
+    indexed_chirp(device_index as u32, sample_rate, empty_seconds, duration_ms / 1000.0)
 }
 
-fn indexed_chirp(idx: u32, sr: u32, dur_s: f32) -> Vec<f32> {
+fn indexed_chirp(idx: u32, sr: u32, empty_seconds: f32, dur_s: f32) -> Vec<f32> {
     if dur_s <= 0.0 { return Vec::new(); }
-    let sr = sr as f32;
-    let n = (dur_s * sr).round().max(1.0) as usize;
 
+    let sr_f = sr as f32;
+    let n = (dur_s * sr_f).round().max(1.0) as usize;
+    let empty_n = (empty_seconds.max(0.0) * sr_f).round() as usize;
+
+    // NOTE: your h.fract() is always 0.0 because h is an integer-valued f32.
+    // Leaving your logic intact, but consider fixing if you actually want per-idx randomness.
     let h = (idx.wrapping_mul(0x9E3779B9) ^ 0x85EBCA6B) as f32;
     let base = 150.0 + (h.fract() * 120.0);       // ~150–270 Hz
     let span = 500.0 + (h.sin().abs() * 300.0);   // +0.5–0.8 kHz
-    let nyq_limit = sr * 0.2;                     // keep it low
+    let nyq_limit = sr_f * 0.2;                   // keep it low
     let f0 = base.min(nyq_limit);
     let f1 = (base + span).min(nyq_limit);
 
     let k = (f1 / f0).ln() / dur_s;
-    (0..n).map(|i| {
-        let t = i as f32 / sr;
-        let phase = 2.0 * std::f32::consts::PI * f0 * ((k * t).exp() - 1.0) / k;
-        let w = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos()); // Hann
-        phase.sin() * w * 0.3 // adjust gain as needed
-    }).collect()
+
+    let mut out = vec![0.0f32; empty_n];
+    out.reserve(n);
+
+    for i in 0..n {
+        let t = i as f32 / sr_f;
+
+        // Handle k ~ 0 (f0 ~= f1) to avoid divide-by-zero
+        let phase = if k.abs() < 1e-9 {
+            2.0 * std::f32::consts::PI * f0 * t
+        } else {
+            2.0 * std::f32::consts::PI * f0 * ((k * t).exp() - 1.0) / k
+        };
+
+        // Hann window (use n-1 so endpoints hit 0 when n>1)
+        let w = if n > 1 {
+            0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos())
+        } else {
+            1.0
+        };
+
+        out.push(phase.sin() * w * 0.3);
+    }
+
+    out
 }
 
 
@@ -278,24 +301,23 @@ fn chirp(f0: f32, f1: f32, sr: f32, dur_s: f32) -> Vec<f32> {
 
 /// Probe detection using GCC-PHAT to estimate lag between the captured stream and each probe.
 /// Returns best (device_index, start_sample, score) per device that produced a valid match.
-fn detect_probe_tones(input_mono: &[f32], num_devices: usize, duration_ms: f32, sample_rate: u32) -> Vec<(usize, i64, f32)> {
+fn detect_probe_tones(input_mono: &[f32], num_devices: usize, empty_seconds: f32, duration_ms: f32, sample_rate: u32) -> Vec<(usize, i64, f32)> {
     let mut results = Vec::new();
     if num_devices == 0 || input_mono.is_empty() {
         return results;
     }
 
     for device in 0..num_devices {
-        let probe = generate_probe_tone_for_device(device, duration_ms, sample_rate);
+        let probe = generate_probe_tone_for_device(device, empty_seconds, duration_ms, sample_rate);
         if probe.is_empty() || probe.len() > input_mono.len() {
             continue;
         }
         // Pad probe to match captured length for GCC-PHAT.
         let mut probe_padded = vec![0.0f32; input_mono.len()];
         probe_padded[..probe.len()].copy_from_slice(&probe);
-        let _margin = input_mono.len().saturating_sub(1);
-        let lag = gcc_phat_delay(&input_mono, &probe_padded);
+        let (lag, score) = gcc_phat_delay(&input_mono, &probe_padded);
             // positive lag means probe leads capture; lag is the start index in the capture
-        results.push((device, lag as i64, 0.0));
+        results.push((device, lag as i64, score));
     }
     results
 }
@@ -367,9 +389,89 @@ fn normalize(x: &[f32]) -> Vec<f32> {
     let gain = 1.0 / peak;
     x.iter().map(|&v| v * gain).collect()
 }
+
+pub fn gcc_phat_delay(x_in: &[f32], y_in: &[f32]) -> (isize, f32) {
+    assert_eq!(x_in.len(), y_in.len());
+    let n = x_in.len();
+    if n == 0 { return (0, 0.0); }
+
+    let x = normalize(x_in);
+    let y = normalize(y_in);
+
+    let nfft = (2 * n).next_power_of_two();
+
+    let mut x_vec = vec![Complex::<f32>::new(0.0, 0.0); nfft];
+    let mut y_vec = vec![Complex::<f32>::new(0.0, 0.0); nfft];
+    for i in 0..n {
+        x_vec[i].re = x[i];
+        y_vec[i].re = y[i];
+    }
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(nfft);
+    fft.process(&mut x_vec);
+    fft.process(&mut y_vec);
+
+    let eps = 1e-12f32;
+    let mut psi = vec![Complex::<f32>::new(0.0, 0.0); nfft];
+    for k in 0..nfft {
+        let g = x_vec[k] * y_vec[k].conj();
+        psi[k] = g / (g.norm() + eps); // PHAT
+    }
+
+    let ifft = planner.plan_fft_inverse(nfft);
+    ifft.process(&mut psi);
+
+    // Normalize inverse FFT (rustfft inverse is unnormalized)
+    let scale = 1.0 / (nfft as f32);
+    for v in &mut psi { *v *= scale; }
+
+    // Search lags only in [-(n-1), +(n-1)]
+    let max_lag = (n - 1) as isize;
+
+    // Find best peak
+    let mut best_i = 0usize;
+    let mut best_lag = 0isize;
+    let mut best_val = -f32::INFINITY;
+
+    for i in 0..nfft {
+        //let lag = if i <= nfft / 2 { i as isize } else { i as isize - nfft as isize };
+        //if lag < -max_lag || lag > max_lag { continue; }
+
+        let v = psi[i].re.abs(); // abs is safer than raw re
+        if v > best_val {
+            best_val = v;
+            best_i = i;
+            //best_lag = lag;
+        }
+    }
+
+    let peak = best_val;
+
+    // Estimate "floor" away from the main peak: RMS excluding a guard band
+    let guard = 2isize; // exclude +/- 2 samples around peak (tweak as needed)
+    let mut sum_sq = 0.0f32;
+    let mut count = 0usize;
+
+    for i in 0..nfft {
+        let lag = if i <= nfft / 2 { i as isize } else { i as isize - nfft as isize };
+        if lag < -max_lag || lag > max_lag { continue; }
+        if (lag - best_lag).abs() <= guard { continue; }
+
+        let v = psi[i].re.abs();
+        sum_sq += v * v;
+        count += 1;
+    }
+
+    let rms_floor = if count > 0 { (sum_sq / count as f32).sqrt() } else { 0.0 };
+    let score = peak / (rms_floor + 1e-12);
+
+    (best_i as isize, score)
+}
+
 /// Estimates delay (in samples) between x and y using GCC‑PHAT.
 /// Assumes x.len() == y.len() and power-of-two length for simplicity.
-fn gcc_phat_delay(x_in: &[f32], y_in: &[f32]) -> isize {
+fn gcc_phat_delay_old_2(x_in: &[f32], y_in: &[f32]) -> isize {
     let x = normalize(x_in);
     let y = normalize(y_in);
     let n = x.len();
@@ -1223,20 +1325,25 @@ type InputDevice = InputDeviceInfo;
 
 enum OutputStreamMessage {
     Add(StreamId, u32, usize, HashMap<usize, Vec<usize>>, ResampledBufferedCircularProducer, ringbuf::HeapCons<f32>),
+    SetStartTime(StreamId, u128),
     Remove(StreamId),
     InterruptAll(),
 }
 
 pub struct StreamProducer {
     stream_id: StreamId,
-    producer: HeapProd<f32>
+    producer: HeapProd<f32>,
+    stream_message_sender: mpsc::Sender<OutputStreamMessage>,
+    pub first_queue_time: Option<u128>,
 }
 
 impl StreamProducer {
-    pub fn new(stream_id: StreamId, producer: HeapProd<f32>) -> Self {
+    fn new(stream_id: StreamId, producer: HeapProd<f32>, stream_message_sender: mpsc::Sender<OutputStreamMessage>) -> Self {
         Self {
             stream_id,
-            producer: producer
+            producer: producer,
+            stream_message_sender: stream_message_sender,
+            first_queue_time: None,
         }
     }
 
@@ -1244,11 +1351,17 @@ impl StreamProducer {
         self.stream_id
     }
 
-    pub fn queue_audio(&mut self, audio_data: &[f32]) {
+    pub fn queue_audio(&mut self, audio_data: &[f32]) -> Result<(), Box<dyn Error>> {
+        if let None = self.first_queue_time {
+            let start_time = now_micros();
+            self.first_queue_time = Some(start_time);
+            self.stream_message_sender.try_send(OutputStreamMessage::SetStartTime(self.stream_id,start_time))?;
+        }
         let num_pushed = self.producer.push_slice(audio_data);
         if num_pushed < audio_data.len() {
             eprintln!("Error: output audio buffer got behind, try increasing buffer size");
         }
+        Ok(())
     }
     pub fn num_queued_samples(&self) -> usize {
         return self.producer.occupied_len();
@@ -1297,7 +1410,7 @@ impl OutputStreamAlignerProducer {
         )?;
 
         self.output_stream_sender.try_send(OutputStreamMessage::Add(stream_index, sample_rate, channels, channel_map, resampled_producer, resampled_consumer))?;
-        Ok(StreamProducer::new(stream_index, producer))
+        Ok(StreamProducer::new(stream_index, producer, self.output_stream_sender.clone()))
     }
 
     pub fn end_audio_stream(&mut self, stream: &StreamProducer) -> Result<(), Box<dyn Error>> {
@@ -1318,7 +1431,7 @@ struct OutputStreamAlignerMixer {
     frame_size: u32,
     device_audio_producer: BufferedCircularProducer<f32>,
     resampled_audio_buffer_producer: StreamAlignerProducer,
-    stream_consumers: HashMap<StreamId, (u32, usize, HashMap<usize, Vec<usize>>, ResampledBufferedCircularProducer, BufferedCircularConsumer<f32>)>,
+    stream_consumers: HashMap<StreamId, (u32, usize, HashMap<usize, Vec<usize>>, ResampledBufferedCircularProducer, BufferedCircularConsumer<f32>, Option<u128>)>,
     output_stream_receiver: mpsc::Receiver<OutputStreamMessage>,
 }
 
@@ -1339,12 +1452,18 @@ impl OutputStreamAlignerMixer {
     }
 
     fn mix_audio_streams(&mut self, input_chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let time_at_end_of_chunk = now_micros();
         // fetch new audio consumers, non-blocking
         loop {
             match self.output_stream_receiver.try_next() {
                 Ok(Some(msg)) => match msg {
                     OutputStreamMessage::Add(id, input_sample_rate, channels, channel_map, resampled_producer, resampled_consumer) => {
-                        self.stream_consumers.insert(id, (input_sample_rate, channels, channel_map, resampled_producer, BufferedCircularConsumer::new(resampled_consumer)));
+                        self.stream_consumers.insert(id, (input_sample_rate, channels, channel_map, resampled_producer, BufferedCircularConsumer::new(resampled_consumer), None));
+                    }
+                    OutputStreamMessage::SetStartTime(id, start_time) => {
+                        if let Some((_, _, _, _, _, last_start_time)) = self.stream_consumers.get_mut(&id) {
+                            *last_start_time = Some(start_time);
+                        }
                     }
                     OutputStreamMessage::Remove(id) => {
                         // remove if present
@@ -1374,26 +1493,73 @@ impl OutputStreamAlignerMixer {
         //   - we have frame size of 16
         //   - so we don't add to chunk until 496
         //   - then we don't actually play for 496ms
+        //   -   new   we won't play for 22ms+device latency
         //   -   + physical device latency
         //   - wheres if we send x data at position 20
         //   - then we don't play for 32
         //   -   + physical device latency
+        //   -  then we won't play for 492+device latency
         // device buffer latency
         // 
 
+
+
         let (need_to_write_device_values, device_buf_write) = self.device_audio_producer.get_chunk_to_write(input_chunk_size * self.channels);
-        let actual_input_chunk_size = device_buf_write.len();
-        let frames_cap = device_buf_write.len() / (self.channels);
+        let input_chunk_size_available = device_buf_write.len() / (self.channels);
         device_buf_write.fill(0.0);
-        for (_stream_id, (input_sample_rate, channels, channel_map, resample_producer, resample_consumer)) in self.stream_consumers.iter_mut() {
-            let target_input_samples = input_to_output_frames(frames_cap as u128, self.device_sample_rate, *input_sample_rate);
+        
+        for (_stream_id, (input_sample_rate, channels, channel_map, resample_producer, resample_consumer, start_time)) in self.stream_consumers.iter_mut() {
+            let skip_ahead_frames = if let Some(start_time) = *start_time {
+                // this is the amount of time until it is played (+ system audio)
+                let diff = (time_at_end_of_chunk as i128 - start_time as i128).max(0);
+                let diff_frames = micros_to_frames(diff as u128, self.device_sample_rate as u128);
+                if diff_frames <= input_chunk_size_available as u128 {
+                    // we want to delay inital audio to ensure it is always the same latency
+
+                    
+                    // sources of latency
+                    // physical output device latency
+                    //   - chunk size 512
+                    //   - say, we send x data at position 490
+                    //      it is not recieved until next chunk start
+                    //      at which point it plays right at 0
+                    //      so latency is 512-490 + device latency
+                    //   - say we send x data at position 12
+                    //      it is not recieved until next chunk start
+                    //      at which point it plays right at 0
+                    //      so latency is 512-12 + device latency
+                    //   we always want 512 latency (as that is worst case)
+                    //   we know 512-490 or 512-12 values
+                    //   diff_frames is amount of latency we already have
+                    //   so like these ones
+                    //   We want 512-490 = 22
+                    //           512-12  = 500
+                    //   We need to add additional latency until it sums to 512
+                    //        so 22 + x = 512
+                    //           500 + x = 512
+                    //           we just do 512 - diff
+                    //   so we need to add 
+                    let skip_ahead_frames = input_chunk_size_available - (diff_frames as usize);
+                    //      so total latency is 
+                    println!("end of chunk {time_at_end_of_chunk} start time {start_time} diff {diff} diff frames {diff_frames}");
+                    skip_ahead_frames
+                }
+                else {
+                    0
+                }
+            } else {
+                0
+            };
+            let requested_frames = input_chunk_size_available - skip_ahead_frames;
+            //println!("{requested_frames} {input_chunk_size_available} {skip_ahead_frames}");
+            let target_input_samples = input_to_output_frames(requested_frames as u128, self.device_sample_rate, *input_sample_rate);
             // this doesn't work because it'll stall for very large audio
             // resample_producer.resample_all()?; // do resampling of any available data
             // instead, do it streaming
             // todo: there's a bug where the final 5-10ms of audio is cutoff because doesn't have any empty end data for the chunk
             resample_producer.resample((target_input_samples as u32) * 2)?; // do * 2 so we also grab some leftovers if there are some, this is an upper bound
-            let buf_from_stream = resample_consumer.get_chunk_to_read(round_to_channels(actual_input_chunk_size as u32, *channels) as usize);
-            let frames = (buf_from_stream.len() / *channels as usize).min(frames_cap);
+            let buf_from_stream = resample_consumer.get_chunk_to_read((requested_frames * (*channels)) as usize);
+            let frames = (buf_from_stream.len() / *channels as usize).min(requested_frames);
             if frames == 0 {
                 continue;
             }
@@ -1404,7 +1570,8 @@ impl OutputStreamAlignerMixer {
             for (s_idx, dst_chs) in channel_map.iter() {
                 for dst_ch in dst_chs.iter() {
                     if *dst_ch >= self.channels { continue; } // guard bad maps
-                    let mut dst = *dst_ch as usize;
+                    // skip ahead (insert empty silence) to ensure consistent delay
+                    let mut dst = *dst_ch as usize + skip_ahead_frames*self.channels;
                     let mut src_idx = *s_idx as usize;
                     for _ in 0..frames {
                         // just add to mix, do not average or clamp. Average results in too quiet, clamp is non-linear (so confuses eac, which only works with linear transformations), 
@@ -1422,7 +1589,7 @@ impl OutputStreamAlignerMixer {
         // send output downstream to the eac
         self.resampled_audio_buffer_producer.process_chunk(device_buf_write)?;
         // finish writing to output device buffer
-        self.device_audio_producer.finish_write(need_to_write_device_values, frames_cap * self.channels);
+        self.device_audio_producer.finish_write(need_to_write_device_values, input_chunk_size_available * self.channels);
         Ok(())
     }
 }
@@ -1512,7 +1679,7 @@ pub struct OutputDeviceConfig {
     pub audio_buffer_seconds: u32,
     pub resampler_quality: i32,
     // frame size (in terms of samples) should be small, on the order of 1-2ms or less.
-    // otherwise you may get skipping if you do not provide audio via enqueue_audio fast enough
+    // otherwise you may get skipping if you do not provide audio via queue_audio fast enough
     // larger frame sizes will also prevent immediate interruption, as interruption can only happen between each frame
     pub frame_size: u32,
 }
@@ -1929,6 +2096,7 @@ impl AecStream {
             };
             input_shifts_needed.push(shift_needed);
         }
+        
         let min_input_shift_needed = input_shifts_needed.iter().copied().min();
         // if it is less than zero, it needs to be shifted forwards not backwards (it's currently playing before an output audio device)
         // to do this, we'll need to move all the output devices forward by that much
@@ -1967,6 +2135,7 @@ impl AecStream {
                 }
             }
         }
+        
         Ok(())
     }
 
@@ -1987,7 +2156,7 @@ impl AecStream {
                 eprintln!("calibrate: no output producer found for '{dev_name}'");
                 continue;
             };
-            let tone_mono = generate_probe_tone_for_device(idx, tone_ms, sample_rate);
+            let tone_mono = generate_probe_tone_for_device(idx, capture_secs/2.0, tone_ms, sample_rate);
             if tone_mono.is_empty() {
                 continue;
             }
@@ -2010,7 +2179,7 @@ impl AecStream {
         }
 
         for ((_, stream), tone) in active_streams.iter_mut().zip(tones.iter()) {
-            stream.queue_audio(tone.as_slice());
+            stream.queue_audio(tone.as_slice())?;
         }
 
         // Build channel ranges for inputs and outputs (interleaved order).
@@ -2127,7 +2296,7 @@ impl AecStream {
 
         if !captured_outputs.is_empty() {
             for (dev_idx, buf) in captured_outputs.iter().enumerate() {
-                let detections = detect_probe_tones(buf, output_producers.len(), tone_ms, sample_rate);
+                let detections = detect_probe_tones(buf, output_producers.len(), capture_secs/2.0, tone_ms, sample_rate);
                 let mut start_for_dev: Option<(i64, f32)> = None;
                 for (d_idx, start, score) in detections {
                     if d_idx == dev_idx { // just detect this device, no others should show up since it just forwards the data
@@ -2144,7 +2313,7 @@ impl AecStream {
                 }
             }
             for (input_idx, buf) in captured_inputs.iter().enumerate() {
-                let detections = detect_probe_tones(buf, output_producers.len(), tone_ms, sample_rate);
+                let detections = detect_probe_tones(buf, output_producers.len(), capture_secs/2.0, tone_ms, sample_rate);
                 for (output_idx, start, score) in detections {
                     let in_seconds = (start as f32) / (sample_rate as f32);
                     println!("Output {output_idx} -> Input {input_idx} has offset {start} {in_seconds} with score {score}");
@@ -3139,7 +3308,6 @@ where
     T: FromSample<f32>,
 {
     let device_name = config.device_name.clone();
-    let frame_size = config.frame_size;
     device.build_output_stream(
         &supported_config.config(),
         move |data: &mut [T], _| {

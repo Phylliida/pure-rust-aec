@@ -499,7 +499,7 @@ pub struct PyStreamProducer {
 #[pymethods]
 impl PyStreamProducer {
     pub fn queue_audio(&mut self, audio: Vec<f32>) {
-        self.inner.lock().unwrap().queue_audio(&audio);
+        self.inner.lock().unwrap().queue_audio(&audio).unwrap();
     }
 
     #[getter]
