@@ -261,10 +261,11 @@ pub fn indexed_chirp(idx: u32, sr: u32, empty_seconds: f32, dur_s: f32) -> Vec<f
 }
 
 
-pub fn indexed_chirp_new(idx: u32, chirp_frames: u32) -> Vec<f32> {
-    if dur_s <= 0.0 { return Vec::new(); }
+pub fn indexed_chirp_new(idx: u32, chirp_frames: u32, sample_rate: u32) -> Vec<f32> {
+    if chirp_frames == 0 { return Vec::new(); }
 
-    let sr_f = sr as f32;
+    let sr_f = sample_rate as f32;
+    let dur_s = chirp_frames as f32 / sr_f;
     let n = chirp_frames as usize;
 
     // NOTE: h.fract() is always 0.0 because h is an integer-valued f32.
@@ -302,6 +303,18 @@ pub fn indexed_chirp_new(idx: u32, chirp_frames: u32) -> Vec<f32> {
     }
 
     out
+}
+
+pub fn build_chirp_slice(device_index: usize, silence_before_frames: usize, tone_frames: usize, silence_after_frames: usize, sample_rate: u32) -> Vec<f32> {
+    let total = silence_before_frames
+        .saturating_add(tone_frames)
+        .saturating_add(silence_after_frames);
+    let mut slice = vec![0.0f32; total.max(1)];
+    if tone_frames > 0 {
+        let tone = indexed_chirp_new(device_index as u32, tone_frames as u32, sample_rate);
+        slice[silence_before_frames..silence_before_frames + tone_frames].copy_from_slice(&tone[..tone_frames]);
+    }
+    slice
 }
 
 
@@ -342,26 +355,37 @@ fn chirp(f0: f32, f1: f32, sr: f32, dur_s: f32) -> Vec<f32> {
         .collect()
 }
 
+// 4 or higher are detections, this is fairly conservative
+const SCORE_THRESH : f32 = 4.0;
 
 /// Probe detection using GCC-PHAT to estimate lag between the captured stream and each probe.
 /// Returns best (device_index, start_sample, score) per device that produced a valid match.
-fn detect_probe_tones(input_mono: &[f32], num_devices: usize, empty_seconds: f32, duration_ms: f32, sample_rate: u32) -> Vec<(usize, i64, f32)> {
+fn detect_probe_tones(
+    input_mono: &[f32],
+    num_devices: usize,
+    frames_before_chirp: usize,
+    chirp_frames: usize,
+    frames_after_chirp: usize,
+    sample_rate: u32) -> Vec<(usize, i64, f32)> {
     let mut results = Vec::new();
     if num_devices == 0 || input_mono.is_empty() {
         return results;
     }
 
     for device in 0..num_devices {
-        let probe = generate_probe_tone_for_device(device, empty_seconds, duration_ms, sample_rate);
-        if probe.is_empty() || probe.len() > input_mono.len() {
+        let frames_after = frames_after_chirp.min(input_mono.len() - (frames_before_chirp + chirp_frames));
+        let probe = build_chirp_slice(device,
+                                      frames_before_chirp,
+                                      chirp_frames,
+                                      frames_after,
+                                      sample_rate);
+        if probe.is_empty() {
             continue;
         }
-        // Pad probe to match captured length for GCC-PHAT.
-        let mut probe_padded = vec![0.0f32; input_mono.len()];
-        probe_padded[..probe.len()].copy_from_slice(&probe);
-        let (lag, score) = gcc_phat_delay(&input_mono, &probe_padded);
-            // positive lag means probe leads capture; lag is the start index in the capture
-        results.push((device, lag as i64, score));
+        let (offset, score) = gcc_phat_delay(&input_mono, &probe);
+        if score > SCORE_THRESH {
+            results.push((device, offset as i64, score));
+        }
     }
     results
 }
@@ -2190,6 +2214,9 @@ impl AecStream {
         let tone_ms = 100.0;
         let capture_secs = 3.0;
 
+        let frames_before_chirp = (((capture_secs - tone_ms) as f32/2.0) * sample_rate as f32) as usize;
+        let frames_after_chirp = frames_before_chirp;
+        let chirp_frames = (tone_ms / 1000.0 * sample_rate as f32) as usize;
         // 1) Emit a distinct probe on each output device (all channels), in sorted output order.
         let mut active_streams: Vec<(usize, StreamProducer)> = Vec::new();
         let mut tones = Vec::new();
@@ -2201,8 +2228,13 @@ impl AecStream {
                 eprintln!("calibrate: no output producer found for '{dev_name}'");
                 continue;
             };
-            let tone_mono = generate_probe_tone_for_device(idx, capture_secs/2.0, tone_ms, sample_rate);
-            if tone_mono.is_empty() {
+
+            let probe = build_chirp_slice(idx,
+                                        frames_before_chirp,
+                                        chirp_frames,
+                                        frames_after_chirp,
+                                        sample_rate);
+            if probe.is_empty() {
                 continue;
             }
             let channels = producer.channels;
@@ -2219,10 +2251,11 @@ impl AecStream {
                 self.aec_config.target_sample_rate,
                 5, // resampler quality
             )?;
-            tones.push(tone_mono);
+            tones.push(probe);
             active_streams.push((idx, stream));
         }
 
+        // do this after construction of all streams to minimize latency
         for ((_, stream), tone) in active_streams.iter_mut().zip(tones.iter()) {
             stream.queue_audio(tone.as_slice())?;
         }
@@ -2341,7 +2374,7 @@ impl AecStream {
 
         if !captured_outputs.is_empty() {
             for (dev_idx, buf) in captured_outputs.iter().enumerate() {
-                let detections = detect_probe_tones(buf, output_producers.len(), capture_secs/2.0, tone_ms, sample_rate);
+                let detections = detect_probe_tones(buf, output_producers.len(), frames_before_chirp, chirp_frames, frames_after_chirp, sample_rate);
                 let mut start_for_dev: Option<(i64, f32)> = None;
                 for (d_idx, start, score) in detections {
                     if d_idx == dev_idx { // just detect this device, no others should show up since it just forwards the data
@@ -2358,7 +2391,7 @@ impl AecStream {
                 }
             }
             for (input_idx, buf) in captured_inputs.iter().enumerate() {
-                let detections = detect_probe_tones(buf, output_producers.len(), capture_secs/2.0, tone_ms, sample_rate);
+                let detections = detect_probe_tones(buf, output_producers.len(), frames_before_chirp, chirp_frames, frames_after_chirp, sample_rate);
                 for (output_idx, start, score) in detections {
                     let in_seconds = (start as f32) / (sample_rate as f32);
                     println!("Output {output_idx} -> Input {input_idx} has offset {start} {in_seconds} with score {score}");
