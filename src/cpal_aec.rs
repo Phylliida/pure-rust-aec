@@ -384,7 +384,7 @@ fn detect_probe_tones(
         }
         let (offset, score) = gcc_phat_delay(&input_mono, &probe);
         if score > SCORE_THRESH {
-            results.push((device, offset as i64, score));
+            results.push((device, -(offset as i64), score));
         }
     }
     results
@@ -1074,12 +1074,12 @@ impl StreamAlignerResampler {
         // not enough frames, we need to increase dynamic sample rate (to get more samples)
         if updated_total_frames_emitted < target_emitted_output_frames - margin && calibrated {
             self.increase_dynamic_sample_rate()?;
-            println!("Increase to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
+            // println!("Increase to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
         }
         // too many frames, we need to decrease dynamic sample rate (to get less samples)
         else if updated_total_frames_emitted > target_emitted_output_frames + margin && calibrated {
             self.decrease_dynamic_sample_rate()?;
-            println!("Decrease to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
+            // println!("Decrease to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
         }
 
         //// do resampling ////
@@ -2137,8 +2137,8 @@ impl AecStream {
 
     pub async fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(), Box<dyn std::error::Error>> {
         self.calibrate_inner(output_producers, debug_wav).await?;
-        self.calibrate_inner(output_producers, debug_wav).await?;
         self.calibrate_inner(output_producers, debug_wav).await
+        //self.calibrate_inner(output_producers, debug_wav).await
     }
 
     pub async fn calibrate_inner(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -2212,14 +2212,25 @@ impl AecStream {
         let sample_rate = self.aec_config.target_sample_rate as u32;
         // Probe length (~0.1s) to stay quick but audible.
         let tone_ms = 100.0;
-        let capture_secs = 3.0;
+        let capture_secs = 5.0;
 
-        let frames_before_chirp = (((capture_secs - tone_ms) as f32/2.0) * sample_rate as f32) as usize;
+        let frames_before_chirp = ((((capture_secs - (tone_ms/1000.0)) as f32)/2.0) * sample_rate as f32) as usize;
         let frames_after_chirp = frames_before_chirp;
         let chirp_frames = (tone_ms / 1000.0 * sample_rate as f32) as usize;
+        println!("Frames {} {} {}", frames_before_chirp, chirp_frames, frames_after_chirp);
         // 1) Emit a distinct probe on each output device (all channels), in sorted output order.
         let mut active_streams: Vec<(usize, StreamProducer)> = Vec::new();
         let mut tones = Vec::new();
+
+        // wait for time first, to make sure we don't overlap with previous calibration
+        let mut captured_micros: u128 = 0;
+        let target_micros: u128 = ((capture_secs as u128) * 1_000_000) as u128;
+        while captured_micros < target_micros {
+            let (_input_slices, _output_slices, _aec_out, start_time, end_time) =
+                self.update_debug().await?;
+            let chunk_micros = end_time.saturating_sub(start_time);
+            captured_micros += chunk_micros;
+        }
 
         for (idx, dev_name) in self.sorted_output_aligners.clone().iter().enumerate() {
             let Some(producer) = output_producers
@@ -2247,13 +2258,14 @@ impl AecStream {
             let stream = producer.begin_audio_stream(
                 1, // 1 channel
                 channel_map,
-                2, // seconds of buffer for this probe
+                (probe.len() as u32)/self.aec_config.target_sample_rate*2 as u32, // seconds of buffer for this probe
                 self.aec_config.target_sample_rate,
                 5, // resampler quality
             )?;
             tones.push(probe);
             active_streams.push((idx, stream));
         }
+
 
         // do this after construction of all streams to minimize latency
         for ((_, stream), tone) in active_streams.iter_mut().zip(tones.iter()) {
@@ -2281,10 +2293,10 @@ impl AecStream {
         // 2) Capture ~3s of aligned input/output data, averaged per device.
         let mut captured_inputs: Vec<Vec<f32>> = vec![Vec::new(); input_channel_ranges.len()];
         let mut captured_outputs: Vec<Vec<f32>> = vec![Vec::new(); output_channel_ranges.len()];
-        let mut captured_micros: u128 = 0;
-        let target_micros: u128 = ((capture_secs as u128) * 1_000_000) as u128;
         let total_in_ch = self.input_channels.max(1);
         let total_out_ch = self.output_channels.max(1);
+        
+        captured_micros = 0;
         while captured_micros < target_micros {
             let (input_slices, output_slices, _aec_out, start_time, end_time) =
                 self.update_debug().await?;
