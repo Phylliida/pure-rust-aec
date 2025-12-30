@@ -91,3 +91,13 @@ Notes:
 - `get_supported_input_configs(...)` and `get_supported_output_configs(...)` return per-host device configs; pick one and feed into the add/remove APIs.
 - `OutputStreamAlignerProducer.begin_audio_stream` returns a `StreamProducer` holding its stream id; pass that to `end_audio_stream` or call `StreamProducer.close(producer)`.
 - The callback thread continuously calls `update()` under the hood; prefer it when you want streaming delivery without manual polling.
+
+## Running GCC-PHAT tests
+
+The GCC-PHAT regression tests live in `tests/gcc_phat_delay.rs` and sweep offsets (clean + noisy) across a 4s buffer. Because the crate builds a PyO3 `cdylib`, use dynamic lookup for Python symbols when running them:
+
+```bash
+RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" cargo test gcc_phat_delay -- --nocapture
+```
+
+The `-- --nocapture` flag shows per-offset logs (diff between detected and actual samples) to make debugging easier.

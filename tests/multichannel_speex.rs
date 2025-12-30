@@ -1,4 +1,4 @@
-use speex_rust_aec::EchoCanceller;
+use melaec3::EchoCanceller;
 
 fn i16_from_f32(v: f32) -> i16 {
     v.clamp(i16::MIN as f32, i16::MAX as f32) as i16

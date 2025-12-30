@@ -9,7 +9,7 @@ cpal-example = ["cpal"]
 
 [lib]
 name = "melaec3"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 

@@ -216,15 +216,15 @@ fn generate_probe_tone_for_device(device_index: usize, empty_seconds: f32, durat
     indexed_chirp(device_index as u32, sample_rate, empty_seconds, duration_ms / 1000.0)
 }
 
-fn indexed_chirp(idx: u32, sr: u32, empty_seconds: f32, dur_s: f32) -> Vec<f32> {
+pub fn indexed_chirp(idx: u32, sr: u32, empty_seconds: f32, dur_s: f32) -> Vec<f32> {
     if dur_s <= 0.0 { return Vec::new(); }
 
     let sr_f = sr as f32;
     let n = (dur_s * sr_f).round().max(1.0) as usize;
     let empty_n = (empty_seconds.max(0.0) * sr_f).round() as usize;
 
-    // NOTE: your h.fract() is always 0.0 because h is an integer-valued f32.
-    // Leaving your logic intact, but consider fixing if you actually want per-idx randomness.
+    // NOTE: h.fract() is always 0.0 because h is an integer-valued f32.
+    // consider fixing if you actually want per-idx randomness.
     let h = (idx.wrapping_mul(0x9E3779B9) ^ 0x85EBCA6B) as f32;
     let base = 150.0 + (h.fract() * 120.0);       // ~150–270 Hz
     let span = 500.0 + (h.sin().abs() * 300.0);   // +0.5–0.8 kHz
@@ -235,6 +235,50 @@ fn indexed_chirp(idx: u32, sr: u32, empty_seconds: f32, dur_s: f32) -> Vec<f32> 
     let k = (f1 / f0).ln() / dur_s;
 
     let mut out = vec![0.0f32; empty_n];
+    out.reserve(n);
+
+    for i in 0..n {
+        let t = i as f32 / sr_f;
+
+        // Handle k ~ 0 (f0 ~= f1) to avoid divide-by-zero
+        let phase = if k.abs() < 1e-9 {
+            2.0 * std::f32::consts::PI * f0 * t
+        } else {
+            2.0 * std::f32::consts::PI * f0 * ((k * t).exp() - 1.0) / k
+        };
+
+        // Hann window (use n-1 so endpoints hit 0 when n>1)
+        let w = if n > 1 {
+            0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos())
+        } else {
+            1.0
+        };
+
+        out.push(phase.sin() * w * 0.3);
+    }
+
+    out
+}
+
+
+pub fn indexed_chirp_new(idx: u32, chirp_frames: u32) -> Vec<f32> {
+    if dur_s <= 0.0 { return Vec::new(); }
+
+    let sr_f = sr as f32;
+    let n = chirp_frames as usize;
+
+    // NOTE: h.fract() is always 0.0 because h is an integer-valued f32.
+    // consider fixing if you actually want per-idx randomness.
+    let h = (idx.wrapping_mul(0x9E3779B9) ^ 0x85EBCA6B) as f32;
+    let base = 150.0 + (h.fract() * 120.0);       // ~150–270 Hz
+    let span = 500.0 + (h.sin().abs() * 300.0);   // +0.5–0.8 kHz
+    let nyq_limit = sr_f * 0.2;                   // keep it low
+    let f0 = base.min(nyq_limit);
+    let f1 = (base + span).min(nyq_limit);
+
+    let k = (f1 / f0).ln() / dur_s;
+
+    let mut out = vec![0.0f32; 0];
     out.reserve(n);
 
     for i in 0..n {
@@ -430,19 +474,17 @@ pub fn gcc_phat_delay(x_in: &[f32], y_in: &[f32]) -> (isize, f32) {
     let max_lag = (n - 1) as isize;
 
     // Find best peak
-    let mut best_i = 0usize;
     let mut best_lag = 0isize;
     let mut best_val = -f32::INFINITY;
 
     for i in 0..nfft {
-        //let lag = if i <= nfft / 2 { i as isize } else { i as isize - nfft as isize };
-        //if lag < -max_lag || lag > max_lag { continue; }
+        let lag = if i <= nfft / 2 { i as isize } else { i as isize - nfft as isize };
+        if lag < -max_lag || lag > max_lag { continue; }
 
         let v = psi[i].re.abs(); // abs is safer than raw re
         if v > best_val {
             best_val = v;
-            best_i = i;
-            //best_lag = lag;
+            best_lag = lag;
         }
     }
 
@@ -466,7 +508,10 @@ pub fn gcc_phat_delay(x_in: &[f32], y_in: &[f32]) -> (isize, f32) {
     let rms_floor = if count > 0 { (sum_sq / count as f32).sqrt() } else { 0.0 };
     let score = peak / (rms_floor + 1e-12);
 
-    (best_i as isize, score)
+    // Convert FFT index lag to an intuitive offset: positive means y starts after x
+    let offset_samples = -best_lag;
+
+    (offset_samples, score)
 }
 
 /// Estimates delay (in samples) between x and y using GCC‑PHAT.
@@ -3717,4 +3762,3 @@ pub async fn build_webaudio_input_stream<D>(
     
     Ok(WasmStream::new(device_info.device_id.clone()))
 }
-
