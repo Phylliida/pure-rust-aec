@@ -2139,13 +2139,22 @@ impl AecStream {
         Ok(())
     }
 
-    pub async fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(), Box<dyn std::error::Error>> {
-        self.calibrate_inner(output_producers, debug_wav).await
+    pub async fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<bool, Box<dyn std::error::Error>> {
+        let mut success = false;
+        let mut iters = 0;
+        while !success {
+            success = self.calibrate_inner(output_producers, debug_wav).await?;
+            iters += 1;
+            if iters > 4 {
+                break;
+            }
+        }
+        Ok(success)
         //self.calibrate_inner(output_producers, debug_wav).await
         //self.calibrate_inner(output_producers, debug_wav).await
     }
 
-    pub async fn calibrate_inner(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn calibrate_inner(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<bool, Box<dyn std::error::Error>> {
         let (output_offsets, input_offsets) = self.get_calibration_offsets(output_producers, debug_wav).await?;
         // we need to throw away some samples for each device until we are calibrated
         // each device will have an offset (could be negative)
@@ -2171,6 +2180,7 @@ impl AecStream {
         }
         
         let min_input_shift_needed = input_shifts_needed.iter().copied().min();
+        let max_input_shift_needed = input_shifts_needed.iter().copied().max();
         // if it is less than zero, it needs to be shifted forwards not backwards (it's currently playing before an output audio device)
         // to do this, we'll need to move all the output devices forward by that much
         // and then since we did that, we'll subtract that amount from our shifts needed
@@ -2182,6 +2192,10 @@ impl AecStream {
                 // this will also ensure that all input_shifts_needed are positive now
                 for s in &mut input_shifts_needed {
                     *s += min_input_shift_needed.unsigned_abs() as i64;  // min_shift is negative, so this adds abs(min_shift)
+                }
+                // too large latency, we failed to find, bail
+                if min_input_shift_needed < -((self.aec_config.target_sample_rate/2) as i64) {
+                    return Ok(false);
                 }
                 println!("Shifting outputs ahead by {}", min_input_shift_needed);
                 /*
@@ -2196,8 +2210,13 @@ impl AecStream {
                 */
             }
         }
-        
-        
+
+        if let Some(max_input_shift_needed) = max_input_shift_needed {
+            if max_input_shift_needed > (self.aec_config.target_sample_rate / 2) as i64 {
+                return Ok(false);
+            }
+        }
+
         for input_index in 0..input_offsets.len() {
             let shift_needed = input_shifts_needed[input_index];
             println!("Shifting input channel {} by {}",input_index, shift_needed);
@@ -2211,7 +2230,7 @@ impl AecStream {
             }
         }
         
-        Ok(())
+        Ok(true)
     }
 
     async fn get_calibration_offsets(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(Vec<Option<i64>>, Vec<Vec<Option<i64>>>), Box<dyn std::error::Error>> {

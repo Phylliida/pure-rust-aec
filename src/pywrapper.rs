@@ -697,7 +697,7 @@ impl PyAecStream {
         &mut self,
         producers: Vec<Py<PyOutputStreamAlignerProducer>>,
         debug_wav: bool,
-    ) -> PyResult<()> {
+    ) -> PyResult<bool> {
         let mut owned: Vec<InnerOutputStreamAlignerProducer> = Vec::with_capacity(producers.len());
 
         Python::attach(|py| -> PyResult<()> {
