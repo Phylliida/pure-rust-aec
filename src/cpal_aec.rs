@@ -1286,6 +1286,10 @@ impl StreamAlignerConsumer {
     fn finish_read(&mut self, size: usize) -> usize {
         self.final_audio_buffer_consumer.finish_read(size)
     }
+
+    fn available(&self) -> usize {
+        self.final_audio_buffer_consumer.available()
+    }
 }
 
 impl Drop for StreamAlignerConsumer {
@@ -2136,8 +2140,8 @@ impl AecStream {
     }
 
     pub async fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(), Box<dyn std::error::Error>> {
-        self.calibrate_inner(output_producers, debug_wav).await?;
         self.calibrate_inner(output_producers, debug_wav).await
+        //self.calibrate_inner(output_producers, debug_wav).await
         //self.calibrate_inner(output_producers, debug_wav).await
     }
 
@@ -2180,6 +2184,7 @@ impl AecStream {
                     *s += min_input_shift_needed.unsigned_abs() as i64;  // min_shift is negative, so this adds abs(min_shift)
                 }
                 println!("Shifting outputs ahead by {}", min_input_shift_needed);
+                /*
                 for output_index in 0..output_offsets.len() {
                     if let Some(aligner) = self.output_aligners.get_mut(&self.sorted_output_aligners[output_index].clone()) {
                         // skip ahead that many samples (* num channels bc it is multi channel)
@@ -2188,10 +2193,11 @@ impl AecStream {
                         aligner.finish_read(chunk_len);
                     }
                 }
+                */
             }
         }
         
-
+        
         for input_index in 0..input_offsets.len() {
             let shift_needed = input_shifts_needed[input_index];
             println!("Shifting input channel {} by {}",input_index, shift_needed);
@@ -2212,7 +2218,7 @@ impl AecStream {
         let sample_rate = self.aec_config.target_sample_rate as u32;
         // Probe length (~0.1s) to stay quick but audible.
         let tone_ms = 100.0;
-        let capture_secs = 5.0;
+        let capture_secs = 3.0;
 
         let frames_before_chirp = ((((capture_secs - (tone_ms/1000.0)) as f32)/2.0) * sample_rate as f32) as usize;
         let frames_after_chirp = frames_before_chirp;
@@ -2225,11 +2231,41 @@ impl AecStream {
         // wait for time first, to make sure we don't overlap with previous calibration
         let mut captured_micros: u128 = 0;
         let target_micros: u128 = ((capture_secs as u128) * 1_000_000) as u128;
+        
+        let (mut chunk_start_micros, mut chunk_end_micros) = self.update_devices().await?;
+           
         while captured_micros < target_micros {
-            let (_input_slices, _output_slices, _aec_out, start_time, end_time) =
-                self.update_debug().await?;
-            let chunk_micros = end_time.saturating_sub(start_time);
+            let _ = self.update_helper(chunk_start_micros, chunk_end_micros).await?;
+            let chunk_micros = chunk_end_micros.saturating_sub(chunk_start_micros);
             captured_micros += chunk_micros;
+            if captured_micros < target_micros {
+                (chunk_start_micros, chunk_end_micros) = self.get_next_frame();
+            }
+        }
+
+        // flush them, this avoids accumulated errors and ensures we act on most recent
+        // Flush input aligners
+        for name in &self.sorted_input_aligners {
+            if let Some(aligner) = self.input_aligners.get_mut(name) {
+                let avail = aligner.available(); // or aligner.final_audio_buffer_consumer.available()
+                if avail > 0 {
+                    let (_ok, chunk) = aligner.get_chunk_to_read(avail).await;
+                    let read_size = chunk.len();
+                    aligner.finish_read(read_size);
+                }
+            }
+        }
+
+        // Flush output aligners
+        for name in &self.sorted_output_aligners {
+            if let Some(aligner) = self.output_aligners.get_mut(name) {
+                let avail = aligner.available();
+                if avail > 0 {
+                    let (_ok, chunk) = aligner.get_chunk_to_read(avail).await;
+                    let read_size = chunk.len();
+                    aligner.finish_read(read_size);
+                }
+            }
         }
 
         for (idx, dev_name) in self.sorted_output_aligners.clone().iter().enumerate() {
@@ -2298,9 +2334,10 @@ impl AecStream {
         
         captured_micros = 0;
         while captured_micros < target_micros {
-            let (input_slices, output_slices, _aec_out, start_time, end_time) =
-                self.update_debug().await?;
-            let chunk_micros = end_time.saturating_sub(start_time);
+            // we need to do update helper instead of update_debug to avoid device changes
+            let _ = self.update_helper(chunk_start_micros, chunk_end_micros).await?;
+            let input_slices = self.input_audio_buffer.as_slice();
+            let output_slices = self.output_audio_buffer.as_slice();
             if !input_slices.is_empty() && total_in_ch > 0 {
                 let frames = input_slices.len() / total_in_ch;
                 for frame_idx in 0..frames {
@@ -2329,13 +2366,23 @@ impl AecStream {
                     }
                 }
             }
+            let chunk_micros = chunk_end_micros.saturating_sub(chunk_start_micros);
             captured_micros += chunk_micros;
+            if captured_micros < target_micros {
+                (chunk_start_micros, chunk_end_micros) = self.get_next_frame();
+            }
         }
 
         // 3) Stop probe streams now that capture is done.
-        for (idx, stream) in active_streams.iter() {
-            if let Some(producer) = output_producers.get_mut(*idx) {
+        for (dev_name, (_idx, stream)) in self.sorted_output_aligners.clone().iter().zip(active_streams.iter_mut()) {
+            if let Some(producer) = output_producers
+                .iter_mut()
+                .find(|p| p.device_name == *dev_name) {
                 producer.end_audio_stream(stream)?;
+            }
+            else {
+                eprintln!("calibrate: no output producer found for '{dev_name}'");
+                continue;
             }
         }
 
