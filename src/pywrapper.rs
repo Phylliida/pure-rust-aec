@@ -23,6 +23,8 @@ use pyo3::{
     wrap_pyfunction,
 };
 
+use pyo3::conversion::IntoPyObjectExt;
+
 use crate::cpal_aec::{
     get_supported_input_configs as inner_get_supported_input_configs,
     get_supported_output_configs as inner_get_supported_output_configs, AecConfig as InnerAecConfig,
@@ -156,7 +158,7 @@ impl PyInputDeviceConfig {
         Ok(Self { inner })
     }
 
-    pub fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<&'py PyDict> {
+    pub fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
         d.set_item("host_id", self.inner.host_id.name())?;
         d.set_item("device_name", &self.inner.device_name)?;
@@ -170,14 +172,14 @@ impl PyInputDeviceConfig {
         Ok(d)
     }
 
-    pub fn to_json(&self, py: Python) -> PyResult<String> {
+    pub fn to_json(&self, py: Python<'_>) -> PyResult<String> {
         let json = py.import("json")?;
         let dict = self.to_dict(py)?;
         let dumped = json.call_method("dumps", (dict,), None)?;
         dumped.extract()
     }
 
-    pub fn __hash__(&self, py: Python) -> PyResult<isize> {
+    pub fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
         let key = (
             self.inner.host_id.name().to_string(),
             self.inner.device_name.clone(),
@@ -188,12 +190,16 @@ impl PyInputDeviceConfig {
             self.inner.calibration_packets,
             self.inner.audio_buffer_seconds,
             self.inner.resampler_quality,
-            self.inner.frame_size,
         );
-        key.into_py(py).hash(py)
+        let key_obj = key.into_py_any(py)?;
+        key_obj.bind(py).hash()
     }
 
-    pub fn __richcmp__(&self, other: &PyAny, op: CompareOp) -> PyResult<PyObject> {
+    pub fn __richcmp__(
+        &self,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
         let py = other.py();
         let Ok(other_cfg) = other.extract::<PyRef<PyInputDeviceConfig>>() else {
             return Ok(py.NotImplemented());
@@ -223,59 +229,8 @@ impl PyInputDeviceConfig {
         );
 
         match op {
-            CompareOp::Eq => Ok((self_key == other_key).into_py(py)),
-            CompareOp::Ne => Ok((self_key != other_key).into_py(py)),
-            _ => Ok(py.NotImplemented()),
-        }
-    }
-
-    pub fn __hash__(&self, py: Python) -> PyResult<isize> {
-        let key = (
-            self.inner.host_id.name().to_string(),
-            self.inner.device_name.clone(),
-            self.inner.channels,
-            self.inner.sample_rate,
-            sample_format_to_string(self.inner.sample_format).to_string(),
-            self.inner.history_len,
-            self.inner.calibration_packets,
-            self.inner.audio_buffer_seconds,
-            self.inner.resampler_quality,
-        );
-        key.into_py(py).hash(py)
-    }
-
-    pub fn __richcmp__(&self, other: &PyAny, op: CompareOp) -> PyResult<PyObject> {
-        let py = other.py();
-        let Ok(other_cfg) = other.extract::<PyRef<PyInputDeviceConfig>>() else {
-            return Ok(py.NotImplemented());
-        };
-
-        let self_key = (
-            self.inner.host_id.name().to_string(),
-            self.inner.device_name.clone(),
-            self.inner.channels,
-            self.inner.sample_rate,
-            sample_format_to_string(self.inner.sample_format).to_string(),
-            self.inner.history_len,
-            self.inner.calibration_packets,
-            self.inner.audio_buffer_seconds,
-            self.inner.resampler_quality,
-        );
-        let other_key = (
-            other_cfg.inner.host_id.name().to_string(),
-            other_cfg.inner.device_name.clone(),
-            other_cfg.inner.channels,
-            other_cfg.inner.sample_rate,
-            sample_format_to_string(other_cfg.inner.sample_format).to_string(),
-            other_cfg.inner.history_len,
-            other_cfg.inner.calibration_packets,
-            other_cfg.inner.audio_buffer_seconds,
-            other_cfg.inner.resampler_quality,
-        );
-
-        match op {
-            CompareOp::Eq => Ok((self_key == other_key).into_py(py)),
-            CompareOp::Ne => Ok((self_key != other_key).into_py(py)),
+            CompareOp::Eq => (self_key == other_key).into_py_any(py),
+            CompareOp::Ne => (self_key != other_key).into_py_any(py),
             _ => Ok(py.NotImplemented()),
         }
     }
@@ -379,41 +334,41 @@ impl PyInputDeviceConfig {
     }
 
     #[staticmethod]
-    pub fn from_dict(d: &PyDict) -> PyResult<Self> {
-        let host_id_raw: Option<String> = match d.get_item("host_id") {
+    pub fn from_dict(d: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let host_id_raw: Option<String> = match d.get_item("host_id")? {
             Some(v) => Some(v.extract::<String>()?),
             None => None,
         };
         let device_name = d
-            .get_item("device_name")
+            .get_item("device_name")?
             .ok_or_else(|| PyValueError::new_err("device_name missing"))?
             .extract::<String>()?;
         let channels = d
-            .get_item("channels")
+            .get_item("channels")?
             .ok_or_else(|| PyValueError::new_err("channels missing"))?
             .extract::<usize>()?;
         let sample_rate = d
-            .get_item("sample_rate")
+            .get_item("sample_rate")?
             .ok_or_else(|| PyValueError::new_err("sample_rate missing"))?
             .extract::<u32>()?;
         let sample_format = d
-            .get_item("sample_format")
+            .get_item("sample_format")?
             .map(|v| v.extract::<String>())
             .transpose()?;
         let history_len = d
-            .get_item("history_len")
+            .get_item("history_len")?
             .ok_or_else(|| PyValueError::new_err("history_len missing"))?
             .extract::<usize>()?;
         let calibration_packets = d
-            .get_item("calibration_packets")
+            .get_item("calibration_packets")?
             .ok_or_else(|| PyValueError::new_err("calibration_packets missing"))?
             .extract::<u32>()?;
         let audio_buffer_seconds = d
-            .get_item("audio_buffer_seconds")
+            .get_item("audio_buffer_seconds")?
             .ok_or_else(|| PyValueError::new_err("audio_buffer_seconds missing"))?
             .extract::<u32>()?;
         let resampler_quality = d
-            .get_item("resampler_quality")
+            .get_item("resampler_quality")?
             .ok_or_else(|| PyValueError::new_err("resampler_quality missing"))?
             .extract::<i32>()?;
 
@@ -436,11 +391,11 @@ impl PyInputDeviceConfig {
     }
 
     #[staticmethod]
-    pub fn from_json(py: Python, raw: &str) -> PyResult<Self> {
+    pub fn from_json(py: Python<'_>, raw: &str) -> PyResult<Self> {
         let json = py.import("json")?;
         let data = json.call_method("loads", (raw,), None)?;
-        let d: &PyDict = data.downcast()?;
-        Self::from_dict(d)
+        let d: Bound<'_, PyDict> = data.cast_into::<PyDict>()?;
+        Self::from_dict(&d)
     }
 }
 
@@ -618,7 +573,7 @@ impl PyOutputDeviceConfig {
         self.inner.frame_size = size;
     }
 
-    pub fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<&'py PyDict> {
+    pub fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
         d.set_item("host_id", self.inner.host_id.name())?;
         d.set_item("device_name", &self.inner.device_name)?;
@@ -636,7 +591,7 @@ impl PyOutputDeviceConfig {
         Ok(d)
     }
 
-    pub fn to_json(&self, py: Python) -> PyResult<String> {
+    pub fn to_json(&self, py: Python<'_>) -> PyResult<String> {
         let json = py.import("json")?;
         let dict = self.to_dict(py)?;
         let dumped = json.call_method("dumps", (dict,), None)?;
@@ -644,45 +599,45 @@ impl PyOutputDeviceConfig {
     }
 
     #[staticmethod]
-    pub fn from_dict(d: &PyDict) -> PyResult<Self> {
-        let host_id_raw: Option<String> = match d.get_item("host_id") {
+    pub fn from_dict(d: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let host_id_raw: Option<String> = match d.get_item("host_id")? {
             Some(v) => Some(v.extract::<String>()?),
             None => None,
         };
         let device_name = d
-            .get_item("device_name")
+            .get_item("device_name")?
             .ok_or_else(|| PyValueError::new_err("device_name missing"))?
             .extract::<String>()?;
         let channels = d
-            .get_item("channels")
+            .get_item("channels")?
             .ok_or_else(|| PyValueError::new_err("channels missing"))?
             .extract::<usize>()?;
         let sample_rate = d
-            .get_item("sample_rate")
+            .get_item("sample_rate")?
             .ok_or_else(|| PyValueError::new_err("sample_rate missing"))?
             .extract::<u32>()?;
         let sample_format = d
-            .get_item("sample_format")
+            .get_item("sample_format")?
             .map(|v| v.extract::<String>())
             .transpose()?;
         let history_len = d
-            .get_item("history_len")
+            .get_item("history_len")?
             .ok_or_else(|| PyValueError::new_err("history_len missing"))?
             .extract::<usize>()?;
         let calibration_packets = d
-            .get_item("calibration_packets")
+            .get_item("calibration_packets")?
             .ok_or_else(|| PyValueError::new_err("calibration_packets missing"))?
             .extract::<u32>()?;
         let audio_buffer_seconds = d
-            .get_item("audio_buffer_seconds")
+            .get_item("audio_buffer_seconds")?
             .ok_or_else(|| PyValueError::new_err("audio_buffer_seconds missing"))?
             .extract::<u32>()?;
         let resampler_quality = d
-            .get_item("resampler_quality")
+            .get_item("resampler_quality")?
             .ok_or_else(|| PyValueError::new_err("resampler_quality missing"))?
             .extract::<i32>()?;
         let frame_size = d
-            .get_item("frame_size")
+            .get_item("frame_size")?
             .ok_or_else(|| PyValueError::new_err("frame_size missing"))?
             .extract::<u32>()?;
 
@@ -706,11 +661,11 @@ impl PyOutputDeviceConfig {
     }
 
     #[staticmethod]
-    pub fn from_json(py: Python, raw: &str) -> PyResult<Self> {
+    pub fn from_json(py: Python<'_>, raw: &str) -> PyResult<Self> {
         let json = py.import("json")?;
         let data = json.call_method("loads", (raw,), None)?;
-        let d: &PyDict = data.downcast()?;
-        Self::from_dict(d)
+        let d: Bound<'_, PyDict> = data.cast_into::<PyDict>()?;
+        Self::from_dict(&d)
     }
 
     pub fn clone_config(&self) -> Self {
