@@ -2811,10 +2811,7 @@ impl AecStream {
         let mut modified_aligners = false;
         for key in self.input_aligners_in_progress.keys().cloned().collect::<Vec<InputDeviceConfig>>() {
             let ready = match self.input_aligners_in_progress.get_mut(&key) {
-                Some(a) => {
-                    println!("Found");
-                    a.is_ready_to_read(chunk_end_micros, chunk_size).await
-                }
+                Some(a) => a.is_ready_to_read(chunk_end_micros, chunk_size).await
                 None => false,
             };
             if ready {
