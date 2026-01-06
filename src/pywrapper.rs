@@ -779,7 +779,7 @@ impl PyOutputStreamAlignerProducer {
             .inner
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Output stream producer no longer available"))?
-            .device_name
+            .config.device_name
             .clone())
     }
 
@@ -789,7 +789,7 @@ impl PyOutputStreamAlignerProducer {
             .inner
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Output stream producer no longer available"))?
-            .channels)
+            .config.channels)
     }
 
     pub fn begin_audio_stream(

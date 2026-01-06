@@ -53,6 +53,7 @@ use futures::StreamExt;
 use futures::executor::block_on;
 
 use std::{
+    fmt,
     hash::{Hash, Hasher},
     cmp::Ordering as CmpOrdering,
     collections::{HashMap},
@@ -1448,22 +1449,16 @@ impl StreamProducer {
 // because that ensures that multi-channel audio is synchronized properly
 // when sent to output device
 pub struct OutputStreamAlignerProducer {
-    pub host_id: cpal::HostId,
-    pub device_name: String,
-    pub channels: usize,
-    pub device_sample_rate: u32,
+    pub config: OutputDeviceConfig,
     output_stream_sender: mpsc::Sender<OutputStreamMessage>,
     cur_stream_id: Arc<AtomicU64>,
 }
 
 impl OutputStreamAlignerProducer {
 
-    fn new(host_id: cpal::HostId, device_name: String, channels: usize, device_sample_rate: u32, output_stream_sender: mpsc::Sender<OutputStreamMessage>) -> Self {
+    fn new(config: OutputDeviceConfig, output_stream_sender: mpsc::Sender<OutputStreamMessage>) -> Self {
         Self {
-            host_id: host_id,
-            device_name: device_name,
-            channels: channels,
-            device_sample_rate: device_sample_rate,
+            config: config,
             output_stream_sender: output_stream_sender,
             cur_stream_id: Arc::new(AtomicU64::new(0)),
         }
@@ -1473,13 +1468,13 @@ impl OutputStreamAlignerProducer {
         // this assigns unique ids in a thread-safe way
         let stream_index = self.cur_stream_id.fetch_add(1, Ordering::Relaxed);
         let (producer, consumer) = HeapRb::<f32>::new((audio_buffer_seconds * sample_rate * (channels as u32)) as usize).split();
-        let (resampled_producer, resampled_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * self.device_sample_rate * (channels as u32)) as usize).split();
+        let (resampled_producer, resampled_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * self.config.sample_rate * (channels as u32)) as usize).split();
 
         // send the consumer to the consume thread
         let resampled_producer = ResampledBufferedCircularProducer::new(
             channels,
             sample_rate,
-            self.device_sample_rate,
+            self.config.sample_rate,
             resampler_quality,
             BufferedCircularConsumer::<f32>::new(consumer),
             BufferedCircularProducer::<f32>::new(resampled_producer),
@@ -1801,6 +1796,25 @@ impl PartialOrd for InputDeviceConfig {
     }
 }
 
+
+impl fmt::Display for InputDeviceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Input(host={:?}, device=\"{}\", {}ch @ {} Hz, fmt={:?}, history_len={}, calib_pkts={}, buf_s={}, resampler_q={})",
+            self.host_id,
+            self.device_name,
+            self.channels,
+            self.sample_rate,
+            self.sample_format,
+            self.history_len,
+            self.calibration_packets,
+            self.audio_buffer_seconds,
+            self.resampler_quality,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputDeviceConfig {
     pub host_id: cpal::HostId,
@@ -1929,6 +1943,25 @@ impl PartialOrd for OutputDeviceConfig {
     }
 }
 
+impl fmt::Display for OutputDeviceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Output(host={:?}, device=\"{}\", {}ch @ {} Hz, fmt={:?}, history_len={}, calib_pkts={}, buf_s={}, resampler_q={}, frame_size={})",
+            self.host_id,
+            self.device_name,
+            self.channels,
+            self.sample_rate,
+            self.sample_format,
+            self.history_len,
+            self.calibration_packets,
+            self.audio_buffer_seconds,
+            self.resampler_quality,
+            self.frame_size,
+        )
+    }
+}
+
 pub struct AecConfig {
     target_sample_rate: u32,
     frame_size: usize,
@@ -2011,10 +2044,7 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
     let (output_stream_sender, output_stream_receiver) = mpsc::channel::<OutputStreamMessage>(CHANNEL_SIZE);
 
     let output_producer = OutputStreamAlignerProducer::new(
-        device_config.host_id,
-        device_config.device_name.clone(),
-        device_config.channels, // channels
-        device_config.sample_rate, // device_sample_rate
+        device_config.clone(),
         output_stream_sender
     );
 
@@ -2406,8 +2436,8 @@ impl AecStream {
         for (idx, dev_config) in self.sorted_output_aligners.clone().iter().enumerate() {
             let Some(producer) = output_producers
                 .iter_mut()
-                .find(|p| p == *dev_config) else {
-                eprintln!("calibrate: no output producer found for '{:?}'", dev_config);
+                .find(|p| p.config == *dev_config) else {
+                eprintln!("calibrate: no output producer found for '{}'", dev_config);
                 continue;
             };
 
@@ -2419,7 +2449,7 @@ impl AecStream {
             if probe.is_empty() {
                 continue;
             }
-            let channels = producer.channels;
+            let channels = producer.config.channels;
             let mut channel_map = HashMap::new();
             let mut out_channels = Vec::new();
             for ch in 0..channels {
@@ -2444,19 +2474,19 @@ impl AecStream {
         }
 
         // Build channel ranges for inputs and outputs (interleaved order).
-        let mut input_channel_ranges: Vec<(String, usize, usize)> = Vec::new();
+        let mut input_channel_ranges: Vec<(InputDeviceConfig, usize, usize)> = Vec::new();
         let mut in_ch_start = 0usize;
-        for name in &self.sorted_input_aligners {
-            if let Some(aligner) = self.input_aligners.get(name) {
-                input_channel_ranges.push((name.clone(), in_ch_start, aligner.channels));
+        for cfg in &self.sorted_input_aligners {
+            if let Some(aligner) = self.input_aligners.get(cfg) {
+                input_channel_ranges.push((cfg.clone(), in_ch_start, aligner.channels));
                 in_ch_start += aligner.channels;
             }
         }
-        let mut output_channel_ranges: Vec<(String, usize, usize)> = Vec::new();
+        let mut output_channel_ranges: Vec<(OutputDeviceConfig, usize, usize)> = Vec::new();
         let mut out_ch_start = 0usize;
-        for name in &self.sorted_output_aligners {
-            if let Some(aligner) = self.output_aligners.get(name) {
-                output_channel_ranges.push((name.clone(), out_ch_start, aligner.channels));
+        for cfg in &self.sorted_output_aligners {
+            if let Some(aligner) = self.output_aligners.get(cfg) {
+                output_channel_ranges.push((cfg.clone(), out_ch_start, aligner.channels));
                 out_ch_start += aligner.channels;
             }
         }
@@ -2509,22 +2539,22 @@ impl AecStream {
         }
 
         // 3) Stop probe streams now that capture is done.
-        for (dev_name, (_idx, stream)) in self.sorted_output_aligners.clone().iter().zip(active_streams.iter_mut()) {
+        for (dev_config, (_idx, stream)) in self.sorted_output_aligners.clone().iter().zip(active_streams.iter_mut()) {
             if let Some(producer) = output_producers
                 .iter_mut()
-                .find(|p| p.device_name == *dev_name) {
+                .find(|p| p.config == *dev_config) {
                 producer.end_audio_stream(stream)?;
             }
             else {
-                eprintln!("calibrate: no output producer found for '{dev_name}'");
+                eprintln!("calibrate: no output producer found for '{dev_config}'");
                 continue;
             }
         }
 
         if debug_wav {
             // write captured inputs
-            for (i, (name, _, _)) in input_channel_ranges.iter().enumerate() {
-                let sanitized = Self::sanitize_filename(name);
+            for (i, (cfg, _, _)) in input_channel_ranges.iter().enumerate() {
+                let sanitized = Self::sanitize_filename(&cfg.device_name);
                 let path = format!("calib_input_{sanitized}.wav");
                 let mut writer = WavWriter::create(
                     path,
@@ -2541,8 +2571,8 @@ impl AecStream {
                 writer.finalize()?;
             }
             // write captured outputs
-            for (i, (name, _, _)) in output_channel_ranges.iter().enumerate() {
-                let sanitized = Self::sanitize_filename(name);
+            for (i, (cfg, _, _)) in output_channel_ranges.iter().enumerate() {
+                let sanitized = Self::sanitize_filename(&cfg.device_name);
                 let path = format!("calib_output_{sanitized}.wav");
                 let mut writer = WavWriter::create(
                     path,
@@ -2781,7 +2811,10 @@ impl AecStream {
         let mut modified_aligners = false;
         for key in self.input_aligners_in_progress.keys().cloned().collect::<Vec<InputDeviceConfig>>() {
             let ready = match self.input_aligners_in_progress.get_mut(&key) {
-                Some(a) => a.is_ready_to_read(chunk_end_micros, chunk_size).await,
+                Some(a) => {
+                    println!("Found");
+                    a.is_ready_to_read(chunk_end_micros, chunk_size).await
+                }
                 None => false,
             };
             if ready {
