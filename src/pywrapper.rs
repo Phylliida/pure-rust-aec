@@ -881,7 +881,7 @@ impl PyAecStream {
             .ok_or_else(|| PyRuntimeError::new_err("AecStream is busy"))
     }
 
-    pub async fn add_input_device(&mut self, config: Py<PyInputDeviceConfig>) -> PyResult<()> {
+    pub async fn add_input_device(&self, config: Py<PyInputDeviceConfig>) -> PyResult<()> {
         let cfg = Python::attach(|py| {
             config
                 .try_borrow(py)
@@ -893,7 +893,7 @@ impl PyAecStream {
     }
 
     pub async fn add_output_device(
-        &mut self,
+        &self,
         config: Py<PyOutputDeviceConfig>,
     ) -> PyResult<PyOutputStreamAlignerProducer> {
         let cfg = Python::attach(|py| {
@@ -909,7 +909,7 @@ impl PyAecStream {
         })
     }
 
-    pub async fn remove_input_device(&mut self, config: Py<PyInputDeviceConfig>) -> PyResult<()> {
+    pub async fn remove_input_device(&self, config: Py<PyInputDeviceConfig>) -> PyResult<()> {
         let cfg = Python::attach(|py| {
             config
                 .try_borrow(py)
@@ -919,7 +919,7 @@ impl PyAecStream {
         self.inner.lock().await.remove_input_device(&cfg).map_err(to_py_err)
     }
 
-    pub async fn remove_output_device(&mut self, config: Py<PyOutputDeviceConfig>) -> PyResult<()> {
+    pub async fn remove_output_device(&self, config: Py<PyOutputDeviceConfig>) -> PyResult<()> {
         let cfg = Python::attach(|py| {
             config
                 .try_borrow(py)
@@ -934,7 +934,7 @@ impl PyAecStream {
     }
 
     pub async fn calibrate(
-        &mut self,
+        &self,
         producers: Vec<Py<PyOutputStreamAlignerProducer>>,
         debug_wav: bool,
     ) -> PyResult<bool> {
@@ -971,7 +971,7 @@ impl PyAecStream {
     }
 
     #[pyo3(signature = ())]
-    pub async fn update(&mut self) -> PyResult<(Py<PyBytes>, u128, u128)> {
+    pub async fn update(&self) -> PyResult<(Py<PyBytes>, u128, u128)> {
         let (samples, start, end) = {
             let mut guard = self.inner.lock().await;
             guard
@@ -1011,7 +1011,7 @@ impl PyAecStream {
 
     #[pyo3(signature = ())]
     pub async fn update_debug_vad(
-        &mut self,
+        &self,
     ) -> PyResult<(Py<PyBytes>, Py<PyBytes>, Py<PyBytes>, u128, u128, Vec<bool>)> {
         let (aligned_in, aligned_out, aec_applied, start, end, vad_scores) = {
             let mut guard = self.inner.lock().await;
