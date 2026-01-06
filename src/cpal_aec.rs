@@ -53,6 +53,8 @@ use futures::StreamExt;
 use futures::executor::block_on;
 
 use std::{
+    hash::{Hash, Hasher},
+    cmp::Ordering as CmpOrdering,
     collections::{HashMap},
     error::Error,
     mem::{MaybeUninit},
@@ -84,6 +86,7 @@ use std::thread;
 #[cfg(target_arch = "wasm32")]
 use cpal::SupportedBufferSize;
 use std::collections::HashSet;
+
 
 use ringbuf::{
     traits::{Consumer, Producer, RingBuffer, Split, Observer},
@@ -1667,6 +1670,22 @@ impl OutputStreamAlignerMixer {
     }
 }
 
+fn sample_format_tag(fmt: SampleFormat) -> u8 {
+    match fmt {
+        SampleFormat::I8 => 0,
+        SampleFormat::I16 => 1,
+        SampleFormat::I32 => 2,
+        SampleFormat::I64 => 3,
+        SampleFormat::U8 => 4,
+        SampleFormat::U16 => 5,
+        SampleFormat::U32 => 6,
+        SampleFormat::U64 => 7,
+        SampleFormat::F32 => 8,
+        SampleFormat::F64 => 9,
+        _ => 255, // future‑proof fallback
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputDeviceConfig {
     pub host_id: cpal::HostId,
@@ -1732,6 +1751,53 @@ impl InputDeviceConfig {
             audio_buffer_seconds,
             resampler_quality,
         ))
+    }
+}
+
+impl Hash for InputDeviceConfig {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.host_id.name().hash(state);
+        self.device_name.hash(state);
+        self.channels.hash(state);
+        self.sample_rate.hash(state);
+        (self.sample_format as u8).hash(state); // doesn't have hash sadly
+        self.history_len.hash(state);
+        self.calibration_packets.hash(state);
+        self.audio_buffer_seconds.hash(state);
+        self.resampler_quality.hash(state);
+    }
+}
+
+impl Ord for InputDeviceConfig {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        (
+            self.host_id.name(),
+            &self.device_name,
+            self.sample_rate,
+            self.channels,
+            self.sample_format as u8,
+            self.history_len,
+            self.calibration_packets,
+            self.audio_buffer_seconds,
+            self.resampler_quality,
+        )
+            .cmp(&(
+                other.host_id.name(),
+                &other.device_name,
+                other.sample_rate,
+                other.channels,
+                other.sample_format as u8,
+                other.history_len,
+                other.calibration_packets,
+                other.audio_buffer_seconds,
+                other.resampler_quality,
+            ))
+    }
+}
+
+impl PartialOrd for InputDeviceConfig {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -1809,6 +1875,57 @@ impl OutputDeviceConfig {
             resampler_quality,
             frame_size as u32,
         ))
+    }
+}
+
+
+impl Hash for OutputDeviceConfig {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.host_id.name().hash(state);
+        self.device_name.hash(state);
+        self.channels.hash(state);
+        self.sample_rate.hash(state);
+        (self.sample_format as u8).hash(state);
+        self.history_len.hash(state);
+        self.calibration_packets.hash(state);
+        self.audio_buffer_seconds.hash(state);
+        self.resampler_quality.hash(state);
+        self.frame_size.hash(state);
+    }
+}
+
+impl Ord for OutputDeviceConfig {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        (
+            self.host_id.name(),
+            &self.device_name,
+            self.sample_rate,
+            self.channels,
+            self.sample_format as u8, // use discriminant if SampleFormat lacks Ord
+            self.history_len,
+            self.calibration_packets,
+            self.audio_buffer_seconds,
+            self.resampler_quality,
+            self.frame_size,
+        )
+            .cmp(&(
+                other.host_id.name(),
+                &other.device_name,
+                other.sample_rate,
+                other.channels,
+                other.sample_format as u8,
+                other.history_len,
+                other.calibration_packets,
+                other.audio_buffer_seconds,
+                other.resampler_quality,
+                other.frame_size,
+            ))
+    }
+}
+
+impl PartialOrd for OutputDeviceConfig {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -1937,12 +2054,11 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
     Ok((stream, output_producer, consumer))
 }
 
-
 enum DeviceUpdateMessage {
-    AddInputDevice(String, InputStream, StreamAlignerConsumer),
-    RemoveInputDevice(String),
-    AddOutputDevice(String, Stream, StreamAlignerConsumer),
-    RemoveOutputDevice(String)
+    AddInputDevice(InputDeviceConfig, InputStream, StreamAlignerConsumer),
+    RemoveInputDevice(InputDeviceConfig),
+    AddOutputDevice(OutputDeviceConfig, Stream, StreamAlignerConsumer),
+    RemoveOutputDevice(OutputDeviceConfig)
 }
 
 const VAD_FRAME_SIZE : usize = 256;
@@ -1952,14 +2068,14 @@ pub struct AecStream {
     aec_config: AecConfig,
     device_update_sender: mpsc::Sender<DeviceUpdateMessage>,
     device_update_receiver: mpsc::Receiver<DeviceUpdateMessage>,
-    input_streams: HashMap<String, InputStream>,
-    output_streams: HashMap<String, Stream>,
-    input_aligners: HashMap<String, StreamAlignerConsumer>,
-    input_aligners_in_progress: HashMap<String, StreamAlignerConsumer>,
-    output_aligners: HashMap<String, StreamAlignerConsumer>,
-    output_aligners_in_progress: HashMap<String, StreamAlignerConsumer>,
-    sorted_input_aligners: Vec<String>,
-    sorted_output_aligners: Vec<String>,
+    input_streams: HashMap<InputDeviceConfig, InputStream>,
+    output_streams: HashMap<OutputDeviceConfig, Stream>,
+    input_aligners: HashMap<InputDeviceConfig, StreamAlignerConsumer>,
+    input_aligners_in_progress: HashMap<InputDeviceConfig, StreamAlignerConsumer>,
+    output_aligners: HashMap<OutputDeviceConfig, StreamAlignerConsumer>,
+    output_aligners_in_progress: HashMap<OutputDeviceConfig, StreamAlignerConsumer>,
+    sorted_input_aligners: Vec<InputDeviceConfig>,
+    sorted_output_aligners: Vec<OutputDeviceConfig>,
     input_channels: usize,
     output_channels: usize,
     input_gain: f32,
@@ -2119,23 +2235,23 @@ impl AecStream {
 
     pub async fn add_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
         let (stream, aligners) = get_input_stream_aligners(config, &self.aec_config).await?;
-        self.device_update_sender.try_send(DeviceUpdateMessage::AddInputDevice(config.device_name.clone(), stream, aligners))?;
+        self.device_update_sender.try_send(DeviceUpdateMessage::AddInputDevice(config.clone(), stream, aligners))?;
         Ok(())
     }
 
     pub async fn add_output_device(&mut self, config: &OutputDeviceConfig) -> Result<OutputStreamAlignerProducer, Box<dyn std::error::Error>> {
         let (stream, producer, consumer) = get_output_stream_aligners(config, &self.aec_config)?;
-        self.device_update_sender.try_send(DeviceUpdateMessage::AddOutputDevice(config.device_name.clone(), stream, consumer))?;
+        self.device_update_sender.try_send(DeviceUpdateMessage::AddOutputDevice(config.clone(), stream, consumer))?;
         Ok(producer)
     }
 
     pub fn remove_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        self.device_update_sender.try_send(DeviceUpdateMessage::RemoveInputDevice(config.device_name.clone()))?;
+        self.device_update_sender.try_send(DeviceUpdateMessage::RemoveInputDevice(config.clone()))?;
         Ok(())
     }
 
     pub fn remove_output_device(&mut self, config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        self.device_update_sender.try_send(DeviceUpdateMessage::RemoveOutputDevice(config.device_name.clone()))?;
+        self.device_update_sender.try_send(DeviceUpdateMessage::RemoveOutputDevice(config.clone()))?;
         Ok(())
     }
 
@@ -2287,11 +2403,11 @@ impl AecStream {
             }
         }
 
-        for (idx, dev_name) in self.sorted_output_aligners.clone().iter().enumerate() {
+        for (idx, dev_config) in self.sorted_output_aligners.clone().iter().enumerate() {
             let Some(producer) = output_producers
                 .iter_mut()
-                .find(|p| p.device_name == *dev_name) else {
-                eprintln!("calibrate: no output producer found for '{dev_name}'");
+                .find(|p| p == *dev_config) else {
+                eprintln!("calibrate: no output producer found for '{:?}'", dev_config);
                 continue;
             };
 
@@ -2497,12 +2613,18 @@ impl AecStream {
     pub async fn update_debug_vad(&mut self) -> Result<(&[f32], &[f32], &[f32], u128, u128, Vec<bool>), Box<dyn std::error::Error>> {
         let (chunk_start_micros, chunk_end_micros) = self.update_devices().await?; // needs to be done before everything, so num channels doen't change between update_helper calls
 
+        if self.input_channels == 0 && self.output_channels > 0 {
+            // still run update so the outputs are correctly drained, but ignore them
+            let (_input, _start, _end) = self.update_helper(chunk_start_micros, chunk_end_micros).await?;
+            return Ok((&[], &[], &[], 0, 0, Vec::new()));
+        }
+
         // this has 3 circular buffers of size min(self.aec_config.frame_size*4, VAD_FRAME_SIZE*2) that hold the input_audio_buffer, output_audio_buffer, and aec_outputs from update_debug
         // update_debug is called multiple times until we have at least VAD_FRAME_SIZE samples, at which point the vad is called (one for each channel) and then we send the results
         let mut latest_end_time: u128 = 0;
 
         let first = true;
-        while self.input_channels > 0 && self.output_channels > 0 && (self.vad_input_buffer_cons.available() / self.input_channels) < VAD_FRAME_SIZE {
+        while self.input_channels > 0 && (self.vad_input_buffer_cons.available() / self.input_channels) < VAD_FRAME_SIZE {
             let (chunk_start_micros, chunk_end_micros) = if first {
                 (chunk_start_micros, chunk_end_micros)
             } else {
@@ -2518,16 +2640,20 @@ impl AecStream {
                 }
             };
             latest_end_time = end;
-            let (input, output, aec) = (self.input_audio_buffer.as_slice(), self.output_audio_buffer.as_slice(), self.aec_audio_buffer.as_slice());
+            let (input, aec) = (self.input_audio_buffer.as_slice(),  self.aec_audio_buffer.as_slice());
             let (input_write, input_buf) = self.vad_input_buffer_prod.get_chunk_to_write(input.len());
-            let (output_write, output_buf) = self.vad_output_buffer_prod.get_chunk_to_write(output.len());
             let (aec_write, aec_buf) = self.vad_aec_buffer_prod.get_chunk_to_write(aec.len());
             input_buf.copy_from_slice(input);
-            output_buf.copy_from_slice(output);
             aec_buf.copy_from_slice(aec);
             self.vad_input_buffer_prod.finish_write(input_write, input.len());
-            self.vad_output_buffer_prod.finish_write(output_write, output.len());
             self.vad_aec_buffer_prod.finish_write(aec_write, aec.len());
+
+            if self.output_channels > 0 {
+                let output = self.output_audio_buffer.as_slice();
+                let (output_write, output_buf) = self.vad_output_buffer_prod.get_chunk_to_write(output.len());
+                output_buf.copy_from_slice(output);
+                self.vad_output_buffer_prod.finish_write(output_write, output.len());
+            }
         }
 
         // failed, maybe we removed all input devices or something else happened, return nothing
@@ -2537,7 +2663,6 @@ impl AecStream {
         let remaining_frames = self.vad_input_buffer_cons.available() / self.input_channels;
         
         let input_buf = self.vad_input_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE*self.input_channels);
-        let output_buf = self.vad_output_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE*self.output_channels);
         let aec_buf = self.vad_aec_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE*self.input_channels);
         let end_time = latest_end_time - frames_to_micros(remaining_frames as u128, self.aec_config.target_sample_rate as u128);
         let start_time = end_time - frames_to_micros(VAD_FRAME_SIZE as u128, self.aec_config.target_sample_rate as u128);
@@ -2558,15 +2683,18 @@ impl AecStream {
 
         self.vad_input_buffer.clear();
         self.vad_input_buffer.extend_from_slice(input_buf);
-        self.vad_output_buffer.clear();
-        self.vad_output_buffer.extend_from_slice(output_buf);
         self.vad_aec_buffer.clear();
         self.vad_aec_buffer.extend_from_slice(aec_buf);
         
         self.vad_input_buffer_cons.finish_read(VAD_FRAME_SIZE*self.input_channels);
-        self.vad_output_buffer_cons.finish_read(VAD_FRAME_SIZE*self.output_channels);
         self.vad_aec_buffer_cons.finish_read(VAD_FRAME_SIZE*self.input_channels);
-        
+
+        if self.output_channels > 0 {
+            let output_buf = self.vad_output_buffer_cons.get_chunk_to_read(VAD_FRAME_SIZE*self.output_channels);
+            self.vad_output_buffer.clear();
+            self.vad_output_buffer.extend_from_slice(output_buf);
+            self.vad_output_buffer_cons.finish_read(VAD_FRAME_SIZE*self.output_channels);
+        }
 
         Ok((
             &self.vad_input_buffer.as_slice(),
@@ -2651,7 +2779,7 @@ impl AecStream {
         }
          // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
-        for key in self.input_aligners_in_progress.keys().cloned().collect::<Vec<String>>() {
+        for key in self.input_aligners_in_progress.keys().cloned().collect::<Vec<InputDeviceConfig>>() {
             let ready = match self.input_aligners_in_progress.get_mut(&key) {
                 Some(a) => a.is_ready_to_read(chunk_end_micros, chunk_size).await,
                 None => false,
@@ -2663,7 +2791,7 @@ impl AecStream {
                 }
             }
         }
-        for key in self.output_aligners_in_progress.keys().cloned().collect::<Vec<String>>() {
+        for key in self.output_aligners_in_progress.keys().cloned().collect::<Vec<OutputDeviceConfig>>() {
             let ready = match self.output_aligners_in_progress.get_mut(&key) {
                 Some(a) => a.is_ready_to_read(chunk_end_micros, chunk_size).await,
                 None => false,
