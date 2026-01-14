@@ -598,6 +598,65 @@ impl PyOutputDeviceConfig {
         dumped.extract()
     }
 
+    pub fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
+        let key = (
+            self.inner.host_id.name().to_string(),
+            self.inner.device_name.clone(),
+            self.inner.channels,
+            self.inner.sample_rate,
+            sample_format_to_string(self.inner.sample_format).to_string(),
+            self.inner.history_len,
+            self.inner.calibration_packets,
+            self.inner.audio_buffer_seconds,
+            self.inner.resampler_quality,
+            self.inner.frame_size,
+        );
+        let key_obj = key.into_py_any(py)?;
+        key_obj.bind(py).hash()
+    }
+
+    pub fn __richcmp__(
+        &self,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        let py = other.py();
+        let Ok(other_cfg) = other.extract::<PyRef<PyOutputDeviceConfig>>() else {
+            return Ok(py.NotImplemented());
+        };
+
+        let self_key = (
+            self.inner.host_id.name().to_string(),
+            self.inner.device_name.clone(),
+            self.inner.channels,
+            self.inner.sample_rate,
+            sample_format_to_string(self.inner.sample_format).to_string(),
+            self.inner.history_len,
+            self.inner.calibration_packets,
+            self.inner.audio_buffer_seconds,
+            self.inner.resampler_quality,
+            self.inner.frame_size,
+        );
+        let other_key = (
+            other_cfg.inner.host_id.name().to_string(),
+            other_cfg.inner.device_name.clone(),
+            other_cfg.inner.channels,
+            other_cfg.inner.sample_rate,
+            sample_format_to_string(other_cfg.inner.sample_format).to_string(),
+            other_cfg.inner.history_len,
+            other_cfg.inner.calibration_packets,
+            other_cfg.inner.audio_buffer_seconds,
+            other_cfg.inner.resampler_quality,
+            other_cfg.inner.frame_size,
+        );
+
+        match op {
+            CompareOp::Eq => (self_key == other_key).into_py_any(py),
+            CompareOp::Ne => (self_key != other_key).into_py_any(py),
+            _ => Ok(py.NotImplemented()),
+        }
+    }
+
     #[staticmethod]
     pub fn from_dict(d: &Bound<'_, PyDict>) -> PyResult<Self> {
         let host_id_raw: Option<String> = match d.get_item("host_id")? {
