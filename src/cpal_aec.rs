@@ -1547,7 +1547,7 @@ impl OutputStreamAlignerMixer {
                 },
                 // sender dropped; receiver will never get more messages
                 Ok(None) => {
-                    eprintln!("Error: Mix audio stream message disconnected");
+                    //eprintln!("Error: Mix audio stream message disconnected");
                     break;
                 }
                 Err(_err) => {
@@ -2131,6 +2131,17 @@ pub struct AecStream {
 
 // AecStream is used behind a Mutex to serialize access; mark it Send so it can cross threads.
 unsafe impl Send for AecStream {}
+
+impl Drop for AecStream {
+    fn drop(&mut self) {
+        for (_k, stream) in self.input_streams.drain() {
+            stream.pause().unwrap();
+        }
+        for (_k, stream) in self.output_streams.drain() {
+            stream.pause().unwrap();
+        }
+    }
+}
 
 impl AecStream {
     pub fn new(
@@ -2756,33 +2767,41 @@ impl AecStream {
         loop {
             match self.device_update_receiver.try_next() {
                 Ok(Some(msg)) => match msg {
-                    DeviceUpdateMessage::AddInputDevice(device_name, stream, aligner) => {
-                        // old stream is stopped by default when it goes out of scope
-                        self.input_streams.insert(device_name.clone(), stream);
-                        self.input_aligners.remove(&device_name);
-                        self.input_aligners_in_progress.insert(device_name.clone(), aligner);
+                    DeviceUpdateMessage::AddInputDevice(device_config, stream, aligner) => {
+                        if let Some(stream) = self.input_streams.remove(&device_config) {
+                            stream.pause()?;
+                        }
+                        self.input_streams.insert(device_config.clone(), stream);
+                        self.input_aligners.remove(&device_config);
+                        self.input_aligners_in_progress.insert(device_config.clone(), aligner);
 
                         self.reinitialize_aec()?;
                     }
-                    DeviceUpdateMessage::RemoveInputDevice(device_name) => {
-                        // old stream is stopped by default when it goes out of scope
-                        self.input_streams.remove(&device_name);
-                        self.input_aligners.remove(&device_name);
-                        self.input_aligners_in_progress.remove(&device_name);
+                    DeviceUpdateMessage::RemoveInputDevice(device_config) => {
+                        if let Some(stream) = self.input_streams.remove(&device_config) {
+                            stream.pause()?;
+                        }
+                        self.input_aligners.remove(&device_config);
+                        self.input_aligners_in_progress.remove(&device_config);
 
                         self.reinitialize_aec()?;
                     }
-                    DeviceUpdateMessage::AddOutputDevice(device_name, stream, aligner) => {
-                        self.output_streams.insert(device_name.clone(), stream);
-                        self.output_aligners.remove(&device_name);
-                        self.output_aligners_in_progress.insert(device_name.clone(), aligner);
+                    DeviceUpdateMessage::AddOutputDevice(device_config, stream, aligner) => {
+                        if let Some(stream) = self.output_streams.remove(&device_config) {
+                            stream.pause()?;
+                        }
+                        self.output_streams.insert(device_config.clone(), stream);
+                        self.output_aligners.remove(&device_config);
+                        self.output_aligners_in_progress.insert(device_config.clone(), aligner);
 
                         self.reinitialize_aec()?;
                     }
-                    DeviceUpdateMessage::RemoveOutputDevice(device_name) => {
-                        self.output_streams.remove(&device_name);
-                        self.output_aligners.remove(&device_name);
-                        self.output_aligners_in_progress.remove(&device_name);
+                    DeviceUpdateMessage::RemoveOutputDevice(device_config) => {
+                        if let Some(stream) = self.output_streams.remove(&device_config) {
+                            stream.pause()?;
+                        }
+                        self.output_aligners.remove(&device_config);
+                        self.output_aligners_in_progress.remove(&device_config);
 
                         self.reinitialize_aec()?;
                     }
