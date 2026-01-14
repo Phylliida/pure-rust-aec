@@ -1628,7 +1628,13 @@ impl OutputStreamAlignerMixer {
             // resample_producer.resample_all()?; // do resampling of any available data
             // instead, do it streaming
             // todo: there's a bug where the final 5-10ms of audio is cutoff because doesn't have any empty end data for the chunk
-            resample_producer.resample((target_input_samples as u32) * 2)?; // do * 2 so we also grab some leftovers if there are some, this is an upper bound
+            
+            // if we need some, do some resampling
+            if resample_consumer.available() < requested_frames * (*channels) { // important to only do this when needed so we don't get too far ahead
+                // we don't do samples_needed, because of resampler chunk size reasons
+                // (just asking for samples_needed may result in zero produced)
+                resample_producer.resample((target_input_samples as u32) * 2)?; // do * 2 so we also grab some leftovers if there are some, this is an upper bound   
+            }
             let buf_from_stream = resample_consumer.get_chunk_to_read((requested_frames * (*channels)) as usize);
             let frames = (buf_from_stream.len() / *channels as usize).min(requested_frames);
             if frames == 0 {
