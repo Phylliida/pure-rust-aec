@@ -2261,7 +2261,7 @@ impl AecStream {
             println!("Making aec with {} inputs and {} outputs", self.input_channels, self.output_channels);
             Some(VoipAec3::builder(self.aec_config.target_sample_rate as i32, self.output_channels, self.input_channels)
             .initial_delay_ms((self.aec_config.frame_size/3) as i32)
-            .enable_high_pass(false)
+            .enable_high_pass(true)
             .build()
             .expect("failed to create AEC pipeline"))
         } else {
