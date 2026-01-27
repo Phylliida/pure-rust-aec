@@ -2302,6 +2302,30 @@ impl AecStream {
         Ok(())
     }
 
+    pub fn get_ready_input_devices(&self) -> Vec<InputDeviceConfig> {
+        let mut ready_input_devices = Vec::new();
+        // in sorted order so it is consistent
+        for key in &self.sorted_input_aligners {
+            // check if it is ready (otherwise it'll be in input_aligners_in_progress)
+            if let Some(_aligner) = self.input_aligners.get(key) {
+                ready_input_devices.push(key.clone());
+            }
+        }
+        ready_input_devices
+    } 
+    
+    pub fn get_ready_output_devices(&self) -> Vec<OutputDeviceConfig> {
+        let mut ready_output_devices = Vec::new();
+        // in sorted order so it is consistent
+        for key in &self.sorted_output_aligners {
+            // check if it is ready (otherwise it'll be in output_aligners_in_progress)
+            if let Some(_aligner) = self.output_aligners.get(key) {
+                ready_output_devices.push(key.clone());
+            }
+        }
+        ready_output_devices
+    }
+
     pub async fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<bool, Box<dyn std::error::Error>> {
         let mut success = false;
         let mut iters = 0;

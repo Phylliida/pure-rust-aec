@@ -940,6 +940,34 @@ impl PyAecStream {
             .ok_or_else(|| PyRuntimeError::new_err("AecStream is busy"))
     }
 
+    #[pyo3(signature = ())]
+    pub fn get_ready_input_devices(&self) -> PyResult<Vec<PyInputDeviceConfig>> {
+        self.inner
+            .try_lock()
+            .map(|guard| {
+                guard
+                    .get_ready_input_devices()
+                    .into_iter()
+                    .map(PyInputDeviceConfig::from_inner)
+                    .collect()
+            })
+            .ok_or_else(|| PyRuntimeError::new_err("AecStream is busy"))
+    }
+
+    #[pyo3(signature = ())]
+    pub fn get_ready_output_devices(&self) -> PyResult<Vec<PyOutputDeviceConfig>> {
+        self.inner
+            .try_lock()
+            .map(|guard| {
+                guard
+                    .get_ready_output_devices()
+                    .into_iter()
+                    .map(PyOutputDeviceConfig::from_inner)
+                    .collect()
+            })
+            .ok_or_else(|| PyRuntimeError::new_err("AecStream is busy"))
+    }
+
     pub async fn add_input_device(&self, config: Py<PyInputDeviceConfig>) -> PyResult<()> {
         let cfg = Python::attach(|py| {
             config
@@ -991,7 +1019,7 @@ impl PyAecStream {
             .remove_output_device(&cfg)
             .map_err(to_py_err)
     }
-
+    
     pub async fn calibrate(
         &self,
         producers: Vec<Py<PyOutputStreamAlignerProducer>>,
@@ -1030,66 +1058,136 @@ impl PyAecStream {
     }
 
     #[pyo3(signature = ())]
-    pub async fn update(&self) -> PyResult<(Py<PyBytes>, u128, u128)> {
-        let (samples, start, end) = {
+    pub async fn update(
+        &self,
+    ) -> PyResult<(Vec<PyInputDeviceConfig>, Vec<PyOutputDeviceConfig>, Py<PyBytes>, u128, u128)> {
+        let (ready_inputs, ready_outputs, samples, start, end) = {
             let mut guard = self.inner.lock().await;
             guard
                 .update()
                 .await
-                .map(|(buf, s, e)| (buf.to_vec(), s, e))
+                .map(|(new_in, new_out, buf, s, e)| (new_in, new_out, buf.to_vec(), s, e))
         }
         .map_err(to_py_err)?;
 
-        let py_buf = Python::attach(|py| slice_to_pybytes(py, samples.as_slice()));
-        Ok((py_buf, start, end))
+        let (ready_inputs, ready_outputs, py_buf) = Python::attach(|py| {
+            (
+                ready_inputs
+                    .into_iter()
+                    .map(PyInputDeviceConfig::from_inner)
+                    .collect(),
+                ready_outputs
+                    .into_iter()
+                    .map(PyOutputDeviceConfig::from_inner)
+                    .collect(),
+                slice_to_pybytes(py, samples.as_slice()),
+            )
+        });
+        Ok((ready_inputs, ready_outputs, py_buf, start, end))
     }
 
     #[pyo3(signature = ())]
     pub async fn update_debug(
         &mut self,
-    ) -> PyResult<(Py<PyBytes>, Py<PyBytes>, Py<PyBytes>, u128, u128)> {
-        let (aligned_in, aligned_out, aec_applied, start, end) = {
+    ) -> PyResult<(
+        Vec<PyInputDeviceConfig>,
+        Vec<PyOutputDeviceConfig>,
+        Py<PyBytes>,
+        Py<PyBytes>,
+        Py<PyBytes>,
+        u128,
+        u128,
+    )> {
+        let (ready_inputs, ready_outputs, aligned_in, aligned_out, aec_applied, start, end) = {
             let mut guard = self.inner.lock().await;
             guard
                 .update_debug()
                 .await
-                .map(|(a, b, c, s, e)| (a.to_vec(), b.to_vec(), c.to_vec(), s, e))
+                .map(|(new_in, new_out, a, b, c, s, e)| {
+                    (new_in, new_out, a.to_vec(), b.to_vec(), c.to_vec(), s, e)
+                })
         }
         .map_err(to_py_err)?;
 
-        let (aligned_in, aligned_out, aec_applied) = Python::attach(|py| {
-            (
-                slice_to_pybytes(py, aligned_in.as_slice()),
-                slice_to_pybytes(py, aligned_out.as_slice()),
-                slice_to_pybytes(py, aec_applied.as_slice()),
-            )
-        });
+        let (ready_inputs, ready_outputs, aligned_in, aligned_out, aec_applied) =
+            Python::attach(|py| {
+                (
+                    ready_inputs
+                        .into_iter()
+                        .map(PyInputDeviceConfig::from_inner)
+                        .collect(),
+                    ready_outputs
+                        .into_iter()
+                        .map(PyOutputDeviceConfig::from_inner)
+                        .collect(),
+                    slice_to_pybytes(py, aligned_in.as_slice()),
+                    slice_to_pybytes(py, aligned_out.as_slice()),
+                    slice_to_pybytes(py, aec_applied.as_slice()),
+                )
+            });
 
-        Ok((aligned_in, aligned_out, aec_applied, start, end))
+        Ok((
+            ready_inputs,
+            ready_outputs,
+            aligned_in,
+            aligned_out,
+            aec_applied,
+            start,
+            end,
+        ))
     }
 
     #[pyo3(signature = ())]
     pub async fn update_debug_vad(
         &self,
-    ) -> PyResult<(Py<PyBytes>, Py<PyBytes>, Py<PyBytes>, u128, u128, Vec<bool>)> {
-        let (aligned_in, aligned_out, aec_applied, start, end, vad_scores) = {
+    ) -> PyResult<(
+        Vec<PyInputDeviceConfig>,
+        Vec<PyOutputDeviceConfig>,
+        Py<PyBytes>,
+        Py<PyBytes>,
+        Py<PyBytes>,
+        u128,
+        u128,
+        Vec<bool>,
+    )> {
+        let (ready_inputs, ready_outputs, aligned_in, aligned_out, aec_applied, start, end, vad_scores) = {
             let mut guard = self.inner.lock().await;
             guard
                 .update_debug_vad()
                 .await
-                .map(|(a, b, c, s, e, v)| (a.to_vec(), b.to_vec(), c.to_vec(), s, e, v))
+                .map(|(new_in, new_out, a, b, c, s, e, v)| {
+                    (new_in, new_out, a.to_vec(), b.to_vec(), c.to_vec(), s, e, v)
+                })
         }
         .map_err(to_py_err)?;
 
-        let (aligned_in, aligned_out, aec_applied) = Python::attach(|py| {
-            (
-                slice_to_pybytes(py, aligned_in.as_slice()),
-                slice_to_pybytes(py, aligned_out.as_slice()),
-                slice_to_pybytes(py, aec_applied.as_slice()),
-            )
-        });
+        let (ready_inputs, ready_outputs, aligned_in, aligned_out, aec_applied) =
+            Python::attach(|py| {
+                (
+                    ready_inputs
+                        .into_iter()
+                        .map(PyInputDeviceConfig::from_inner)
+                        .collect(),
+                    ready_outputs
+                        .into_iter()
+                        .map(PyOutputDeviceConfig::from_inner)
+                        .collect(),
+                    slice_to_pybytes(py, aligned_in.as_slice()),
+                    slice_to_pybytes(py, aligned_out.as_slice()),
+                    slice_to_pybytes(py, aec_applied.as_slice()),
+                )
+            });
 
-        Ok((aligned_in, aligned_out, aec_applied, start, end, vad_scores))
+        Ok((
+            ready_inputs,
+            ready_outputs,
+            aligned_in,
+            aligned_out,
+            aec_applied,
+            start,
+            end,
+            vad_scores,
+        ))
     }
 
     #[getter]
@@ -1156,7 +1254,7 @@ impl PyAecStream {
                         guard
                             .update()
                             .await
-                            .map(|(buf, s, e)| (buf.to_vec(), s, e))
+                            .map(|(_new_in, _new_out, buf, s, e)| (buf.to_vec(), s, e))
                             .map_err(|e| e.to_string())
                     };
                     match pool.run_until(fut) {
