@@ -1411,6 +1411,7 @@ pub struct StreamProducer {
     stream_id: StreamId,
     producer: HeapProd<f32>,
     stream_message_sender: mpsc::Sender<OutputStreamMessage>,
+    total_samples_queued: u128,
     pub first_queue_time: Option<u128>,
 }
 
@@ -1420,6 +1421,7 @@ impl StreamProducer {
             stream_id,
             producer: producer,
             stream_message_sender: stream_message_sender,
+            total_samples_queued: 0,
             first_queue_time: None,
         }
     }
@@ -1435,10 +1437,14 @@ impl StreamProducer {
             self.stream_message_sender.try_send(OutputStreamMessage::SetStartTime(self.stream_id,start_time))?;
         }
         let num_pushed = self.producer.push_slice(audio_data);
+        self.total_samples_queued += num_pushed as u128;
         if num_pushed < audio_data.len() {
             eprintln!("Error: output audio buffer got behind, try increasing buffer size");
         }
         Ok(())
+    }
+    pub fn num_played_samples(&self) -> u128 {
+        return self.total_samples_queued.saturating_sub(self.num_queued_samples() as u128)
     }
     pub fn num_queued_samples(&self) -> usize {
         return self.producer.occupied_len();

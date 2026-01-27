@@ -802,6 +802,11 @@ impl PyStreamProducer {
     }
 
     #[getter]
+    pub fn num_played_samples(&self) -> u128 {
+        self.inner.lock().unwrap().num_played_samples()
+    }
+
+    #[getter]
     pub fn num_queued_samples(&self) -> usize {
         return self.inner.lock().unwrap().num_queued_samples();
     }
