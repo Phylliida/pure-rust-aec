@@ -2414,7 +2414,7 @@ impl AecStream {
         let mut captured_micros: u128 = 0;
         let target_micros: u128 = ((capture_secs as u128) * 1_000_000) as u128;
         
-        let (mut chunk_start_micros, mut chunk_end_micros) = self.update_devices().await?;
+        let (_new_ready_input_devices, _new_ready_output_devices, mut chunk_start_micros, mut chunk_end_micros) = self.update_devices().await?;
            
         while captured_micros < target_micros {
             let _ = self.update_helper(chunk_start_micros, chunk_end_micros).await?;
@@ -2657,13 +2657,13 @@ impl AecStream {
             .collect()
     }
 
-    pub async fn update_debug_vad(&mut self) -> Result<(&[f32], &[f32], &[f32], u128, u128, Vec<bool>), Box<dyn std::error::Error>> {
-        let (chunk_start_micros, chunk_end_micros) = self.update_devices().await?; // needs to be done before everything, so num channels doen't change between update_helper calls
+    pub async fn update_debug_vad(&mut self) -> Result<(Vec<InputDeviceConfig>, Vec<OutputDeviceConfig>, &[f32], &[f32], &[f32], u128, u128, Vec<bool>), Box<dyn std::error::Error>> {
+        let (new_ready_input_devices, new_ready_output_devices, chunk_start_micros, chunk_end_micros) = self.update_devices().await?; // needs to be done before everything, so num channels doen't change between update_helper calls
 
         if self.input_channels == 0 && self.output_channels > 0 {
             // still run update so the outputs are correctly drained, but ignore them
             let (_input, _start, _end) = self.update_helper(chunk_start_micros, chunk_end_micros).await?;
-            return Ok((&[], &[], &[], 0, 0, Vec::new()));
+            return Ok((new_ready_input_devices, new_ready_output_devices, &[], &[], &[], 0, 0, Vec::new()));
         }
 
         // this has 3 circular buffers of size min(self.aec_config.frame_size*4, VAD_FRAME_SIZE*2) that hold the input_audio_buffer, output_audio_buffer, and aec_outputs from update_debug
@@ -2705,7 +2705,7 @@ impl AecStream {
 
         // failed, maybe we removed all input devices or something else happened, return nothing
         if self.input_channels == 0 || (self.vad_input_buffer_cons.available() / self.input_channels) < VAD_FRAME_SIZE {
-            return Ok((&[], &[], &[], 0, 0, Vec::new()));
+            return Ok((new_ready_input_devices, new_ready_output_devices, &[], &[], &[], 0, 0, Vec::new()));
         }
         let remaining_frames = self.vad_input_buffer_cons.available() / self.input_channels;
         
@@ -2744,6 +2744,8 @@ impl AecStream {
         }
 
         Ok((
+            new_ready_input_devices,
+            new_ready_output_devices,
             &self.vad_input_buffer.as_slice(),
             &self.vad_output_buffer.as_slice(),
             &self.vad_aec_buffer.as_slice(),
@@ -2755,12 +2757,14 @@ impl AecStream {
 
     // calls update, but returns all involved audio buffers
     // (if needed for diagnostic reasons, usually .update() (which returns aec'd inputs) should be all you need)
-    pub async fn update_debug(&mut self) -> Result<(&[f32], &[f32], &[f32], u128, u128), Box<dyn std::error::Error>> {
-        let (start_time, end_time) = {
-            let (_, start_time, end_time) = self.update().await?;
-            (start_time, end_time)
+    pub async fn update_debug(&mut self) -> Result<(Vec<InputDeviceConfig>, Vec<OutputDeviceConfig>, &[f32], &[f32], &[f32], u128, u128), Box<dyn std::error::Error>> {
+        let (new_ready_input_devices, new_ready_output_devices, start_time, end_time) = {
+            let (new_ready_input_devices, new_ready_output_devices, _, start_time, end_time) = self.update().await?;
+            (new_ready_input_devices, new_ready_output_devices, start_time, end_time)
         };
         Ok((
+            new_ready_input_devices,
+            new_ready_output_devices,
             self.input_audio_buffer.as_slice(),
             self.output_audio_buffer.as_slice(),
             self.aec_audio_buffer.as_slice(),
@@ -2769,7 +2773,7 @@ impl AecStream {
         ))
     }
 
-    async fn update_devices(&mut self) -> Result<(u128, u128), Box<dyn std::error::Error>>{
+    async fn update_devices(&mut self) -> Result<(Vec<InputDeviceConfig>, Vec<OutputDeviceConfig>, u128, u128), Box<dyn std::error::Error>>{
         loop {
             match self.device_update_receiver.try_next() {
                 Ok(Some(msg)) => match msg {
@@ -2830,10 +2834,11 @@ impl AecStream {
         // similarly, if we initialize an output device here
         // we may not get any audio for a little bit
         if chunk_size == 0 {
-            return Ok((chunk_start_micros, chunk_end_micros));
+            return Ok((Vec::new(), Vec::new(), chunk_start_micros, chunk_end_micros));
         }
          // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
+        let mut new_ready_input_devices = Vec::new();
         for key in self.input_aligners_in_progress.keys().cloned().collect::<Vec<InputDeviceConfig>>() {
             let ready = match self.input_aligners_in_progress.get_mut(&key) {
                 Some(a) => a.is_ready_to_read(chunk_end_micros, chunk_size).await,
@@ -2841,11 +2846,14 @@ impl AecStream {
             };
             if ready {
                 if let Some(aligner) = self.input_aligners_in_progress.remove(&key) {
+                    new_ready_input_devices.push(key.clone());
                     self.input_aligners.insert(key, aligner);
                     modified_aligners = true;
                 }
             }
         }
+
+        let mut new_ready_output_devices = Vec::new();
         for key in self.output_aligners_in_progress.keys().cloned().collect::<Vec<OutputDeviceConfig>>() {
             let ready = match self.output_aligners_in_progress.get_mut(&key) {
                 Some(a) => a.is_ready_to_read(chunk_end_micros, chunk_size).await,
@@ -2853,6 +2861,7 @@ impl AecStream {
             };
             if ready {
                 if let Some(aligner) = self.output_aligners_in_progress.remove(&key) {
+                    new_ready_output_devices.push(key.clone());
                     self.output_aligners.insert(key, aligner);
                     modified_aligners = true;
                 }
@@ -2863,7 +2872,7 @@ impl AecStream {
             self.reinitialize_aec()?;
         }
 
-        Ok((chunk_start_micros, chunk_end_micros))
+        Ok((new_ready_input_devices, new_ready_output_devices, chunk_start_micros, chunk_end_micros))
     }
 
     fn get_next_frame(&mut self) -> (u128, u128) {
@@ -2882,9 +2891,10 @@ impl AecStream {
         (chunk_start_micros, chunk_end_micros)
     }
 
-    pub async fn update(&mut self)-> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
-        let (chunk_start_micros, chunk_end_micros) = self.update_devices().await?;
-        self.update_helper(chunk_start_micros, chunk_end_micros).await
+    pub async fn update(&mut self)-> Result<(Vec<InputDeviceConfig>, Vec<OutputDeviceConfig>, &[f32], u128, u128), Box<dyn std::error::Error>> {
+        let (new_ready_input_devices, new_ready_output_devices, chunk_start_micros, chunk_end_micros) = self.update_devices().await?;
+        let (buf, start_time, end_time) = self.update_helper(chunk_start_micros, chunk_end_micros).await?;
+        Ok((new_ready_input_devices, new_ready_output_devices, buf, start_time, end_time))
     }
 
     async fn update_helper(&mut self, chunk_start_micros: u128, chunk_end_micros: u128) -> Result<(&[f32], u128, u128), Box<dyn std::error::Error>> {
