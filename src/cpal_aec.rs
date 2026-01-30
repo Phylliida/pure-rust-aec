@@ -1618,7 +1618,7 @@ impl OutputStreamAlignerMixer {
                     //   so we need to add 
                     let skip_ahead_frames = input_chunk_size_available - (diff_frames as usize);
                     //      so total latency is 
-                    println!("end of chunk {time_at_end_of_chunk} start time {start_time} diff {diff} diff frames {diff_frames}");
+                    //println!("end of chunk {time_at_end_of_chunk} start time {start_time} diff {diff} diff frames {diff_frames}");
                     skip_ahead_frames
                 }
                 else {
@@ -2339,16 +2339,18 @@ impl AecStream {
     // if that happens, the offsets will be very large
     // we can detect that by seeing if it is larger than max_offset_frames
     // (I recommend 1000 frames, but this depends on your device, run a few times with a large value to check)
-    pub async fn calibrate(&mut self, max_offset_frames: usize, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    pub async fn calibrate(&mut self, max_offset_frames: usize, max_calibration_attempts: usize, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<bool, Box<dyn std::error::Error>> {
         let mut success = false;
         let mut iters = 0;
         while !success {
             success = self.calibrate_inner(max_offset_frames, output_producers, debug_wav).await?;
             iters += 1;
-            if iters > 4 {
+            if iters >= max_calibration_attempts {
                 break;
             }
         }
+        // we failed to calibrate, just flush streams, that's best we can do
+        self.flush_streams().await;
         Ok(success)
         //self.calibrate_inner(output_producers, debug_wav).await
         //self.calibrate_inner(output_producers, debug_wav).await
@@ -2437,36 +2439,7 @@ impl AecStream {
         Ok(true)
     }
 
-    async fn get_calibration_offsets(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(Vec<Option<i64>>, Vec<Vec<Option<i64>>>), Box<dyn std::error::Error>> {
-        let sample_rate = self.aec_config.target_sample_rate as u32;
-        // Probe length (~0.1s) to stay quick but audible.
-        let tone_ms = 100.0;
-        let capture_secs = 3.0;
-
-        let frames_before_chirp = ((((capture_secs - (tone_ms/1000.0)) as f32)/2.0) * sample_rate as f32) as usize;
-        let frames_after_chirp = frames_before_chirp;
-        let chirp_frames = (tone_ms / 1000.0 * sample_rate as f32) as usize;
-        println!("Frames {} {} {}", frames_before_chirp, chirp_frames, frames_after_chirp);
-        // 1) Emit a distinct probe on each output device (all channels), in sorted output order.
-        let mut active_streams: Vec<(usize, StreamProducer)> = Vec::new();
-        let mut tones = Vec::new();
-
-        // wait for time first, to make sure we don't overlap with previous calibration
-        let mut captured_micros: u128 = 0;
-        let target_micros: u128 = ((capture_secs as u128) * 1_000_000) as u128;
-        
-        let (_new_ready_input_devices, _new_ready_output_devices, mut chunk_start_micros, mut chunk_end_micros) = self.update_devices().await?;
-           
-        while captured_micros < target_micros {
-            let _ = self.update_helper(chunk_start_micros, chunk_end_micros).await?;
-            let chunk_micros = chunk_end_micros.saturating_sub(chunk_start_micros);
-            captured_micros += chunk_micros;
-            if captured_micros < target_micros {
-                (chunk_start_micros, chunk_end_micros) = self.get_next_frame();
-            }
-        }
-
-        // flush them, this avoids accumulated errors and ensures we act on most recent
+    async fn flush_streams(&mut self) {
         // Flush input aligners
         for name in &self.sorted_input_aligners {
             if let Some(aligner) = self.input_aligners.get_mut(name) {
@@ -2490,6 +2463,40 @@ impl AecStream {
                 }
             }
         }
+    }
+
+    async fn get_calibration_offsets(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(Vec<Option<i64>>, Vec<Vec<Option<i64>>>), Box<dyn std::error::Error>> {
+        let sample_rate = self.aec_config.target_sample_rate as u32;
+        // Probe length (~0.1s) to stay quick but audible.
+        let tone_ms = 100.0;
+        let capture_secs = 3.0;
+
+        let frames_before_chirp = ((((capture_secs - (tone_ms/1000.0)) as f32)/2.0) * sample_rate as f32) as usize;
+        let frames_after_chirp = frames_before_chirp;
+        let chirp_frames = (tone_ms / 1000.0 * sample_rate as f32) as usize;
+        //println!("Frames {} {} {}", frames_before_chirp, chirp_frames, frames_after_chirp);
+        // 1) Emit a distinct probe on each output device (all channels), in sorted output order.
+        let mut active_streams: Vec<(usize, StreamProducer)> = Vec::new();
+        let mut tones = Vec::new();
+
+        // wait for time first, to make sure we don't overlap with previous calibration
+        let mut captured_micros: u128 = 0;
+        let target_micros: u128 = ((capture_secs as u128) * 1_000_000) as u128;
+        
+        let (_new_ready_input_devices, _new_ready_output_devices, mut chunk_start_micros, mut chunk_end_micros) = self.update_devices().await?;
+           
+        while captured_micros < target_micros {
+            let _ = self.update_helper(chunk_start_micros, chunk_end_micros).await?;
+            let chunk_micros = chunk_end_micros.saturating_sub(chunk_start_micros);
+            captured_micros += chunk_micros;
+            if captured_micros < target_micros {
+                (chunk_start_micros, chunk_end_micros) = self.get_next_frame();
+            }
+        }
+
+
+        // flush them, this avoids accumulated errors and ensures we act on most recent
+        self.flush_streams().await;
 
         for (idx, dev_config) in self.sorted_output_aligners.clone().iter().enumerate() {
             let Some(producer) = output_producers
