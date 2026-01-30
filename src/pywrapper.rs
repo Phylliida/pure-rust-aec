@@ -1027,6 +1027,7 @@ impl PyAecStream {
     
     pub async fn calibrate(
         &self,
+        max_offset_frames: usize,
         producers: Vec<Py<PyOutputStreamAlignerProducer>>,
         debug_wav: bool,
     ) -> PyResult<bool> {
@@ -1048,7 +1049,7 @@ impl PyAecStream {
 
         let result = {
             let mut guard = self.inner.lock().await;
-            guard.calibrate(owned.as_mut_slice(), debug_wav).await
+            guard.calibrate(max_offset_frames, owned.as_mut_slice(), debug_wav).await
         };
 
         Python::attach(|py| {

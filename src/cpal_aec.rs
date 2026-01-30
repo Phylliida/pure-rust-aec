@@ -2332,11 +2332,18 @@ impl AecStream {
         ready_output_devices
     }
 
-    pub async fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    // adjusts each device so aec recieves device inputs well aligned for it's buffer
+    // this does this by making a "boop" sound to measure hardware latencies
+    // then adjusting relative to that
+    // sometimes this boop is failed to detect
+    // if that happens, the offsets will be very large
+    // we can detect that by seeing if it is larger than max_offset_frames
+    // (I recommend 1000 frames, but this depends on your device, run a few times with a large value to check)
+    pub async fn calibrate(&mut self, max_offset_frames: usize, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<bool, Box<dyn std::error::Error>> {
         let mut success = false;
         let mut iters = 0;
         while !success {
-            success = self.calibrate_inner(output_producers, debug_wav).await?;
+            success = self.calibrate_inner(max_offset_frames, output_producers, debug_wav).await?;
             iters += 1;
             if iters > 4 {
                 break;
@@ -2347,11 +2354,11 @@ impl AecStream {
         //self.calibrate_inner(output_producers, debug_wav).await
     }
 
-    pub async fn calibrate_inner(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    pub async fn calibrate_inner(&mut self, max_offset_frames: usize, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<bool, Box<dyn std::error::Error>> {
         let (output_offsets, input_offsets) = self.get_calibration_offsets(output_producers, debug_wav).await?;
         // we need to throw away some samples for each device until we are calibrated
         // each device will have an offset (could be negative)
-        
+
         let mut input_shifts_needed = Vec::new();
         for input_index in 0..input_offsets.len() {
             let mut shifts_needed = Vec::new();
@@ -2373,11 +2380,14 @@ impl AecStream {
         }
         
         let min_input_shift_needed = input_shifts_needed.iter().copied().min();
-        let max_input_shift_needed = input_shifts_needed.iter().copied().max();
+        
         // if it is less than zero, it needs to be shifted forwards not backwards (it's currently playing before an output audio device)
         // to do this, we'll need to move all the output devices forward by that much
         // and then since we did that, we'll subtract that amount from our shifts needed
         if let Some(min_input_shift_needed) = min_input_shift_needed {
+            if min_input_shift_needed.abs() > (max_offset_frames as i64) {
+                return Ok(false);
+            }
             if min_input_shift_needed < 0 {
                 // if we needed to move the input to the left A amount
                 // now, outputs will be moved to the left min_input_shift_needed
@@ -2391,7 +2401,7 @@ impl AecStream {
                     return Ok(false);
                 }
                 println!("Shifting outputs ahead by {}", min_input_shift_needed);
-                /*
+                
                 for output_index in 0..output_offsets.len() {
                     if let Some(aligner) = self.output_aligners.get_mut(&self.sorted_output_aligners[output_index].clone()) {
                         // skip ahead that many samples (* num channels bc it is multi channel)
@@ -2400,12 +2410,13 @@ impl AecStream {
                         aligner.finish_read(chunk_len);
                     }
                 }
-                */
             }
         }
-
+        
+        let max_input_shift_needed = input_shifts_needed.iter().copied().max();
+        
         if let Some(max_input_shift_needed) = max_input_shift_needed {
-            if max_input_shift_needed > (self.aec_config.target_sample_rate / 2) as i64 {
+            if max_input_shift_needed.abs() > (max_offset_frames as i64) || max_input_shift_needed > (self.aec_config.target_sample_rate / 2) as i64 {
                 return Ok(false);
             }
         }
